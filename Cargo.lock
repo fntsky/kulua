@@ -450,6 +450,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "sync-core",
+ "tokio",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1773,6 +1782,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync-core"
+version = "0.1.0"
+dependencies = [
+ "clipboard-win",
+ "image",
+ "mdns-sd",
+ "notify-rust",
+ "qrcode",
+ "rand 0.8.7",
+ "rqrr",
+ "tokio",
 ]
 
 [[package]]
