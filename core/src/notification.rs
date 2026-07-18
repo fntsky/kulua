@@ -1,9 +1,9 @@
 use crate::adb_cmd::AdbOps;
 use crate::types::Device;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ pub fn show_desktop_notification(info: &NotifInfo) {
 pub fn spawn_notification_poller(
     adb: Arc<dyn AdbOps>,
     device: Device,
-    notif_tx: Sender<NotifInfo>,
+    notif_tx: std_mpsc::Sender<NotifInfo>,
 ) -> (JoinHandle<()>, Arc<AtomicBool>) {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
@@ -211,6 +211,29 @@ pub fn spawn_notification_poller(
         .expect("spawn notification poller thread");
 
     (handle, stop)
+}
+
+/// 桥接版本：启动 std 线程通知轮询器，通过 bridging 转发到 tokio mpsc channel
+pub fn spawn_notification_poller_tokio(
+    adb: Arc<dyn AdbOps>,
+    device: Device,
+    notif_tx: tokio::sync::mpsc::Sender<NotifInfo>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let (bridge_tx, bridge_rx) = std_mpsc::channel::<NotifInfo>();
+    let (poller_handle, _) = spawn_notification_poller(adb, device, bridge_tx);
+    // 后台转发：std mpsc → tokio mpsc
+    tokio::task::spawn_blocking(move || {
+        while let Ok(info) = bridge_rx.recv() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if notif_tx.blocking_send(info).is_err() {
+                break;
+            }
+        }
+    });
+    poller_handle
 }
 
 #[cfg(test)]

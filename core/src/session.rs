@@ -1,130 +1,196 @@
 use crate::adb_cmd::AdbOps;
 use crate::notification::{self, NotifInfo};
-use crate::scrcpy::{self, ScrcpyServer};
+use crate::scrcpy;
 use crate::types::{AdbError, Device};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
-pub struct Session {
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// 轻量 session 句柄，主循环用来发停止信号 + 等待任务结束
+pub struct Handle {
+    #[allow(dead_code)]
     pub device: Device,
-    scrcpy: Option<ScrcpyServer>,
-    clipboard_listener: Option<JoinHandle<()>>,
-    notification_poller: Option<JoinHandle<()>>,
-    notification_stop: Arc<AtomicBool>,
-    /// Core→Phone: Core 通过此 channel 发送剪贴板文本给 listener 线程写入设备
-    pub ctrl_tx: Sender<String>,
-    /// Phone→Core: listener 收到设备剪贴板文本后通过此 channel 转发给 Core
-    pub phone_clipboard_rx: Receiver<String>,
-    /// Phone→Core: 通知轮询线程收到新通知后通过此 channel 转发给 Core
-    pub notification_rx: Receiver<NotifInfo>,
+    pub stop_tx: Option<oneshot::Sender<()>>,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
-impl Session {
-    pub fn new(device: Device) -> Self {
-        let (ctrl_tx, _ctrl_rx) = mpsc::channel();
-        let (_phone_tx, phone_clipboard_rx) = mpsc::channel();
-        let (_notif_tx, notification_rx) = mpsc::channel();
-        // 默认 channel 会在 listener/poller 创建时被替换
-        Self {
-            device,
-            scrcpy: None,
-            clipboard_listener: None,
-            notification_poller: None,
-            notification_stop: Arc::new(AtomicBool::new(false)),
-            ctrl_tx,
-            phone_clipboard_rx,
-            notification_rx,
+impl Handle {
+    pub async fn stop(&mut self, _adb: &dyn AdbOps) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
         }
+        // 给 session 一点时间自行清理
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut self.task).await;
     }
+}
 
-    /// 部署 scrcpy-server + 启动剪贴板双向服务。
-    ///
-    /// scrcpy 控制连接是双向的：在同一个 TcpStream 上接收设备消息
-    /// （Phone→PC 剪贴板）和发送控制指令（PC→Phone 剪贴板）。
-    pub fn start_clipboard_service(
-        &mut self,
-        adb: &dyn AdbOps,
-        local_jar: &str,
-        port: u16,
-    ) -> Result<(), AdbError> {
-        println!(
-            "Deploying scrcpy-server to {} on port {}...",
-            self.device.serial, port
-        );
+/// 启动一个设备的完整 session：部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询
+pub async fn run(
+    adb: Arc<dyn AdbOps>,
+    device: Device,
+    jar_path: String,
+    port: u16,
+    mut clip_sub: broadcast::Receiver<String>,
+    phone_clip_tx: mpsc::Sender<String>,
+    notif_tx: mpsc::Sender<NotifInfo>,
+    stop_rx: oneshot::Receiver<()>,
+) {
+    // 1. 部署 scrcpy-server（阻塞 ADB 操作 → spawn_blocking）
+    let server = tokio::task::spawn_blocking({
+        let adb = adb.clone();
+        let device = device.clone();
+        let jar_path = jar_path.clone();
+        move || scrcpy::ScrcpyServer::deploy_clipboard_only(adb.as_ref(), &device, &jar_path, port)
+    })
+    .await;
 
-        // 部署 server + forward（只 forward 一个端口，数据和控制共用）
-        let server = ScrcpyServer::deploy_clipboard_only(adb, &self.device, local_jar, port)?;
-        self.scrcpy = Some(server);
+    let mut server = match server {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            eprintln!("scrcpy deploy failed for {}: {:?}", device.serial, e);
+            run_notification_only(adb, device, notif_tx, stop_rx).await;
+            return;
+        }
+        Err(e) => {
+            eprintln!("spawn_blocking panic: {}", e);
+            return;
+        }
+    };
+    println!("scrcpy-server alive on {} (port {})", device.serial, port);
 
-        // 创建双向 channel
-        let (ctrl_tx, ctrl_rx) = mpsc::channel();
-        let (phone_tx, phone_rx) = mpsc::channel();
-
-        // 启动监听线程（内部会重试连接），等待它连上 server
-        let (handle, alive) =
-            scrcpy::spawn_clipboard_listener(port, ctrl_rx, phone_tx);
-        match alive.recv_timeout(Duration::from_secs(10)) {
-            Ok(()) => println!(
-                "✓ scrcpy-server alive on {} (port {})",
-                self.device.serial, port
-            ),
+    // 2. 连接 scrcpy TCP 控制通道
+    let stream = loop {
+        match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+            Ok(mut s) => {
+                let mut dummy = [0u8; 1];
+                match s.read_exact(&mut dummy).await {
+                    Ok(_) => break s,
+                    Err(_) => {
+                        drop(s);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
+            }
             Err(_) => {
-                // 监听线程连不上，清理已部署的资源
-                self.stop(adb);
-                return Err(AdbError::Other(format!(
-                    "clipboard listener on port {}: server not responding within 10s",
-                    port
-                )));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
             }
         }
-        self.clipboard_listener = Some(handle);
-        self.ctrl_tx = ctrl_tx;
-        self.phone_clipboard_rx = phone_rx;
+    };
 
-        Ok(())
-    }
+    // 3. 启动通知轮询（子任务）
+    let notif_stop = Arc::new(AtomicBool::new(false));
+    let np_stop = notif_stop.clone();
+    let np_adb = adb.clone();
+    let np_device = device.clone();
+    let np_tx = notif_tx.clone();
+    notification::spawn_notification_poller_tokio(np_adb, np_device, np_tx, np_stop);
 
-    /// 通过 ctrl channel 向设备发送剪贴板文本（PC→Phone）。
-    pub fn write_clipboard(&self, text: &str) -> Result<(), AdbError> {
-        self.ctrl_tx
-            .send(text.to_string())
-            .map_err(|e| AdbError::Other(format!("ctrl channel send: {}", e)))
-    }
+    // 4. 双向剪贴板 I/O
+    run_clipboard_io(stream, &mut clip_sub, &phone_clip_tx, stop_rx).await;
 
-    /// 启动通知轮询线程。启动后独立于 scrcpy 服务运行，
-    /// 周期性地通过 adb shell 拉取通知列表并 diff key 集合。
-    pub fn start_notification_polling(&mut self, adb: Arc<dyn AdbOps>) {
-        let (notif_tx, notif_rx) = mpsc::channel::<NotifInfo>();
-        let (handle, stop) =
-            notification::spawn_notification_poller(adb, self.device.clone(), notif_tx);
-        self.notification_poller = Some(handle);
-        self.notification_stop = stop;
-        self.notification_rx = notif_rx;
-    }
+    // 5. 清理
+    notif_stop.store(true, Ordering::SeqCst);
+    server.stop(adb.as_ref());
+    println!("Session {} cleaned up", device.serial);
+}
 
-    #[allow(dead_code)]
-    pub fn is_clipboard_running(&self) -> bool {
-        self.scrcpy.is_some()
-    }
+/// 剪贴板服务不可用时仅启动通知轮询
+async fn run_notification_only(
+    adb: Arc<dyn AdbOps>,
+    device: Device,
+    notif_tx: mpsc::Sender<NotifInfo>,
+    stop_rx: oneshot::Receiver<()>,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    notification::spawn_notification_poller_tokio(adb, device, notif_tx, stop.clone());
 
-    pub fn stop(&mut self, adb: &dyn AdbOps) {
-        // 先停 scrcpy server（kill 进程 + 移除端口转发）
-        if let Some(mut server) = self.scrcpy.take() {
-            server.stop(adb);
+    let _ = stop_rx.await;
+    stop.store(true, Ordering::SeqCst);
+}
+
+// ─── 双向剪贴板 I/O ─────────────────────────────────────
+
+async fn run_clipboard_io(
+    mut stream: TcpStream,
+    clip_sub: &mut broadcast::Receiver<String>,
+    phone_clip_tx: &mpsc::Sender<String>,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => break,
+
+            // PC→Phone：广播剪贴板 → 写入 scrcpy 控制连接
+            result = clip_sub.recv() => {
+                match result {
+                    Ok(text) => {
+                        if let Err(e) = scrcpy::send_clipboard_async(&mut stream, &text).await {
+                            eprintln!("send clipboard: {}", e);
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("clipboard broadcast lagged by {}", n);
+                    }
+                }
+            }
+
+            // Phone→PC：读取设备剪贴板事件 → 发送给 Core
+            result = read_phone_clipboard(&mut stream) => {
+                match result {
+                    Ok(Some(text)) => {
+                        if phone_clip_tx.send(text).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
         }
-
-        // 等待剪贴板监听线程结束（TcpStream 读到错误时自行退出）
-        if let Some(handle) = self.clipboard_listener.take() {
-            let _ = handle.join();
-        }
-
-        // 停止通知轮询线程
-        self.notification_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.notification_poller.take() {
-            let _ = handle.join();
-        }
     }
+}
+
+/// 从 scrcpy 控制连接读取一条设备剪贴板消息（200ms 超时返回 None）
+async fn read_phone_clipboard(stream: &mut TcpStream) -> Result<Option<String>, AdbError> {
+    let mut type_buf = [0u8; 1];
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        stream.read_exact(&mut type_buf),
+    )
+    .await;
+    match result {
+        Err(_timeout) => return Ok(None),
+        Ok(Err(e)) => return Err(AdbError::Io(e)),
+        Ok(Ok(_)) => {}
+    }
+
+    if type_buf[0] != 0x00 {
+        let mut extra = [0u8; 64];
+        let n = stream.read(&mut extra).await.unwrap_or(0);
+        println!(
+            "scrcpy msg: type=0x{:02X}, payload ({} bytes): {:02X?}",
+            type_buf[0], n, &extra[..n]
+        );
+        return Ok(None);
+    }
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.map_err(AdbError::Io)?;
+    let text_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut text = vec![0u8; text_len];
+    stream.read_exact(&mut text).await.map_err(AdbError::Io)?;
+
+    let clip_text = String::from_utf8(text).map_err(|e| AdbError::Other(format!("{}", e)))?;
+    println!("Phone clipboard: {}", clip_text);
+    Ok(Some(clip_text))
 }

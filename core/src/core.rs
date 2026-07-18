@@ -1,126 +1,112 @@
 use crate::adb_cmd::{AdbCmd, AdbOps};
-use crate::notification;
-use crate::session::Session;
-use crate::types::{AdbError, Device, DeviceState};
-use crate::{
-    tray,
-    wireless_pair,
-};
+use crate::notification::{self, NotifInfo};
+use crate::session;
+use crate::types::{Device, DeviceState};
+use crate::wireless_pair;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub struct Core {
-    pub adb_cmd: Arc<dyn AdbOps>,
-    pub devices: Arc<Mutex<HashMap<String, Device>>>,
-    pub sessions: HashMap<String, Session>,
-    /// 全局停止信号，任一来源（Ctrl+C / 正常退出）触发
+    adb_cmd: Arc<dyn AdbOps>,
+    jar_path: String,
+    pair_info: wireless_pair::WirelessPairing,
+
+    // ── 后台任务句柄（hold 住防止 drop） ──
+    _mdns_handle: wireless_pair::MdnsHandle,
+    _refresh_handle: bool, // 后台线程不阻塞，放在这里只是个标记
+
+    // ── 事件流 ──
+    mdns_rx: mpsc::Receiver<wireless_pair::MdnsEvent>,
+    device_watch: watch::Receiver<HashMap<String, Device>>,
+
+    // ── 事件总线 ──
+    clip_broadcast: broadcast::Sender<String>,
+    phone_clip_rx: mpsc::Receiver<String>,
+    phone_clip_tx: mpsc::Sender<String>,
+    notif_rx: mpsc::Receiver<NotifInfo>,
+    notif_tx: mpsc::Sender<NotifInfo>,
+
+    // ── 状态 ──
+    sessions: HashMap<String, session::Handle>,
+    pending_serials: HashSet<String>,
+    /// 上次对每个 pending 设备发起 adb connect 的时间（用于 5s 重试间隔）
+    last_connect_attempt: HashMap<String, Instant>,
+    port_counter: u16,
     stop_flag: Arc<AtomicBool>,
-    refresh_thread_stop: Option<std::thread::JoinHandle<()>>,
+
+    // ── 剪贴板防回环 ──
+    clipboard_last_seen: Option<String>,
+    last_received_from_phone: Option<String>,
+    last_clipboard_error_print: Instant,
 }
 
 impl Core {
-    pub fn new() -> Self {
+    pub fn new(jar_path: String, pair_info: wireless_pair::WirelessPairing) -> Self {
+        let (clip_tx, _) = broadcast::channel(64);
+        let (phone_clip_tx, phone_clip_rx) = mpsc::channel(256);
+        let (notif_tx, notif_rx) = mpsc::channel(64);
+        let (device_tx, device_watch) = watch::channel(HashMap::new());
+
+        // 启动 mDNS 发现（同步线程 → 桥接到 tokio mpsc）
+        let (mdns_tx, mdns_rx) = mpsc::channel(16);
+        let mdns_handle = if let Ok((handle, std_rx)) =
+            wireless_pair::start_discovery(&pair_info)
+        {
+            tokio::task::spawn_blocking(move || {
+                while let Ok(event) = std_rx.recv() {
+                    if mdns_tx.blocking_send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            handle
+        } else {
+            eprintln!("mDNS discovery failed to start");
+            // 空 handle 占位，防止 Core::new 失败
+            wireless_pair::MdnsHandle::empty()
+        };
+
+        // 启动设备刷新后台任务
+        Self::spawn_device_refresh(device_tx);
+
         Self {
             adb_cmd: Arc::new(AdbCmd::new()),
-            devices: Arc::new(Mutex::new(HashMap::new())),
+            jar_path,
+            pair_info,
+            _mdns_handle: mdns_handle,
+            _refresh_handle: true,
+            mdns_rx,
+            device_watch,
+            clip_broadcast: clip_tx,
+            phone_clip_rx,
+            phone_clip_tx,
+            notif_rx,
+            notif_tx,
             sessions: HashMap::new(),
+            pending_serials: HashSet::new(),
+            last_connect_attempt: HashMap::new(),
+            port_counter: 27183,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            refresh_thread_stop: None,
+            clipboard_last_seen: None,
+            last_received_from_phone: None,
+            last_clipboard_error_print: Instant::now(),
         }
     }
 
-    /// 返回停止信号接收端，供外部（主线程 Ctrl+C handler）触发停止
     pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
         self.stop_flag.clone()
     }
 
-    /// 停止所有 session 并等待后台线程结束
-    pub fn stop_all(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-
-        // 停止所有 session（会 kill adb shell + 移除端口转发）
-        let serials: Vec<String> = self.sessions.keys().cloned().collect();
-        for serial in &serials {
-            if let Some(mut session) = self.sessions.remove(serial) {
-                session.stop(self.adb_cmd.as_ref());
-                println!("Stopped session for {}", serial);
-            }
-        }
-
-        // 等待后台刷新线程退出
-        if let Some(handle) = self.refresh_thread_stop.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// 该调用从 core.run() 循环返回的唯一方式是：
-    /// 1. mDNS channel 断开（remote end dropped）
-    /// 2. 收到外部停止信号（Ctrl+C 或手动调用 stop_all）
-    fn should_stop(&self) -> bool {
-        self.stop_flag.load(Ordering::SeqCst)
-    }
-
-    /// 刷新设备列表（线程安全），由后台刷新线程和测试共用
-    #[allow(dead_code)]
-    pub fn refresh_devices(&self) {
-        let mut map = self.devices.lock().unwrap();
-        map.clear();
-        if let Ok(list) = self.adb_cmd.devices() {
-            for d in list {
-                if d.state == DeviceState::Device {
-                    map.insert(d.serial.clone(), d);
-                }
-            }
-        }
-        // adb 失败时 map 保持清空状态
-    }
-
-    pub fn wireless_pair(
-        &self,
-        info: &wireless_pair::WirelessPairing,
-        ip: &str,
-        port: u16,
-    ) -> Result<(), AdbError> {
-        let addr = format!("{}:{}", ip, port);
-        self.adb_cmd.wireless_pair(&addr, info)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn connect(&self, ip: &str, port: u16) -> Result<(), AdbError> {
-        let addr = format!("{}:{}", ip, port);
-        self.adb_cmd.connect(&addr)?;
-        Ok(())
-    }
-
-    pub fn run(
-        &mut self,
-        rx: Receiver<wireless_pair::MdnsEvent>,
-        pair_info: &wireless_pair::WirelessPairing,
-        jar_path: &str,
-    ) {
-        let jar_path = std::path::Path::new(jar_path);
-        if !jar_path.exists() {
-            eprintln!("scrcpy-server not found at: {}", jar_path.display());
-            return;
-        }
-        let jar_path = jar_path.to_string_lossy().to_string();
-
-        // 独立线程：每 1s 刷新一次设备列表，不阻塞主循环
-        let adb = self.adb_cmd.clone();
-        let devices = self.devices.clone();
-        let stop = self.stop_flag.clone();
-        let handle = std::thread::spawn(move || {
+    /// 后台任务：每 1s 执行 `adb devices`，通过 watch channel 推送最新设备列表
+    fn spawn_device_refresh(device_tx: watch::Sender<HashMap<String, Device>>) {
+        tokio::task::spawn_blocking(move || {
+            let adb = AdbCmd::new();
             loop {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                let mut map = devices.lock().unwrap();
-                map.clear();
+                let mut map = HashMap::new();
                 if let Ok(list) = adb.devices() {
                     for d in list {
                         if d.state == DeviceState::Device {
@@ -128,245 +114,271 @@ impl Core {
                         }
                     }
                 }
-                drop(map);
+                let _ = device_tx.send(map);
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
-        self.refresh_thread_stop = Some(handle);
+    }
 
-        let mut clipboard_last_seen: Option<String> = None;
-        // 最近一次从手机收到的剪贴板文本，用于防回环
-        let mut last_received_from_phone: Option<String> = None;
-        let mut last_clipboard_error_print = Instant::now();
+    // ─── 主循环 ──────────────────────────────────────────
 
-        let mut clipboard_port = 27183u16;
+    pub async fn run(&mut self) {
         loop {
             if self.should_stop() {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(wireless_pair::MdnsEvent::PairingDiscovered { host, port }) => {
+
+            // 1. 处理 mDNS 发现事件
+            self.handle_mdns_events().await;
+
+            // 2. 收集 Phone→PC 事件
+            self.drain_phone_clipboard().await;
+            self.drain_notifications().await;
+
+            // 3. 轮询 PC 系统剪贴板
+            self.poll_system_clipboard();
+
+            // 4. 管理设备连接 & session
+            let devices = self.device_watch.borrow().clone();
+            self.try_connect_pending(&devices);
+            self.sync_sessions(devices).await;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        self.stop_all().await;
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop_flag.load(Ordering::SeqCst)
+    }
+
+    // ─── 各步骤 ──────────────────────────────────────────
+
+    async fn handle_mdns_events(&mut self) {
+        while let Ok(event) = self.mdns_rx.try_recv() {
+            match event {
+                wireless_pair::MdnsEvent::PairingDiscovered { host, port } => {
                     println!("Discovered device at {}:{}", host, port);
-                    let _ = self.wireless_pair(pair_info, &host, port);
-                    // std::thread::sleep(Duration::from_secs(10));
-                    // 设备会被后台刷新线程自动发现
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(e) => {
-                    eprintln!("Error receiving mDNS event: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-
-            // 0. 检查托盘菜单事件（非阻塞）
-            if let Some(tray::TrayEvent::Exit) = tray::check_event() {
-                println!("Tray: exit requested");
-                self.stop_flag.store(true, Ordering::SeqCst);
-                break;
-            }
-
-            // 1. 收集 Phone→PC 剪贴板事件并写入系统剪贴板
-            for session in self.sessions.values_mut() {
-                while let Ok(text) = session.phone_clipboard_rx.try_recv() {
-                    // 跳过重复（同一台手机连续发来相同文本）
-                    if Some(&text) == last_received_from_phone.as_ref() {
+                    let addr = format!("{}:{}", host, port);
+                    if let Err(e) = self.adb_cmd.wireless_pair(&addr, &self.pair_info) {
+                        eprintln!("Wireless pair failed: {}", e);
                         continue;
                     }
-                    last_received_from_phone = Some(text.clone());
-
-                    // 内容与 PC 剪贴板当前内容相同，不重复写入（避免回环）
-                    if Some(&text) == clipboard_last_seen.as_ref() {
-                        continue;
-                    }
-
-                    println!("System clipboard (from phone): {}", text);
-                    if let Err(e) = clipboard_win::set_clipboard_string(&text) {
-                        eprintln!("Clipboard: failed to write from phone: {}", e);
-                    }
+                    self.pending_serials.insert(format!("{}:5555", host));
                 }
-            }
-
-            // 2. 收集 Phone→PC 通知事件并显示桌面通知
-            for session in self.sessions.values_mut() {
-                while let Ok(notif) = session.notification_rx.try_recv() {
-                    if let Some(title) = &notif.title {
-                        println!("通知: [{}] {}", notif.package, title);
-                    } else {
-                        println!("通知: [{}]", notif.package);
-                    }
-                    notification::show_desktop_notification(&notif);
-                }
-            }
-
-            // 3. 轮询系统剪贴板变化并分发给所有设备
-            match clipboard_win::get_clipboard_string() {
-                Ok(ref text) if Some(text.as_str()) != clipboard_last_seen.as_deref() => {
-                    clipboard_last_seen = Some(text.clone());
-                    last_clipboard_error_print = Instant::now();
-                    // 只分发不是从手机收来的内容（防回环）
-                    if Some(text) != last_received_from_phone.as_ref() {
-                        println!(
-                            "Clipboard (PC→{} devices): {}",
-                            self.sessions.len(),
-                            text
-                        );
-                        for session in self.sessions.values() {
-                            if let Err(e) = session.write_clipboard(text) {
-                                eprintln!(
-                                    "Clipboard: failed to write to {}: {:?}",
-                                    session.device.serial, e
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    if last_clipboard_error_print.elapsed() >= Duration::from_secs(30) {
-                        eprintln!("Clipboard: failed to read system clipboard: {}", e);
-                        last_clipboard_error_print = Instant::now();
-                    }
-                }
-            }
-
-            // 为新设备启动 session
-            let serials: Vec<String> = {
-                let map = self.devices.lock().unwrap();
-                map.keys().cloned().collect()
-            };
-            for serial in &serials {
-                if !self.sessions.contains_key(serial) {
-                    let device = {
-                        let map = self.devices.lock().unwrap();
-                        map.get(serial).cloned()
-                    };
-                    if let Some(device) = device {
-                        self.start_session(&device, &mut clipboard_port, &jar_path);
-                    }
-                }
-            }
-
-            // 清理已断开设备的 session
-            let session_serials: Vec<String> = self.sessions.keys().cloned().collect();
-            for serial in &session_serials {
-                let still_present = {
-                    let map = self.devices.lock().unwrap();
-                    map.contains_key(serial)
-                };
-                if !still_present {
-                    if let Some(mut session) = self.sessions.remove(serial) {
-                        session.stop(self.adb_cmd.as_ref());
-                        println!("Stopped session for {}", serial);
-                    }
+                wireless_pair::MdnsEvent::Error(e) => {
+                    eprintln!("mDNS error: {}", e);
                 }
             }
         }
     }
 
-    fn start_session(&mut self, device: &Device, port: &mut u16, jar_path: &str) {
-        let mut session = Session::new(device.clone());
-        match session.start_clipboard_service(self.adb_cmd.as_ref(), jar_path, *port) {
-            Ok(()) => {
-                println!("Started clipboard service for {}", device.serial);
-                *port += 1;
+    async fn drain_phone_clipboard(&mut self) {
+        while let Ok(text) = self.phone_clip_rx.try_recv() {
+            if Some(&text) == self.last_received_from_phone.as_ref() {
+                continue;
             }
-            Err(e) => {
-                eprintln!("Failed to start clipboard for {}: {:?}", device.serial, e);
+            if Some(&text) == self.clipboard_last_seen.as_ref() {
+                continue;
+            }
+            self.last_received_from_phone = Some(text.clone());
+
+            println!("System clipboard (from phone): {}", text);
+            if let Err(e) = clipboard_win::set_clipboard_string(&text) {
+                eprintln!("Clipboard: failed to write from phone: {}", e);
             }
         }
-        // 无论剪贴板服务是否成功，都启动通知轮询（不依赖 scrcpy）
-        session.start_notification_polling(self.adb_cmd.clone());
-        self.sessions.insert(device.serial.clone(), session);
+    }
+
+    async fn drain_notifications(&mut self) {
+        while let Ok(notif) = self.notif_rx.try_recv() {
+            if let Some(title) = &notif.title {
+                println!("通知: [{}] {}", notif.package, title);
+            } else {
+                println!("通知: [{}]", notif.package);
+            }
+            notification::show_desktop_notification(&notif);
+        }
+    }
+
+    fn poll_system_clipboard(&mut self) {
+        match clipboard_win::get_clipboard_string() {
+            Ok(ref text) if Some(text.as_str()) != self.clipboard_last_seen.as_deref() => {
+                self.clipboard_last_seen = Some(text.clone());
+                self.last_clipboard_error_print = Instant::now();
+                if Some(text) != self.last_received_from_phone.as_ref() {
+                    println!(
+                        "Clipboard (PC→{} devices): {}",
+                        self.sessions.len(),
+                        text
+                    );
+                    let _ = self.clip_broadcast.send(text.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if self.last_clipboard_error_print.elapsed() >= Duration::from_secs(30) {
+                    eprintln!("Clipboard: failed to read system clipboard: {}", e);
+                    self.last_clipboard_error_print = Instant::now();
+                }
+            }
+        }
+    }
+
+    /// 对 pending 队列中的设备发起 adb connect。
+    ///
+    /// - 设备已在 `devices` 中（刷新线程确认已连接）→ 从 pending 移除
+    /// - 5 秒内已尝试过 → 跳过（避免高频重试）
+    /// - 否则发起 adb connect（无论成功失败，等刷新线程确认）
+    fn try_connect_pending(&mut self, devices: &HashMap<String, Device>) {
+        let now = Instant::now();
+        let serials: Vec<String> = self.pending_serials.iter().cloned().collect();
+        for serial in &serials {
+            if devices.contains_key(serial) {
+                // 刷新线程已确认设备在线，从 pending 移除
+                self.pending_serials.remove(serial);
+                self.last_connect_attempt.remove(serial);
+                continue;
+            }
+            // 5 秒内已试过，跳过
+            if let Some(last) = self.last_connect_attempt.get(serial) {
+                if now.duration_since(*last) < Duration::from_secs(5) {
+                    continue;
+                }
+            }
+            println!("Connecting to {}...", serial);
+            let _ = self.adb_cmd.connect(serial);
+            self.last_connect_attempt.insert(serial.clone(), now);
+        }
+    }
+
+    async fn sync_sessions(&mut self, devices: HashMap<String, Device>) {
+        for (serial, device) in &devices {
+            if self.sessions.contains_key(serial) {
+                continue;
+            }
+            self.start_session(device.clone()).await;
+        }
+
+        let active: Vec<String> = self.sessions.keys().cloned().collect();
+        for serial in &active {
+            if !devices.contains_key(serial) {
+                if let Some(mut handle) = self.sessions.remove(serial) {
+                    println!("Stopped session for {}", serial);
+                    handle.stop(self.adb_cmd.as_ref()).await;
+                }
+            }
+        }
+    }
+
+    async fn start_session(&mut self, device: Device) {
+        let port = self.port_counter;
+        self.port_counter += 1;
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let clip_sub = self.clip_broadcast.subscribe();
+        let phone_clip_tx = self.phone_clip_tx.clone();
+        let notif_tx = self.notif_tx.clone();
+        let adb = self.adb_cmd.clone();
+        let jar_path = self.jar_path.clone();
+
+        let task = tokio::spawn(session::run(
+            adb, device.clone(), jar_path, port,
+            clip_sub, phone_clip_tx, notif_tx, stop_rx,
+        ));
+
+        self.sessions.insert(
+            device.serial.clone(),
+            session::Handle {
+                device,
+                stop_tx: Some(stop_tx),
+                task,
+            },
+        );
+    }
+
+    async fn stop_all(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        for (_, mut handle) in self.sessions.drain() {
+            handle.stop(self.adb_cmd.as_ref()).await;
+        }
     }
 }
 
 impl Drop for Core {
     fn drop(&mut self) {
-        self.stop_all();
+        self.stop_flag.store(true, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adb_cmd::mock::MockAdb;
     use crate::types::DeviceState;
 
-    fn make_core(adb: MockAdb) -> Core {
-        Core {
-            adb_cmd: Arc::new(adb),
-            devices: Arc::new(Mutex::new(HashMap::new())),
-            sessions: HashMap::new(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            refresh_thread_stop: None,
-        }
-    }
-
     #[test]
-    fn test_refresh_devices_filters_device_state() {
-        let mut mock = MockAdb::new();
-        mock.devices_result = vec![
-            Device {
-                serial: "device1".into(),
-                state: DeviceState::Device,
-            },
-            Device {
-                serial: "offline1".into(),
-                state: DeviceState::Offline,
-            },
-            Device {
-                serial: "unauth1".into(),
-                state: DeviceState::Unauthorized,
-            },
-            Device {
-                serial: "device2".into(),
-                state: DeviceState::Device,
-            },
+    fn test_device_filter() {
+        let raw = vec![
+            Device { serial: "ok".into(), state: DeviceState::Device },
+            Device { serial: "off".into(), state: DeviceState::Offline },
+            Device { serial: "unauth".into(), state: DeviceState::Unauthorized },
+            Device { serial: "ok2".into(), state: DeviceState::Device },
         ];
-        let core = make_core(mock);
-        core.refresh_devices();
-        let map = core.devices.lock().unwrap();
+        let mut map = HashMap::new();
+        for d in raw {
+            if d.state == DeviceState::Device {
+                map.insert(d.serial.clone(), d);
+            }
+        }
         assert_eq!(map.len(), 2);
-        assert!(map.contains_key("device1"));
-        assert!(map.contains_key("device2"));
-        assert!(!map.contains_key("offline1"));
+        assert!(map.contains_key("ok"));
+        assert!(map.contains_key("ok2"));
     }
 
     #[test]
-    fn test_refresh_devices_empty() {
-        let mock = MockAdb::new();
-        let core = make_core(mock);
-        core.refresh_devices();
-        let map = core.devices.lock().unwrap();
-        assert!(map.is_empty());
-    }
+    fn test_try_connect_pending_removes_when_device_in_map() {
+        let (phone_clip_tx, _) = mpsc::channel(256);
+        let (notif_tx, _) = mpsc::channel(64);
+        let (clip_tx, _) = broadcast::channel(64);
+        let (_device_tx, device_watch) = watch::channel(HashMap::new());
+        let (_mdns_tx, mdns_rx) = mpsc::channel(16);
 
-    #[test]
-    fn test_refresh_devices_adb_error() {
-        let mut mock = MockAdb::new();
-        mock.fail_devices = true;
-        let devices = Arc::new(Mutex::new(HashMap::new()));
-        devices.lock().unwrap().insert(
-            "stale".into(),
+        // 模拟：pending 中有设备，但 devices 是空的
+        let mut core = Core {
+            adb_cmd: Arc::new(AdbCmd::new()),
+            jar_path: "test".into(),
+            pair_info: wireless_pair::WirelessPairing::new(),
+            _mdns_handle: wireless_pair::MdnsHandle::empty(),
+            _refresh_handle: true,
+            mdns_rx,
+            device_watch: device_watch.clone(),
+            clip_broadcast: clip_tx,
+            phone_clip_rx: mpsc::channel(256).1,
+            phone_clip_tx,
+            notif_rx: mpsc::channel(64).1,
+            notif_tx,
+            sessions: HashMap::new(),
+            pending_serials: ["192.168.1.100:5555".into()].into(),
+            last_connect_attempt: HashMap::new(),
+            port_counter: 27183,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            clipboard_last_seen: None,
+            last_received_from_phone: None,
+            last_clipboard_error_print: Instant::now(),
+        };
+
+        // devices map 已有该设备，try_connect_pending 应将其从 pending 移除
+        let devices = HashMap::from([(
+            "192.168.1.100:5555".into(),
             Device {
-                serial: "stale".into(),
+                serial: "192.168.1.100:5555".into(),
                 state: DeviceState::Device,
             },
-        );
-        let core = Core {
-            adb_cmd: Arc::new(mock),
-            devices,
-            sessions: HashMap::new(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            refresh_thread_stop: None,
-        };
-        core.refresh_devices();
-        let map = core.devices.lock().unwrap();
-        assert!(
-            map.is_empty(),
-            "on adb error, devices map should be cleared, got {} items",
-            map.len()
-        );
+        )]);
+
+        core.try_connect_pending(&devices);
+        assert!(core.pending_serials.is_empty());
+        assert!(devices.contains_key("192.168.1.100:5555"));
     }
 }

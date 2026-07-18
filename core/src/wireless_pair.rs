@@ -53,11 +53,16 @@ pub enum MdnsEvent {
 
 pub struct MdnsHandle {
     #[allow(dead_code)]
-    daemon: ServiceDaemon,
+    daemon: Option<ServiceDaemon>,
 }
 
 impl MdnsHandle {
-        #[allow(dead_code)]
+    /// 创建一个空 handle（mDNS 不可用时占位）
+    pub fn empty() -> Self {
+        MdnsHandle { daemon: None }
+    }
+
+    #[allow(dead_code)]
     pub fn stop(self) {
         let _ = self.daemon;
     }
@@ -104,7 +109,7 @@ pub fn start_discovery(
         });
     }
 
-    Ok((MdnsHandle { daemon: mdns }, rx))
+    Ok((MdnsHandle { daemon: Some(mdns) }, rx))
 }
 
 #[cfg(test)]

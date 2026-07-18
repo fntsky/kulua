@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1.52", features = ["full"] }
 rqrr = "0.8"
 image = "0.25"
 rand = "0.8"
@@ -12,8 +13,3 @@ mdns-sd = "0.10"
 clipboard-win = "5.4"
 notify-rust = "4.11"
 ctrlc = "3.4"
-windows-sys = { version = "0.52", features = [
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Threading",
-] }
-tray-icon = "0.24.1"

@@ -16,52 +16,6 @@ pub struct ScrcpyServer {
 }
 
 impl ScrcpyServer {
-    #[allow(dead_code)]
-    pub fn deploy_and_start(
-        adb: &dyn AdbOps,
-        device: &Device,
-        local_jar: &str,
-        port: u16,
-    ) -> Result<Self, crate::types::AdbError> {
-        let remote_jar = "/data/local/tmp/scrcpy-server.jar";
-        adb.push(device, local_jar, remote_jar)?;
-        adb.forward(device, port, "scrcpy")?;
-        let args = [
-            &format!("CLASSPATH={}", remote_jar),
-            "app_process",
-            "/",
-            "com.genymobile.scrcpy.Server",
-            "4.0",
-            "log_level=debug",
-            "tunnel_forward=true",
-            "video=false",
-            "audio=false",
-            "control=true",
-            "cleanup=true",
-            "send_device_meta=false",
-            "send_dummy_byte=false",
-            "send_frame_meta=false",
-            "send_stream_meta=false",
-        ];
-        let mut process = adb.spawn_shell(device, &args)?;
-        if let Some(stderr) = process.stderr.take() {
-            let serial = device.serial.clone();
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    match line {
-                        Ok(l) => eprintln!("scrcpy-server[{}] stderr: {}", serial, l),
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-        Ok(ScrcpyServer {
-            device: device.clone(),
-            process,
-            port,
-        })
-    }
     pub fn deploy_clipboard_only(
         adb: &dyn AdbOps,
         device: &Device,
@@ -130,7 +84,6 @@ impl ScrcpyServer {
 /// 从 reader 中解析一个 scrcpy DeviceMessage 剪贴板事件。
 ///
 /// scrcpy 手机→PC 剪贴板消息格式（全部大端序）：
-#[allow(dead_code)]
 /// - 0:  1 byte:  消息类型（0x00 = TYPE_CLIPBOARD）
 /// - 1:  4 bytes: 文本长度（大端 u32）
 /// - 5:  N bytes: UTF-8 文本内容
@@ -140,6 +93,7 @@ impl ScrcpyServer {
 /// 返回 `Ok(Some(text))` 表示成功读取剪贴板事件，
 /// 返回 `Ok(None)` 表示消息类型不是剪贴板事件，
 /// 返回 `Err` 表示读取失败（连接断开或协议错误）。
+#[allow(dead_code)]
 pub fn parse_clipboard_event<R: Read>(reader: &mut R) -> Result<Option<String>, AdbError> {
     let mut type_buf = [0u8; 1];
     reader.read_exact(&mut type_buf).map_err(AdbError::Io)?;
@@ -182,6 +136,7 @@ pub fn parse_clipboard_event<R: Read>(reader: &mut R) -> Result<Option<String>, 
 /// - 接收 Core 发来的剪贴板写入指令（ctrl_rx）并写入设备
 ///
 /// 返回 (线程句柄, 连接成功信号)。
+#[allow(dead_code)]
 pub fn spawn_clipboard_listener(
     port: u16,
     ctrl_rx: Receiver<String>,
@@ -242,6 +197,7 @@ pub fn spawn_clipboard_listener(
 /// 从 scrcpy 控制连接中读取一条设备消息，超时时返回 Ok(None)。
 ///
 /// 先检查 type byte（设了 read_timeout），有数据时取消超时读完整消息。
+#[allow(dead_code)]
 fn read_device_msg(stream: &mut TcpStream) -> Result<Option<String>, AdbError> {
     let mut type_buf = [0u8; 1];
     // 先尝试读 type byte，可能超时
@@ -291,6 +247,7 @@ fn read_device_msg(stream: &mut TcpStream) -> Result<Option<String>, AdbError> {
 /// - 9:  1 byte:  paste 标记（0 = 不自动粘贴）
 /// - 10: 4 bytes: 文本长度（uint32，大端序）
 /// - 14: N bytes: UTF-8 文本内容
+#[allow(dead_code)]
 pub fn send_clipboard_to_device(stream: &mut TcpStream, text: &str) -> Result<(), AdbError> {
     let text_bytes = text.as_bytes();
     let len = text_bytes.len() as u32;
@@ -306,6 +263,25 @@ pub fn send_clipboard_to_device(stream: &mut TcpStream, text: &str) -> Result<()
     Ok(())
 }
 
+/// 异步版 `send_clipboard_to_device`，配合 tokio::net::TcpStream 使用
+pub async fn send_clipboard_async(
+    stream: &mut tokio::net::TcpStream,
+    text: &str,
+) -> Result<(), AdbError> {
+    use tokio::io::AsyncWriteExt;
+    let text_bytes = text.as_bytes();
+    let len = text_bytes.len() as u32;
+
+    let mut msg = Vec::with_capacity(1 + 8 + 1 + 4 + text_bytes.len());
+    msg.push(0x09);
+    msg.extend_from_slice(&0u64.to_be_bytes());
+    msg.push(0u8);
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(text_bytes);
+
+    stream.write_all(&msg).await.map_err(AdbError::Io)?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

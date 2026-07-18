@@ -1,5 +1,3 @@
-use std::path::Path;
-
 mod adb_cmd;
 mod cli;
 mod core;
@@ -8,7 +6,8 @@ mod scrcpy;
 mod session;
 mod types;
 mod wireless_pair;
-mod tray;
+
+use std::path::Path;
 
 fn find_jar() -> Option<String> {
     let candidates = [
@@ -32,30 +31,26 @@ fn find_jar() -> Option<String> {
     None
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let jar_path = find_jar().unwrap_or_else(|| {
         eprintln!("scrcpy-server not found. Please place it in the project root directory.");
         std::process::exit(1);
     });
 
-    let wireless_pair = wireless_pair::WirelessPairing::new();
-    println!("Wireless Pairing Info: {}", wireless_pair.get_info());
+    let wireless_pair_info = wireless_pair::WirelessPairing::new();
+    cli::print_qr_to_terminal(&wireless_pair_info.get_info());
 
-    let (_handle, rx) = wireless_pair::start_discovery(&wireless_pair).unwrap();
-    cli::print_qr_to_terminal(&wireless_pair.get_info());
-
-    let mut core = core::Core::new();
+    let mut core = core::Core::new(jar_path, wireless_pair_info);
     let stop_flag = core.get_stop_flag();
 
-    // Ctrl+C 时触发停止信号，Drop 会自动清理所有 session
-    // 用 was_shutdown 防止 Windows 上 handler 被多次调用
+    // Ctrl+C 触发停止信号
     let was_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     ctrlc::set_handler({
         let was_shutdown = was_shutdown.clone();
         let stop_flag = stop_flag.clone();
         move || {
             if was_shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                // 第二次收到 Ctrl+C 直接强退
                 std::process::exit(0);
             }
             eprintln!("\nShutting down...");
@@ -64,10 +59,6 @@ fn main() {
     })
     .expect("Error setting Ctrl+C handler");
 
-    // 启动系统托盘
-    let _tray_handle = tray::create_tray();
-
-    core.run(rx, &wireless_pair, &jar_path);
-    // core 在这里 drop，stop_all() 自动执行
+    core.run().await;
     println!("Exited. Terminal should be restored.");
 }
