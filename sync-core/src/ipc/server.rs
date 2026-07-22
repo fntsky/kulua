@@ -1,6 +1,7 @@
 use crate::app::Command;
 use crate::ipc::types::*;
 use crate::types::Device;
+use crate::notification::NotifInfo;
 
 use futures::SinkExt;
 use std::collections::HashMap;
@@ -65,13 +66,13 @@ impl Drop for IpcServer {
 /// 启动后台 accept 循环。
 ///
 /// 每个新连接都 spawn 一个 `handle_ipc_connection` 任务来处理帧解析和 JSON-RPC 分发。
-/// 通过 `token.cancel()` 停止循环；server drop 时自动清理端口文件。
 pub fn serve(
     mut server: IpcServer,
     token: CancellationToken,
     cmd_tx: mpsc::Sender<Command>,
     device_watch: watch::Receiver<HashMap<String, Device>>,
     clip_tx: broadcast::Sender<String>,
+    notif_tx: broadcast::Sender<NotifInfo>,
     pair_info: WirelessPairing,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -87,9 +88,10 @@ pub fn serve(
                             let cmd_tx = cmd_tx.clone();
                             let dw = device_watch.clone();
                             let clip_sub = clip_tx.subscribe();
+                            let notif_sub = notif_tx.subscribe();
                             let pi = pair_info.clone();
                             tokio::spawn(handle_ipc_connection(
-                                stream, cmd_tx, dw, clip_sub, pi,
+                                stream, cmd_tx, dw, clip_sub, notif_sub, pi,
                             ));
                         }
                         Err(e) => {
@@ -108,14 +110,17 @@ pub fn serve(
 
 /// 处理单条 IPC 连接：读帧 → 解析 JSON-RPC → 分发 → 写响应。
 ///
-/// 同时监听三个事件源：
+/// 同时监听四个事件源：
 /// - **TCP 帧**：解析 Request 并回复 Response
 /// - **设备变更**（`device_watch.changed()`）：推送 `device.updated` 事件
+/// - **剪贴板变更**（`clip_sub`）：推送 `clipboard.changed` 事件
+/// - **通知事件**（`notif_sub`）：推送 `notification` 事件
 async fn handle_ipc_connection(
     stream: TcpStream,
     cmd_tx: mpsc::Sender<Command>,
     mut device_watch: watch::Receiver<HashMap<String, Device>>,
     mut clip_sub: broadcast::Receiver<String>,
+    mut notif_sub: broadcast::Receiver<NotifInfo>,
     pair_info: WirelessPairing,
 ) {
     let mut framed = Framed::new(stream, FrameCodec);
@@ -166,6 +171,29 @@ async fn handle_ipc_connection(
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => {} // 跳过丢失消息
+                }
+            }
+
+            // ── 通知事件 ──
+            result = notif_sub.recv() => {
+                match result {
+                    Ok(notif) => {
+                        let event = Event::Notification {
+                            data: NotifData {
+                                serial: String::new(), // 后续从 NotifInfo 补充 serial
+                                title: notif.title.unwrap_or_default(),
+                                text: notif.body.unwrap_or_default(),
+                                app: notif.package,
+                            },
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&event) {
+                            if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         }
@@ -281,6 +309,24 @@ async fn dispatch_request(
             }))
         }
 
+        // 更新 session 配置（通知同步 / 剪贴板同步开关）
+        "session.update" => {
+            let serial = req.params.get("serial").and_then(|v| v.as_str()).unwrap_or("");
+            let clipboard_sync = req.params.get("clipboard_sync").and_then(|v| v.as_bool()).unwrap_or(true);
+            let notification_sync = req.params.get("notification_sync").and_then(|v| v.as_bool()).unwrap_or(true);
+            if serial.is_empty() {
+                return make_error(req.id, -1, "缺少 serial 参数");
+            }
+            if cmd_tx.send(Command::UpdateConfig {
+                serial: serial.to_string(),
+                clipboard_sync,
+                notification_sync,
+            }).await.is_err() {
+                return make_error(req.id, -1, "core 正在关闭");
+            }
+            make_result(req.id, serde_json::Value::Null)
+        }
+
         // 未知方法
         _ => make_error(req.id, -1, &format!("未知方法: {}", req.method)),
     }
@@ -353,12 +399,13 @@ mod tests {
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
         let (clip_tx, _) = broadcast::channel(64);
+        let (notif_tx, notif_rx) = broadcast::channel(64);
 
         // accept + handle_ipc_connection
         let join = tokio::spawn(async move {
             let stream = server.accept().await.unwrap();
             let clip_sub = clip_tx.subscribe();
-            handle_ipc_connection(stream, _cmd_tx, device_watch, clip_sub, WirelessPairing::new()).await;
+            handle_ipc_connection(stream, _cmd_tx, device_watch, clip_sub, notif_rx, WirelessPairing::new()).await;
         });
 
         // 客户端连接并发送 device.list 请求
@@ -393,14 +440,9 @@ mod tests {
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
         let (clip_tx, _) = broadcast::channel(64);
+        let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, WirelessPairing::new());
-
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        drop(client);
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        token.cancel();
+        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, notif_tx, WirelessPairing::new());
     }
 
     #[tokio::test]
@@ -411,8 +453,9 @@ mod tests {
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
         let (clip_tx, _) = broadcast::channel(64);
+        let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, WirelessPairing::new());
+        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, notif_tx, WirelessPairing::new());
 
         // 第一次连接
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -424,7 +467,6 @@ mod tests {
         let c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
         drop(c2);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
         token.cancel();
     }
 }

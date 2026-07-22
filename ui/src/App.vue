@@ -7,6 +7,7 @@ import QRCode from "qrcode";
 interface DeviceInfo {
   serial: string;
   state: string;
+  name: string;
 }
 
 interface PairingInfo {
@@ -15,12 +16,52 @@ interface PairingInfo {
   wifi_string: string;
 }
 
+interface DeviceConfig {
+  clipboardSync: boolean;
+  notificationSync: boolean;
+}
+
 const connected = ref(false);
 const devices = ref<DeviceInfo[]>([]);
 const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
 const qrCanvas = ref<HTMLCanvasElement | null>(null);
+const deviceConfigs = ref<Record<string, DeviceConfig>>({});
 
+function getDeviceConfig(serial: string): DeviceConfig {
+  if (!deviceConfigs.value[serial]) {
+    deviceConfigs.value[serial] = { clipboardSync: true, notificationSync: true };
+  }
+  return deviceConfigs.value[serial];
+}
+
+async function toggleClipboardSync(serial: string) {
+  const cfg = getDeviceConfig(serial);
+  cfg.clipboardSync = !cfg.clipboardSync;
+  try {
+    await invoke("update_session_config", {
+      serial,
+      clipboardSync: cfg.clipboardSync,
+      notificationSync: cfg.notificationSync,
+    });
+  } catch (e) {
+    console.error("toggleClipboardSync failed:", e);
+  }
+}
+
+async function toggleNotificationSync(serial: string) {
+  const cfg = getDeviceConfig(serial);
+  cfg.notificationSync = !cfg.notificationSync;
+  try {
+    await invoke("update_session_config", {
+      serial,
+      clipboardSync: cfg.clipboardSync,
+      notificationSync: cfg.notificationSync,
+    });
+  } catch (e) {
+    console.error("toggleNotificationSync failed:", e);
+  }
+}
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
   connected.value = conn;
   devices.value = devs;
@@ -116,8 +157,31 @@ onMounted(async () => {
           :key="d.serial"
           class="device-card"
         >
-          <span class="serial">{{ d.serial }}</span>
-          <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
+          <div class="device-header">
+            <div class="device-title">
+              <span class="device-name" v-if="d.name">{{ d.name }}</span>
+              <span class="serial">{{ d.serial }}</span>
+            </div>
+            <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
+          </div>
+          <div class="device-toggles">
+            <label class="toggle-row" title="剪贴板同步">
+              <span class="toggle-label">剪贴板</span>
+              <span
+                class="toggle-switch"
+                :class="{ active: getDeviceConfig(d.serial).clipboardSync }"
+                @click="toggleClipboardSync(d.serial)"
+              />
+            </label>
+            <label class="toggle-row" title="通知同步">
+              <span class="toggle-label">通知</span>
+              <span
+                class="toggle-switch"
+                :class="{ active: getDeviceConfig(d.serial).notificationSync }"
+                @click="toggleNotificationSync(d.serial)"
+              />
+            </label>
+          </div>
         </div>
       </div>
 
@@ -189,11 +253,45 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
 .hint { color: var(--dim); font-size: 14px; text-align: center; padding: 30px 0; }
 .device-card {
   background: var(--card); border-radius: 10px;
-  padding: 12px 16px; display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; display: flex; flex-direction: column; gap: 8px;
+}
+.device-header {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.device-toggles {
+  display: flex; align-items: center; gap: 16px; padding-top: 4px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.toggle-row {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  font-size: 12px; color: var(--dim);
+}
+.toggle-label { user-select: none; }
+.toggle-switch {
+  position: relative; width: 36px; height: 20px;
+  background: #444; border-radius: 10px; transition: 0.2s; cursor: pointer;
+  flex-shrink: 0;
+}
+.toggle-switch::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #888; transition: 0.2s;
+}
+.toggle-switch.active { background: var(--green); }
+.toggle-switch.active::after {
+  left: 18px; background: #fff;
 }
 .serial {
   font-size: 13px; font-weight: 500;
   font-family: "Cascadia Code", "Fira Code", monospace;
+}
+.device-title {
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 0;
+}
+.device-name {
+  font-size: 14px; font-weight: 600; color: #fff;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .state {
   font-size: 12px; padding: 3px 10px; border-radius: 20px; font-weight: 500;
@@ -202,7 +300,6 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
 .state.Offline { background: #b71c1c; color: #ef9a9a; }
 .state.Unauthorized { background: #e65100; color: #ffcc80; }
 .state.Unknown { background: #37474f; color: #b0bec5; }
-
 /* QR code */
 .qr-section { margin-bottom: 16px; }
 .qr-card {

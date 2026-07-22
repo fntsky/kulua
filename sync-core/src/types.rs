@@ -7,6 +7,9 @@ pub struct Device {
     pub serial: String,
     /// 连接状态
     pub state: DeviceState,
+    /// 设备名称（从 scrcpy 协议获取，空表示未知）
+    #[serde(default)]
+    pub name: String,
 }
 
 /// 设备状态

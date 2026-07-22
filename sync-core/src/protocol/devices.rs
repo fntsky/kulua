@@ -23,8 +23,7 @@ pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
                 "unauthorized" => DeviceState::Unauthorized,
                 s => DeviceState::Unknown(s.to_string()),
             };
-
-            Some(Device { serial, state })
+            Some(Device { serial, state, name: String::new() })
         })
         .collect();
 

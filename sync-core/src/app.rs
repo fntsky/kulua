@@ -3,8 +3,8 @@ use crate::notification::{self, NotifInfo};
 use crate::session;
 use crate::types::Device;
 use crate::wireless_pair;
-
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -15,6 +15,11 @@ use tokio_util::sync::CancellationToken;
 pub enum Command {
     Connect(String),
     Disconnect(String),
+    UpdateConfig {
+        serial: String,
+        clipboard_sync: bool,
+        notification_sync: bool,
+    },
 }
 
 pub struct Core {
@@ -36,6 +41,8 @@ pub struct Core {
     phone_clip_tx: mpsc::Sender<String>,
     notif_rx: mpsc::Receiver<NotifInfo>,
     notif_tx: mpsc::Sender<NotifInfo>,
+    /// 广播通知给 IPC 等订阅者
+    notif_broadcast: broadcast::Sender<NotifInfo>,
 
     // ── IPC 命令通道 ──
     cmd_tx: mpsc::Sender<Command>,
@@ -43,11 +50,19 @@ pub struct Core {
 
     // ── 状态 ──
     sessions: HashMap<String, session::Handle>,
+    /// 每个连接的设备 session 配置
+    session_configs: HashMap<String, session::SessionConfig>,
     pending_serials: HashMap<String, Instant>,
     /// 上次对每个 pending 设备发起 adb connect 的时间（用于 5s 重试间隔）
     last_connect_attempt: HashMap<String, Instant>,
     port_counter: u16,
     token: CancellationToken,
+    /// 用于从 session 接收设备名称并更新 device_watch
+    device_name_rx: mpsc::Receiver<(String, String)>,
+    /// sender 副本，传给每个新 session
+    device_name_tx: mpsc::Sender<(String, String)>,
+    /// device_watch 的 sender 副本（用于更新设备名称）
+    device_tx: watch::Sender<HashMap<String, Device>>,
 
     // ── 剪贴板防回环 ──
     clipboard_last_seen: Option<String>,
@@ -60,8 +75,8 @@ impl Core {
         let (clip_tx, _) = broadcast::channel(64);
         let (phone_clip_tx, phone_clip_rx) = mpsc::channel(256);
         let (notif_tx, notif_rx) = mpsc::channel(64);
+        let (notif_broadcast_tx, _) = broadcast::channel(64);
         let (device_tx, device_watch) = watch::channel(HashMap::new());
-
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
 
         let token = CancellationToken::new();
@@ -90,8 +105,11 @@ impl Core {
             wireless_pair::MdnsHandle::empty()
         };
 
-        // 启动设备刷新后台任务
+        // 启动设备刷新后台任务（移走 device_tx，Core 保留 clone 以更新名称）
+        let core_device_tx = device_tx.clone();
         crate::device_refresh::spawn(device_tx, token.clone());
+
+        let (device_name_tx, device_name_rx) = mpsc::channel::<(String, String)>(32);
 
         Self {
             adb_cmd: Arc::new(AdbCmd::new()),
@@ -106,13 +124,18 @@ impl Core {
             phone_clip_tx,
             notif_rx,
             notif_tx,
+            notif_broadcast: notif_broadcast_tx,
             sessions: HashMap::new(),
+            session_configs: HashMap::new(),
             pending_serials: HashMap::new(),
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             last_connect_attempt: HashMap::new(),
             port_counter: 27183,
             token,
+            device_name_rx,
+            device_name_tx,
+            device_tx: core_device_tx,
             clipboard_last_seen: None,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
@@ -134,7 +157,15 @@ impl Core {
         // 启动 IPC 服务器后台 accept 循环
         if let Ok(server) = crate::ipc::server::IpcServer::bind().await {
             let token = self.token.clone();
-            crate::ipc::server::serve(server, token, self.cmd_tx.clone(), self.device_watch.clone(), self.clip_broadcast.clone(), self.pair_info.clone());
+            crate::ipc::server::serve(
+                server,
+                token,
+                self.cmd_tx.clone(),
+                self.device_watch.clone(),
+                self.clip_broadcast.clone(),
+                self.notif_broadcast.clone(),
+                self.pair_info.clone(),
+            );
         } else {
             eprintln!("IPC server failed to bind, continuing without IPC");
         }
@@ -149,6 +180,13 @@ impl Core {
                 Some(text) = self.phone_clip_rx.recv()  => self.on_phone_clipboard(text),
                 Some(n)    = self.notif_rx.recv()       => self.on_notification(n),
                 Some(cmd)  = cmd_rx.recv()              => self.on_command(cmd).await,
+                Some((serial, name)) = self.device_name_rx.recv() => {
+                    self.device_tx.send_modify(|devices| {
+                        if let Some(device) = devices.get_mut(&serial) {
+                            device.name = name;
+                        }
+                    });
+                }
                 _ = tick.tick() => {
                     self.poll_system_clipboard();
                     let devices = self.device_watch.borrow_and_update().clone();
@@ -199,15 +237,6 @@ impl Core {
         self.clipboard_last_seen = Some(text);
     }
 
-    fn on_notification(&mut self, notif: NotifInfo) {
-        if let Some(title) = &notif.title {
-            println!("通知: [{}] {}", notif.package, title);
-        } else {
-            println!("通知: [{}]", notif.package);
-        }
-        notification::show_desktop_notification(&notif);
-    }
-
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::Connect(serial) => {
@@ -218,8 +247,31 @@ impl Core {
                     handle.stop(self.adb_cmd.as_ref()).await;
                 }
                 self.pending_serials.remove(&serial);
+                self.session_configs.remove(&serial);
+            }
+            Command::UpdateConfig { serial, clipboard_sync, notification_sync } => {
+                // 直接切换原子标志，无需重启 session
+                if let Some(handle) = self.sessions.get(&serial) {
+                    handle.clipboard_enabled.store(clipboard_sync, Ordering::SeqCst);
+                    handle.notification_enabled.store(notification_sync, Ordering::SeqCst);
+                }
+                // 更新 Core 的配置记录（供新 session 或后续查询使用）
+                self.session_configs.insert(serial, session::SessionConfig {
+                    clipboard_sync,
+                    notification_sync,
+                });
             }
         }
+    }
+
+    fn on_notification(&mut self, notif: NotifInfo) {
+        if let Some(title) = &notif.title {
+            println!("通知: [{}] {}", notif.package, title);
+        } else {
+            println!("通知: [{}]", notif.package);
+        }
+        notification::show_desktop_notification(&notif);
+        let _ = self.notif_broadcast.send(notif);
     }
 
     fn poll_system_clipboard(&mut self) {
@@ -321,7 +373,11 @@ impl Core {
         let adb = self.adb_cmd.clone();
         let jar_path = self.jar_path.clone();
 
-        let task = tokio::spawn(session::run(
+        // 共享原子标志，Core 后续可随时切换
+        let clipboard_enabled = Arc::new(AtomicBool::new(true));
+        let notification_enabled = Arc::new(AtomicBool::new(true));
+
+        let mut sess = session::Session::new(
             adb,
             device.clone(),
             jar_path,
@@ -330,7 +386,12 @@ impl Core {
             phone_clip_tx,
             notif_tx,
             stop_rx,
-        ));
+            clipboard_enabled.clone(),
+            notification_enabled.clone(),
+            self.device_name_tx.clone(),
+        );
+
+        let task = tokio::spawn(async move { sess.run().await });
 
         self.sessions.insert(
             device.serial.clone(),
@@ -338,6 +399,8 @@ impl Core {
                 device,
                 stop_tx: Some(stop_tx),
                 task,
+                clipboard_enabled,
+                notification_enabled,
             },
         );
     }
@@ -367,18 +430,22 @@ mod tests {
             Device {
                 serial: "ok".into(),
                 state: DeviceState::Device,
+                name: String::new(),
             },
             Device {
                 serial: "off".into(),
                 state: DeviceState::Offline,
+                name: String::new(),
             },
             Device {
                 serial: "unauth".into(),
                 state: DeviceState::Unauthorized,
+                name: String::new(),
             },
             Device {
                 serial: "ok2".into(),
                 state: DeviceState::Device,
+                name: String::new(),
             },
         ];
         let mut map = HashMap::new();
@@ -414,13 +481,18 @@ mod tests {
             phone_clip_tx,
             notif_rx: mpsc::channel(64).1,
             notif_tx,
+            notif_broadcast: broadcast::channel(64).0,
             cmd_tx: mpsc::channel(32).0,
             cmd_rx: Some(mpsc::channel(32).1),
             sessions: HashMap::new(),
+            session_configs: HashMap::new(),
             pending_serials: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
             last_connect_attempt: HashMap::new(),
             port_counter: 27183,
             token: CancellationToken::new(),
+            device_name_rx: mpsc::channel::<(String, String)>(32).1,
+            device_name_tx: mpsc::channel::<(String, String)>(32).0,
+            device_tx: watch::channel(HashMap::new()).0,
             clipboard_last_seen: None,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
@@ -432,6 +504,7 @@ mod tests {
             Device {
                 serial: "192.168.1.100:5555".into(),
                 state: DeviceState::Device,
+                name: String::new(),
             },
         )]);
 

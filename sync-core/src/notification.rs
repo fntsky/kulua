@@ -123,21 +123,26 @@ pub fn spawn_notification_poller(
 }
 
 /// 桥接版本：启动 std 线程通知轮询器，通过 bridging 转发到 tokio mpsc channel
+///
+/// `enabled` 控制是否将通知推送给 Core（false 时丢弃但仍保持轮询）
 pub fn spawn_notification_poller_tokio(
     adb: Arc<dyn AdbOps>,
     device: Device,
     notif_tx: tokio::sync::mpsc::Sender<NotifInfo>,
     stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     let (bridge_tx, bridge_rx) = std_mpsc::channel::<NotifInfo>();
     let (poller_handle, _) = spawn_notification_poller(adb, device, bridge_tx);
-    // 后台转发：std mpsc → tokio mpsc
+    // 后台转发：std mpsc → tokio mpsc，检查 enabled 标志
     tokio::task::spawn_blocking(move || {
         while !stop.load(Ordering::SeqCst) {
             match bridge_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(info) => {
-                    if notif_tx.blocking_send(info).is_err() {
-                        break;
+                    if enabled.load(Ordering::SeqCst) {
+                        if notif_tx.blocking_send(info).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {}
