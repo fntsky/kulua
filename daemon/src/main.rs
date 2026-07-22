@@ -25,6 +25,79 @@ fn find_jar() -> Option<String> {
     }
     None
 }
+fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
+    use tray_icon::menu::{Menu, MenuItem, MenuEvent};
+    use tray_icon::{TrayIconBuilder, Icon};
+
+    std::thread::spawn(move || {
+        let open_item = MenuItem::new("打开", true, None);
+        let quit_item = MenuItem::new("退出", true, None);
+
+        let menu = Menu::new();
+        menu.append(&open_item).expect("append menu item");
+        menu.append(&quit_item).expect("append menu item");
+
+        let icon = Icon::from_rgba(
+            std::iter::repeat([0x44u8, 0xbb, 0xff, 0xff])
+                .take(16 * 16)
+                .flatten()
+                .collect(),
+            16,
+            16,
+        )
+        .expect("create icon");
+
+        let _tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_icon(icon)
+            .with_tooltip("Sync Workspace")
+            .build()
+            .expect("build tray icon");
+
+        // Windows: Win32 message loop required by tray-icon
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetMessageW, TranslateMessage, DispatchMessageW,
+            };
+            use std::ptr::null_mut;
+
+            unsafe {
+                let mut msg = std::mem::zeroed();
+                loop {
+                    let ret = GetMessageW(&mut msg, null_mut(), 0, 0);
+                    if ret == 0 || ret == -1 {
+                        break;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+
+                    while let Ok(event) = MenuEvent::receiver().try_recv() {
+                        if event.id() == quit_item.id() {
+                            token.cancel();
+                        } else if event.id() == open_item.id() {
+                            // TODO: 打开功能
+                        }
+                    }
+                }
+            }
+        }
+
+        // Non-Windows: block on channel
+        #[cfg(not(target_os = "windows"))]
+        {
+            let receiver = MenuEvent::receiver();
+            while let Ok(event) = receiver.recv() {
+                if event.id() == quit_item.id() {
+                    token.cancel();
+                } else if event.id() == open_item.id() {
+                    // TODO: 打开功能
+                }
+            }
+        }
+    });
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -53,6 +126,7 @@ async fn main() {
         }
     })
     .expect("Error setting Ctrl+C handler");
+    setup_tray_icon(token);
 
     core.run().await;
 }
