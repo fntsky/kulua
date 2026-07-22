@@ -1,2 +1,4 @@
 /target
 .claude/worktrees
+/ui/frontend/dist
+node_modules
