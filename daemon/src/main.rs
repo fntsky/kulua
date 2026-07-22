@@ -76,7 +76,15 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
                         if event.id() == quit_item.id() {
                             token.cancel();
                         } else if event.id() == open_item.id() {
-                            // TODO: 打开功能
+                            // Launch sync-ui window
+                            let ui_path = std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.parent().map(|d| d.join("sync-ui.exe")))
+                                .filter(|p| p.exists())
+                                .unwrap_or_else(|| {
+                                    std::path::PathBuf::from("../target/debug/sync-ui.exe")
+                                });
+                            let _ = std::process::Command::new(ui_path).spawn();
                         }
                     }
                 }
@@ -91,7 +99,20 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
                 if event.id() == quit_item.id() {
                     token.cancel();
                 } else if event.id() == open_item.id() {
-                    // TODO: 打开功能
+                    // Launch sync-ui window
+                    let ui_name = if cfg!(target_os = "windows") { "sync-ui.exe" } else { "sync-ui" };
+                    let ui_path = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join(ui_name)))
+                        .filter(|p| p.exists())
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(if cfg!(target_os = "windows") {
+                                "../target/debug/sync-ui.exe"
+                            } else {
+                                "../target/debug/sync-ui"
+                            })
+                        });
+                    let _ = std::process::Command::new(ui_path).spawn();
                 }
             }
         }
