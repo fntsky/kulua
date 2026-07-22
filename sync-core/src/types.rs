@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// 设备信息
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     /// 设备序列号 / IP 地址
     pub serial: String,
@@ -8,7 +10,7 @@ pub struct Device {
 }
 
 /// 设备状态
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceState {
     /// 正常连接
     Device,

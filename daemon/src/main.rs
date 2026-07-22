@@ -54,6 +54,5 @@ async fn main() {
     })
     .expect("Error setting Ctrl+C handler");
 
-    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
-    core.run(cmd_rx).await;
+    core.run().await;
 }

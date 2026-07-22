@@ -37,6 +37,10 @@ pub struct Core {
     notif_rx: mpsc::Receiver<NotifInfo>,
     notif_tx: mpsc::Sender<NotifInfo>,
 
+    // ── IPC 命令通道 ──
+    cmd_tx: mpsc::Sender<Command>,
+    cmd_rx: Option<mpsc::Receiver<Command>>,
+
     // ── 状态 ──
     sessions: HashMap<String, session::Handle>,
     pending_serials: HashMap<String, Instant>,
@@ -57,6 +61,8 @@ impl Core {
         let (phone_clip_tx, phone_clip_rx) = mpsc::channel(256);
         let (notif_tx, notif_rx) = mpsc::channel(64);
         let (device_tx, device_watch) = watch::channel(HashMap::new());
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
 
         let token = CancellationToken::new();
 
@@ -102,6 +108,8 @@ impl Core {
             notif_tx,
             sessions: HashMap::new(),
             pending_serials: HashMap::new(),
+            cmd_tx,
+            cmd_rx: Some(cmd_rx),
             last_connect_attempt: HashMap::new(),
             port_counter: 27183,
             token,
@@ -118,9 +126,22 @@ impl Core {
 
     // ─── 主循环 ──────────────────────────────────────────
 
-    pub async fn run(&mut self, mut cmd_rx: mpsc::Receiver<Command>) {
+    pub async fn run(&mut self) {
+        // 取出内部命令通道（仅能调用一次）
+        let mut cmd_rx = self.cmd_rx.take()
+            .expect("Core::run can only be called once");
+
+        // 启动 IPC 服务器后台 accept 循环
+        if let Ok(server) = crate::ipc::server::IpcServer::bind().await {
+            let token = self.token.clone();
+            crate::ipc::server::serve(server, token, self.cmd_tx.clone(), self.device_watch.clone(), self.clip_broadcast.clone(), self.pair_info.clone());
+        } else {
+            eprintln!("IPC server failed to bind, continuing without IPC");
+        }
+
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = self.token.cancelled() => break,
@@ -136,6 +157,7 @@ impl Core {
                 }
             }
         }
+
         self.stop_all().await;
     }
 
@@ -392,6 +414,8 @@ mod tests {
             phone_clip_tx,
             notif_rx: mpsc::channel(64).1,
             notif_tx,
+            cmd_tx: mpsc::channel(32).0,
+            cmd_rx: Some(mpsc::channel(32).1),
             sessions: HashMap::new(),
             pending_serials: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
             last_connect_attempt: HashMap::new(),
