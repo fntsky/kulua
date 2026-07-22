@@ -46,7 +46,14 @@ pub fn generate_qr_code(info: &str) -> Result<DynamicImage, Box<dyn std::error::
 
 #[derive(Debug)]
 pub enum MdnsEvent {
-    PairingDiscovered { host: String, port: u16 },
+    PairingDiscovered {
+        host: String,
+        port: u16,
+    },
+    ConnectDiscovered {
+        host: String,
+        port: u16,
+    },
     #[allow(dead_code)]
     Error(String),
 }
@@ -74,7 +81,7 @@ pub fn start_discovery(
 
     let pairing_receiver = mdns.browse("_adb-tls-pairing._tcp.local.")?;
 
-    let _connect_receiver = mdns.browse("_adb-tls-connect._tcp.local.")?;
+    let connect_receiver = mdns.browse("_adb-tls-connect._tcp.local.")?;
 
     let dns_id = info.dns_id.clone();
 
@@ -91,9 +98,7 @@ pub fn start_discovery(
             while let Ok(event) = pairing_receiver.recv() {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        println!("PAIRING: {:?}", info);
-
-                        // 这里先保持你原来的逻辑
+                        println!("[PAIRING]Resolved service: {:?}", info);
                         if info.get_fullname().contains(&dns_id) {
                             if let Some(addr) = info.get_addresses_v4().iter().next() {
                                 let _ = tx.send(MdnsEvent::PairingDiscovered {
@@ -101,6 +106,29 @@ pub fn start_discovery(
                                     port: info.get_port(),
                                 });
                             }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    //
+    // connect
+    //
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            while let Ok(event) = connect_receiver.recv() {
+                match event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        println!("[CONNECT] Resolved service: {:?}", info);
+                        if let Some(addr) = info.get_addresses_v4().iter().next() {
+                            let _ = tx.send(MdnsEvent::ConnectDiscovered {
+                                host: addr.to_string(),
+                                port: info.get_port(),
+                            });
                         }
                     }
                     _ => {}
@@ -140,14 +168,23 @@ mod tests {
         let p = WirelessPairing::new();
         let info = p.get_info();
 
-        assert!(info.starts_with("WIFI:T:ADB;S:"), "info should start with WIFI:T:ADB;S:");
+        assert!(
+            info.starts_with("WIFI:T:ADB;S:"),
+            "info should start with WIFI:T:ADB;S:"
+        );
         assert!(info.ends_with(";;"), "info should end with ;;");
 
         let parts: Vec<&str> = info.split(';').collect();
         assert_eq!(parts.len(), 5, "splitting by ';' should yield 5 parts");
         assert_eq!(parts[0], "WIFI:T:ADB");
-        assert!(parts[1].starts_with("S:"), "second part should start with S:");
-        assert!(parts[2].starts_with("P:"), "third part should start with P:");
+        assert!(
+            parts[1].starts_with("S:"),
+            "second part should start with S:"
+        );
+        assert!(
+            parts[2].starts_with("P:"),
+            "third part should start with P:"
+        );
     }
 
     #[test]

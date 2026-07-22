@@ -2,5 +2,5 @@
 resolver = "2"
 
 members = [
-    "core", "daemon", "sync-core",
+    "daemon", "sync-core",
 ]

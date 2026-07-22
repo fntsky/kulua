@@ -37,23 +37,23 @@ async fn main() {
     cli::print_qr_to_terminal(&wireless_pair_info.get_info());
 
     let mut core = app::Core::new(jar_path, wireless_pair_info);
-    let stop_flag = core.get_stop_flag();
+    let token = core.get_token();
 
     // Ctrl+C 触发停止信号
     let was_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     ctrlc::set_handler({
         let was_shutdown = was_shutdown.clone();
-        let stop_flag = stop_flag.clone();
+        let token = token.clone();
         move || {
             if was_shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 std::process::exit(0);
             }
             eprintln!("\nShutting down...");
-            stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            token.cancel();
         }
     })
     .expect("Error setting Ctrl+C handler");
 
-    core.run().await;
-    println!("Exited. Terminal should be restored.");
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
+    core.run(cmd_rx).await;
 }

@@ -4,11 +4,20 @@ use crate::session;
 use crate::types::{Device, DeviceState};
 use crate::wireless_pair;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::io;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
+
+#[allow(dead_code)]
+/// 外部命令：UI 或其他组件通过此枚举向主循环发送请求
+pub enum Command {
+    Connect(String),
+    Disconnect(String),
+}
 
 pub struct Core {
     adb_cmd: Arc<dyn AdbOps>,
@@ -32,11 +41,11 @@ pub struct Core {
 
     // ── 状态 ──
     sessions: HashMap<String, session::Handle>,
-    pending_serials: HashSet<String>,
+    pending_serials: HashMap<String, Instant>,
     /// 上次对每个 pending 设备发起 adb connect 的时间（用于 5s 重试间隔）
     last_connect_attempt: HashMap<String, Instant>,
     port_counter: u16,
-    stop_flag: Arc<AtomicBool>,
+    token: CancellationToken,
 
     // ── 剪贴板防回环 ──
     clipboard_last_seen: Option<String>,
@@ -51,15 +60,22 @@ impl Core {
         let (notif_tx, notif_rx) = mpsc::channel(64);
         let (device_tx, device_watch) = watch::channel(HashMap::new());
 
+        let token = CancellationToken::new();
+
         // 启动 mDNS 发现（同步线程 → 桥接到 tokio mpsc）
         let (mdns_tx, mdns_rx) = mpsc::channel(16);
-        let mdns_handle = if let Ok((handle, std_rx)) =
-            wireless_pair::start_discovery(&pair_info)
-        {
+        let mdns_handle = if let Ok((handle, std_rx)) = wireless_pair::start_discovery(&pair_info) {
+            let token = token.clone();
             tokio::task::spawn_blocking(move || {
-                while let Ok(event) = std_rx.recv() {
-                    if mdns_tx.blocking_send(event).is_err() {
-                        break;
+                while !token.is_cancelled() {
+                    match std_rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(event) => {
+                            if mdns_tx.blocking_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
             });
@@ -71,7 +87,7 @@ impl Core {
         };
 
         // 启动设备刷新后台任务
-        Self::spawn_device_refresh(device_tx);
+        Self::spawn_device_refresh(device_tx, token.clone());
 
         Self {
             adb_cmd: Arc::new(AdbCmd::new()),
@@ -87,132 +103,230 @@ impl Core {
             notif_rx,
             notif_tx,
             sessions: HashMap::new(),
-            pending_serials: HashSet::new(),
+            pending_serials: HashMap::new(),
             last_connect_attempt: HashMap::new(),
             port_counter: 27183,
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            token,
             clipboard_last_seen: None,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         }
     }
 
-    pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
-        self.stop_flag.clone()
+    pub fn get_token(&self) -> CancellationToken {
+        self.token.clone()
     }
 
-    /// 后台任务：每 1s 执行 `adb devices`，通过 watch channel 推送最新设备列表
-    fn spawn_device_refresh(device_tx: watch::Sender<HashMap<String, Device>>) {
-        tokio::task::spawn_blocking(move || {
-            let adb = AdbCmd::new();
-            loop {
-                let mut map = HashMap::new();
-                if let Ok(list) = adb.devices() {
-                    for d in list {
-                        if d.state == DeviceState::Device {
-                            map.insert(d.serial.clone(), d);
+    /// 通过 `adb track-devices` 长连接监听设备状态变化，通过 watch channel 推送
+    fn spawn_device_refresh(device_tx: watch::Sender<HashMap<String, Device>>, token: CancellationToken) {
+        const MAX_PAYLOAD: usize = 64 * 1024;
+
+        #[cfg(windows)]
+        let adb_candidate = "./adb.exe";
+        #[cfg(not(windows))]
+        let adb_candidate = "./adb";
+
+        let adb_path = if std::path::Path::new(adb_candidate).exists() {
+            std::path::PathBuf::from(adb_candidate)
+        } else {
+            std::path::PathBuf::from("adb")
+        };
+
+        tokio::spawn(async move {
+            use tokio::process::Command;
+            let mut last: HashMap<String, Device> = HashMap::new();
+
+            while !token.is_cancelled() {
+                let mut child = match Command::new(&adb_path)
+                    .arg("track-devices")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to spawn adb track-devices: {}", e);
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                        }
+                    }
+                };
+
+                let stdout = child.stdout.take().expect("adb track-devices stdout");
+                let mut reader = tokio::io::BufReader::new(stdout);
+                let mut len_buf = [0u8; 4];
+
+                'frame: loop {
+                    // 读取 4 字节 ASCII hex 长度头（可取消）
+                    let result = tokio::select! {
+                        _ = token.cancelled() => break 'frame,
+                        r = reader.read_exact(&mut len_buf) => r,
+                    };
+
+                    if let Err(e) = result {
+                        if e.kind() != io::ErrorKind::UnexpectedEof {
+                            eprintln!("track-devices disconnected: {}", e);
+                        }
+                        break;
+                    }
+
+                    let len_str = match std::str::from_utf8(&len_buf) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("track-devices invalid length header: {}", e);
+                            break;
+                        }
+                    };
+
+                    let len = match usize::from_str_radix(len_str, 16) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("track-devices bad length: {}", e);
+                            break;
+                        }
+                    };
+
+                    // ADB 协议允许空 payload，跳过
+                    if len == 0 {
+                        continue;
+                    }
+
+                    if len > MAX_PAYLOAD {
+                        eprintln!("track-devices payload too large: {} bytes", len);
+                        break;
+                    }
+
+                    // 读取 payload（可取消）
+                    let mut payload = vec![0u8; len];
+                    let result = tokio::select! {
+                        _ = token.cancelled() => break 'frame,
+                        r = reader.read_exact(&mut payload) => r,
+                    };
+
+                    if let Err(e) = result {
+                        eprintln!("track-devices read payload error: {}", e);
+                        break;
+                    }
+
+                    // 解析并推送
+                    let adb = AdbCmd::new();
+                    if let Ok(devices) = adb.parse_devices(&payload) {
+                        let mut map = HashMap::new();
+                        for d in devices {
+                            if d.state == DeviceState::Device {
+                                map.insert(d.serial.clone(), d);
+                            }
+                        }
+
+                        // 避免重复发送相同设备列表
+                        if map != last {
+                            last = map.clone();
+                            let _ = device_tx.send(map);
                         }
                     }
                 }
-                let _ = device_tx.send(map);
-                std::thread::sleep(Duration::from_secs(1));
+
+                child.kill().await.ok();
+                tokio::select! {
+                    _ = token.cancelled() => {},
+                    _ = child.wait() => {},
+                }
             }
         });
     }
 
     // ─── 主循环 ──────────────────────────────────────────
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, mut cmd_rx: mpsc::Receiver<Command>) {
+        let mut tick = tokio::time::interval(Duration::from_millis(150));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            if self.should_stop() {
-                break;
+            tokio::select! {
+                _ = self.token.cancelled() => break,
+                Some(ev)   = self.mdns_rx.recv()       => self.handle_mdns_event(ev).await,
+                Some(text) = self.phone_clip_rx.recv()  => self.on_phone_clipboard(text),
+                Some(n)    = self.notif_rx.recv()       => self.on_notification(n),
+                Some(cmd)  = cmd_rx.recv()              => self.on_command(cmd).await,
+                _ = tick.tick() => {
+                    self.poll_system_clipboard();
+                    let devices = self.device_watch.borrow_and_update().clone();
+                    self.try_connect_pending(&devices);
+                    self.sync_sessions(devices).await;
+                }
             }
-
-            // 1. 处理 mDNS 发现事件
-            self.handle_mdns_events().await;
-
-            // 2. 收集 Phone→PC 事件
-            self.drain_phone_clipboard().await;
-            self.drain_notifications().await;
-
-            // 3. 轮询 PC 系统剪贴板
-            self.poll_system_clipboard();
-
-            // 4. 管理设备连接 & session
-            let devices = self.device_watch.borrow().clone();
-            self.try_connect_pending(&devices);
-            self.sync_sessions(devices).await;
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
         self.stop_all().await;
     }
 
-    fn should_stop(&self) -> bool {
-        self.stop_flag.load(Ordering::SeqCst)
-    }
+    // ─── 事件处理 ────────────────────────────────────────
 
-    // ─── 各步骤 ──────────────────────────────────────────
-
-    async fn handle_mdns_events(&mut self) {
-        while let Ok(event) = self.mdns_rx.try_recv() {
-            match event {
-                wireless_pair::MdnsEvent::PairingDiscovered { host, port } => {
-                    println!("Discovered device at {}:{}", host, port);
-                    let addr = format!("{}:{}", host, port);
-                    if let Err(e) = self.adb_cmd.wireless_pair(&addr, &self.pair_info) {
-                        eprintln!("Wireless pair failed: {}", e);
-                        continue;
-                    }
-                    self.pending_serials.insert(format!("{}:5555", host));
+    async fn handle_mdns_event(&mut self, event: wireless_pair::MdnsEvent) {
+        match event {
+            wireless_pair::MdnsEvent::PairingDiscovered { host, port } => {
+                println!("[PAIRING]Discovered device at {}:{}", host, port);
+                let addr = format!("{}:{}", host, port);
+                if let Err(e) = self.adb_cmd.wireless_pair(&addr, &self.pair_info) {
+                    eprintln!("Wireless pair failed: {}", e);
+                    return;
                 }
-                wireless_pair::MdnsEvent::Error(e) => {
-                    eprintln!("mDNS error: {}", e);
-                }
+            }
+            wireless_pair::MdnsEvent::ConnectDiscovered { host, port } => {
+                println!("[CONNECT] Discovered device at {}:{}", host, port);
+                self.pending_serials.insert(format!("{}:{}", host, port), Instant::now());
+            }
+            wireless_pair::MdnsEvent::Error(e) => {
+                eprintln!("mDNS error: {}", e);
             }
         }
     }
 
-    async fn drain_phone_clipboard(&mut self) {
-        while let Ok(text) = self.phone_clip_rx.try_recv() {
-            if Some(&text) == self.last_received_from_phone.as_ref() {
-                continue;
-            }
-            if Some(&text) == self.clipboard_last_seen.as_ref() {
-                continue;
-            }
-            self.last_received_from_phone = Some(text.clone());
-
-            println!("System clipboard (from phone): {}", text);
-            if let Err(e) = clipboard_win::set_clipboard_string(&text) {
-                eprintln!("Clipboard: failed to write from phone: {}", e);
-            }
+    fn on_phone_clipboard(&mut self, text: String) {
+        if Some(&text) == self.last_received_from_phone.as_ref() {
+            return;
         }
+        if Some(&text) == self.clipboard_last_seen.as_ref() {
+            return;
+        }
+        self.last_received_from_phone = Some(text.clone());
+
+        println!("System clipboard (from phone): {}", text);
+        if let Err(e) = clipboard_win::set_clipboard_string(&text) {
+            eprintln!("Clipboard: failed to write from phone: {}", e);
+        }
+        self.clipboard_last_seen = Some(text);
     }
 
-    async fn drain_notifications(&mut self) {
-        while let Ok(notif) = self.notif_rx.try_recv() {
-            if let Some(title) = &notif.title {
-                println!("通知: [{}] {}", notif.package, title);
-            } else {
-                println!("通知: [{}]", notif.package);
+    fn on_notification(&mut self, notif: NotifInfo) {
+        if let Some(title) = &notif.title {
+            println!("通知: [{}] {}", notif.package, title);
+        } else {
+            println!("通知: [{}]", notif.package);
+        }
+        notification::show_desktop_notification(&notif);
+    }
+
+    async fn on_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::Connect(serial) => {
+                self.pending_serials.insert(serial, Instant::now());
             }
-            notification::show_desktop_notification(&notif);
+            Command::Disconnect(serial) => {
+                if let Some(mut handle) = self.sessions.remove(&serial) {
+                    handle.stop(self.adb_cmd.as_ref()).await;
+                }
+                self.pending_serials.remove(&serial);
+            }
         }
     }
 
     fn poll_system_clipboard(&mut self) {
-        match clipboard_win::get_clipboard_string() {
-            Ok(ref text) if Some(text.as_str()) != self.clipboard_last_seen.as_deref() => {
+        match &clipboard_win::get_clipboard_string() {
+            Ok(text) if Some(text.as_str()) != self.clipboard_last_seen.as_deref() => {
                 self.clipboard_last_seen = Some(text.clone());
                 self.last_clipboard_error_print = Instant::now();
-                if Some(text) != self.last_received_from_phone.as_ref() {
-                    println!(
-                        "Clipboard (PC→{} devices): {}",
-                        self.sessions.len(),
-                        text
-                    );
+                if Some(text.as_str()) != self.last_received_from_phone.as_deref() {
+                    println!("Clipboard (PC→{} devices): {}", self.sessions.len(), text);
                     let _ = self.clip_broadcast.send(text.to_string());
                 }
             }
@@ -231,9 +345,23 @@ impl Core {
     /// - 设备已在 `devices` 中（刷新线程确认已连接）→ 从 pending 移除
     /// - 5 秒内已尝试过 → 跳过（避免高频重试）
     /// - 否则发起 adb connect（无论成功失败，等刷新线程确认）
+    /// - pending 超过 30 秒未连接成功 → 自动丢弃
     fn try_connect_pending(&mut self, devices: &HashMap<String, Device>) {
         let now = Instant::now();
-        let serials: Vec<String> = self.pending_serials.iter().cloned().collect();
+
+        // 清理超时条目（30 秒未连接成功则放弃）
+        let timed_out: Vec<String> = self
+            .pending_serials
+            .iter()
+            .filter(|(_, added)| now.duration_since(**added) > Duration::from_secs(30))
+            .map(|(serial, _)| serial.clone())
+            .collect();
+        for serial in &timed_out {
+            self.pending_serials.remove(serial);
+            self.last_connect_attempt.remove(serial);
+        }
+
+        let serials: Vec<String> = self.pending_serials.keys().cloned().collect();
         for serial in &serials {
             if devices.contains_key(serial) {
                 // 刷新线程已确认设备在线，从 pending 移除
@@ -247,9 +375,17 @@ impl Core {
                     continue;
                 }
             }
-            println!("Connecting to {}...", serial);
-            let _ = self.adb_cmd.connect(serial);
-            self.last_connect_attempt.insert(serial.clone(), now);
+            match self.adb_cmd.connect(serial) {
+                Ok(()) => {
+                    println!("  connect {}: connected", serial);
+                    self.pending_serials.remove(serial);
+                    self.last_connect_attempt.remove(serial);
+                }
+                Err(e) => {
+                    eprintln!("  connect {} failed: {}", serial, e);
+                    self.last_connect_attempt.insert(serial.clone(), now);
+                }
+            }
         }
     }
 
@@ -284,8 +420,14 @@ impl Core {
         let jar_path = self.jar_path.clone();
 
         let task = tokio::spawn(session::run(
-            adb, device.clone(), jar_path, port,
-            clip_sub, phone_clip_tx, notif_tx, stop_rx,
+            adb,
+            device.clone(),
+            jar_path,
+            port,
+            clip_sub,
+            phone_clip_tx,
+            notif_tx,
+            stop_rx,
         ));
 
         self.sessions.insert(
@@ -299,7 +441,7 @@ impl Core {
     }
 
     async fn stop_all(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        self.token.cancel();
         for (_, mut handle) in self.sessions.drain() {
             handle.stop(self.adb_cmd.as_ref()).await;
         }
@@ -308,7 +450,7 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        self.token.cancel();
     }
 }
 
@@ -320,10 +462,22 @@ mod tests {
     #[test]
     fn test_device_filter() {
         let raw = vec![
-            Device { serial: "ok".into(), state: DeviceState::Device },
-            Device { serial: "off".into(), state: DeviceState::Offline },
-            Device { serial: "unauth".into(), state: DeviceState::Unauthorized },
-            Device { serial: "ok2".into(), state: DeviceState::Device },
+            Device {
+                serial: "ok".into(),
+                state: DeviceState::Device,
+            },
+            Device {
+                serial: "off".into(),
+                state: DeviceState::Offline,
+            },
+            Device {
+                serial: "unauth".into(),
+                state: DeviceState::Unauthorized,
+            },
+            Device {
+                serial: "ok2".into(),
+                state: DeviceState::Device,
+            },
         ];
         let mut map = HashMap::new();
         for d in raw {
@@ -359,10 +513,10 @@ mod tests {
             notif_rx: mpsc::channel(64).1,
             notif_tx,
             sessions: HashMap::new(),
-            pending_serials: ["192.168.1.100:5555".into()].into(),
+            pending_serials: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
             last_connect_attempt: HashMap::new(),
             port_counter: 27183,
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            token: CancellationToken::new(),
             clipboard_last_seen: None,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),

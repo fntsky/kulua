@@ -224,12 +224,15 @@ pub fn spawn_notification_poller_tokio(
     let (poller_handle, _) = spawn_notification_poller(adb, device, bridge_tx);
     // 后台转发：std mpsc → tokio mpsc
     tokio::task::spawn_blocking(move || {
-        while let Ok(info) = bridge_rx.recv() {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            if notif_tx.blocking_send(info).is_err() {
-                break;
+        while !stop.load(Ordering::SeqCst) {
+            match bridge_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(info) => {
+                    if notif_tx.blocking_send(info).is_err() {
+                        break;
+                    }
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     });

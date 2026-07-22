@@ -1,5 +1,5 @@
 /// 设备信息
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     /// 设备序列号 / IP 地址
     pub serial: String,

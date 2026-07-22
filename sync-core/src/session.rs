@@ -37,7 +37,7 @@ pub async fn run(
     mut clip_sub: broadcast::Receiver<String>,
     phone_clip_tx: mpsc::Sender<String>,
     notif_tx: mpsc::Sender<NotifInfo>,
-    stop_rx: oneshot::Receiver<()>,
+    mut stop_rx: oneshot::Receiver<()>,
 ) {
     // 1. 部署 scrcpy-server（阻塞 ADB 操作 → spawn_blocking）
     let server = tokio::task::spawn_blocking({
@@ -64,22 +64,32 @@ pub async fn run(
 
     // 2. 连接 scrcpy TCP 控制通道
     let stream = loop {
-        match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-            Ok(mut s) => {
-                let mut dummy = [0u8; 1];
-                match s.read_exact(&mut dummy).await {
-                    Ok(_) => break s,
-                    Err(_) => {
-                        drop(s);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        continue;
+        tokio::select! {
+            _ = &mut stop_rx => {
+                server.stop(adb.as_ref());
+                return;
+            }
+            r = TcpStream::connect(format!("127.0.0.1:{}", port)) => {
+                if let Ok(mut s) = r {
+                    let mut dummy = [0u8; 1];
+                    tokio::select! {
+                        _ = &mut stop_rx => {
+                            server.stop(adb.as_ref());
+                            return;
+                        }
+                        rr = s.read_exact(&mut dummy) => {
+                            if rr.is_ok() { break s; }
+                        }
                     }
                 }
             }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+        }
+        tokio::select! {
+            _ = &mut stop_rx => {
+                server.stop(adb.as_ref());
+                return;
             }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
     };
 

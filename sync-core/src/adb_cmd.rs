@@ -16,6 +16,7 @@ use crate::{
 pub trait AdbOps: Send + Sync {
     #[allow(dead_code)]
     fn check(&self) -> Result<(), AdbError>;
+    #[allow(dead_code)]
     fn devices(&self) -> Result<Vec<Device>, AdbError>;
     fn wireless_pair(
         &self,
@@ -35,6 +36,8 @@ pub trait AdbOps: Send + Sync {
         device: &Device,
         shell_args: &[&str],
     ) -> Result<std::process::Child, AdbError>;
+    /// 启动 `adb track-devices` 长连接进程，其 stdout 输出可逐行读取。
+    fn track_devices(&self) -> Result<std::process::Child, AdbError>;
     fn run(&self, args: &[&str]) -> Result<std::process::Output, AdbError>;
 }
 
@@ -74,11 +77,26 @@ impl AdbOps for AdbCmd {
         let _text = String::from_utf8_lossy(&output.stdout);
         Ok(())
     }
-
     fn connect(&self, addr: &str) -> Result<(), AdbError> {
         let output = self.run(&["connect", addr])?;
-        let _text = String::from_utf8_lossy(&output.stdout);
-        Ok(())
+
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        if !output.status.success() {
+            return Err(AdbError::CommandFailed(text));
+        }
+
+        let lower = text.to_lowercase();
+
+        if lower.contains("connected to") || lower.contains("already connected") {
+            return Ok(());
+        }
+
+        Err(AdbError::CommandFailed(text))
     }
 
     fn push(&self, device: &Device, local: &str, remote: &str) -> Result<(), AdbError> {
@@ -97,7 +115,9 @@ impl AdbOps for AdbCmd {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AdbError::CommandFailed(format!(
                 "adb -s {} push {} {}: {}",
-                serial, local, remote,
+                serial,
+                local,
+                remote,
                 stderr.trim()
             )));
         }
@@ -142,6 +162,15 @@ impl AdbOps for AdbCmd {
             .stderr(std::process::Stdio::piped());
         let child = cmd.spawn().map_err(AdbError::Io)?;
         Ok(child)
+    }
+    fn track_devices(&self) -> Result<std::process::Child, AdbError> {
+        let mut cmd = std::process::Command::new(&self.adb_path);
+        cmd.arg("track-devices")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.spawn().map_err(AdbError::Io)
     }
 
     fn run(&self, args: &[&str]) -> Result<std::process::Output, AdbError> {
@@ -195,7 +224,7 @@ impl AdbCmd {
         }
     }
 
-    fn parse_devices(&self, stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
+    pub fn parse_devices(&self, stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
         let text = std::str::from_utf8(stdout).map_err(AdbError::Utf8)?;
 
         let devices: Vec<Device> = text
@@ -409,12 +438,7 @@ pub mod mock {
             }
         }
 
-        fn push(
-            &self,
-            _device: &Device,
-            _local: &str,
-            _remote: &str,
-        ) -> Result<(), AdbError> {
+        fn push(&self, _device: &Device, _local: &str, _remote: &str) -> Result<(), AdbError> {
             self.calls.lock().unwrap().push("push");
             if self.fail_push {
                 Err(AdbError::CommandFailed("mock: push failed".into()))
@@ -443,6 +467,16 @@ pub mod mock {
             _shell_args: &[&str],
         ) -> Result<std::process::Child, AdbError> {
             self.calls.lock().unwrap().push("spawn_shell");
+            let dummy = std::process::Command::new("cmd")
+                .arg("/c")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(AdbError::Io)?;
+            Ok(dummy)
+        }
+        fn track_devices(&self) -> Result<std::process::Child, AdbError> {
+            self.calls.lock().unwrap().push("track_devices");
             let dummy = std::process::Command::new("cmd")
                 .arg("/c")
                 .stdout(std::process::Stdio::piped())
