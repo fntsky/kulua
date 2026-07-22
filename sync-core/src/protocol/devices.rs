@@ -1,0 +1,113 @@
+use crate::types::{AdbError, Device, DeviceState};
+
+/// 解析 `adb devices -l` / `adb track-devices` 输出的设备列表。
+///
+/// 第一行 `"List of devices attached"` 被跳过，后续每行格式为 `<serial>\t<state>`。
+pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
+    let text = std::str::from_utf8(stdout).map_err(AdbError::Utf8)?;
+
+    let devices: Vec<Device> = text
+        .lines()
+        .skip(1) // 跳过第一行 "List of devices attached"
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+
+            let mut parts = line.split_whitespace();
+            let serial = parts.next()?.to_string();
+            let state = match parts.next().unwrap_or("unknown") {
+                "device" => DeviceState::Device,
+                "offline" => DeviceState::Offline,
+                "unauthorized" => DeviceState::Unauthorized,
+                s => DeviceState::Unknown(s.to_string()),
+            };
+
+            Some(Device { serial, state })
+        })
+        .collect();
+
+    Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DeviceState;
+
+    fn assert_device(d: &Device, expected_serial: &str, expected_state: DeviceState) {
+        assert_eq!(d.serial, expected_serial);
+        assert_eq!(d.state, expected_state);
+    }
+
+    #[test]
+    fn test_parse_devices_normal() {
+        let stdout = b"List of devices attached\ndevice1\tdevice\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_device(&devices[0], "device1", DeviceState::Device);
+    }
+
+    #[test]
+    fn test_parse_devices_mixed_states() {
+        let stdout = b"List of devices attached\ndevice1\toffline\ndevice2\tunauthorized\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_device(&devices[0], "device1", DeviceState::Offline);
+        assert_device(&devices[1], "device2", DeviceState::Unauthorized);
+    }
+
+    #[test]
+    fn test_parse_devices_empty() {
+        let stdout = b"List of devices attached\n\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_parse_devices_no_devices() {
+        let stdout = b"List of devices attached\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_parse_devices_unknown_state() {
+        let stdout = b"List of devices attached\nfoo\tbar\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_device(&devices[0], "foo", DeviceState::Unknown("bar".to_string()));
+    }
+
+    #[test]
+    fn test_parse_devices_with_usb_and_transport() {
+        let stdout =
+            b"List of devices attached\nemulator-5554\tdevice\n192.168.1.5:4321\tdevice product=XYZ model=Pixel transport_id=123\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_device(&devices[0], "emulator-5554", DeviceState::Device);
+        assert_device(&devices[1], "192.168.1.5:4321", DeviceState::Device);
+    }
+
+    #[test]
+    fn test_parse_devices_multiple() {
+        let stdout =
+            b"List of devices attached\ndevice1\tdevice\ndevice2\toffline\ndevice3\tunauthorized\ndevice4\tunknown_state\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 4);
+        assert_device(&devices[0], "device1", DeviceState::Device);
+        assert_device(&devices[1], "device2", DeviceState::Offline);
+        assert_device(&devices[2], "device3", DeviceState::Unauthorized);
+        assert_device(&devices[3], "device4", DeviceState::Unknown("unknown_state".to_string()));
+    }
+
+    #[test]
+    fn test_parse_devices_empty_lines() {
+        let stdout = b"List of devices attached\n\ndevice1\tdevice\n\n\ndevice2\toffline\n\n";
+        let devices = parse_devices(stdout).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_device(&devices[0], "device1", DeviceState::Device);
+        assert_device(&devices[1], "device2", DeviceState::Offline);
+    }
+}

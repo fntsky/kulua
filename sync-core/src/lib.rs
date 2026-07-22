@@ -2,6 +2,8 @@ pub mod adb_cmd;
 pub mod cli;
 pub mod app;
 pub mod notification;
+pub mod protocol;
+pub mod device_refresh;
 pub mod scrcpy;
 pub mod session;
 pub mod types;
