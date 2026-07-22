@@ -16,7 +16,7 @@ pub struct ScrcpyServer {
 }
 
 impl ScrcpyServer {
-    pub fn deploy_clipboard_only(
+    pub fn deploy_scrcpy(
         adb: &dyn AdbOps,
         device: &Device,
         local_jar: &str,
@@ -44,7 +44,7 @@ impl ScrcpyServer {
             "audio=false",
             "control=true",
             "cleanup=true",
-            "send_device_meta=false",
+            "send_device_meta=true",
             "send_dummy_byte=true",
             "send_frame_meta=false",
             "send_stream_meta=false",
@@ -141,7 +141,7 @@ pub fn spawn_clipboard_listener(
                     println!("Phone clipboard: {}", text);
                     let _ = phone_clipboard_tx.send(text);
                 }
-                Ok(None) => {} // timeout，继续循环
+                Ok(None) => {}   // timeout，继续循环
                 Err(_) => break, // 连接断开
             }
         }
@@ -237,4 +237,3 @@ pub async fn send_clipboard_async(
     stream.write_all(&msg).await.map_err(AdbError::Io)?;
     Ok(())
 }
-

@@ -3,8 +3,8 @@ use crate::notification::{self, NotifInfo};
 use crate::scrcpy;
 use crate::types::{AdbError, Device};
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -108,7 +108,7 @@ impl Session {
         let device = self.device.clone();
         let jar_path = self.jar_path.clone();
         let server = tokio::task::spawn_blocking(move || {
-            scrcpy::ScrcpyServer::deploy_clipboard_only(adb.as_ref(), &device, &jar_path, port)
+            scrcpy::ScrcpyServer::deploy_scrcpy(adb.as_ref(), &device, &jar_path, port)
         })
         .await;
 
@@ -124,7 +124,10 @@ impl Session {
                 return;
             }
         };
-        println!("scrcpy-server alive on {} (port {})", self.device.serial, self.port);
+        println!(
+            "scrcpy-server alive on {} (port {})",
+            self.device.serial, self.port
+        );
 
         // 2. 连接 scrcpy TCP 控制通道
         let mut stream = loop {
@@ -258,11 +261,8 @@ impl Session {
 /// 从 scrcpy 控制连接读取一条设备剪贴板消息（200ms 超时返回 None）。
 async fn read_phone_clipboard(stream: &mut TcpStream) -> Result<Option<String>, AdbError> {
     let mut type_buf = [0u8; 1];
-    let result = tokio::time::timeout(
-        Duration::from_millis(200),
-        stream.read_exact(&mut type_buf),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_millis(200), stream.read_exact(&mut type_buf)).await;
     match result {
         Err(_timeout) => return Ok(None),
         Ok(Err(e)) => return Err(AdbError::Io(e)),
@@ -274,13 +274,18 @@ async fn read_phone_clipboard(stream: &mut TcpStream) -> Result<Option<String>, 
         let n = stream.read(&mut extra).await.unwrap_or(0);
         println!(
             "scrcpy msg: type=0x{:02X}, payload ({} bytes): {:02X?}",
-            type_buf[0], n, &extra[..n]
+            type_buf[0],
+            n,
+            &extra[..n]
         );
         return Ok(None);
     }
 
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await.map_err(AdbError::Io)?;
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(AdbError::Io)?;
     let text_len = u32::from_be_bytes(len_buf) as usize;
 
     let mut text = vec![0u8; text_len];
@@ -290,4 +295,3 @@ async fn read_phone_clipboard(stream: &mut TcpStream) -> Result<Option<String>, 
     println!("Phone clipboard: {}", clip_text);
     Ok(Some(clip_text))
 }
-

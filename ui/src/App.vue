@@ -282,7 +282,7 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
   left: 18px; background: #fff;
 }
 .serial {
-  font-size: 13px; font-weight: 500;
+  font-size: 11px; font-weight: 400; color: var(--dim);
   font-family: "Cascadia Code", "Fira Code", monospace;
 }
 .device-title {
