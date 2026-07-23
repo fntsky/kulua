@@ -49,8 +49,6 @@ impl ScrcpyServer {
             "cleanup=true",
             "send_device_meta=true",
             "send_dummy_byte=true",
-            "send_frame_meta=false",
-            "send_stream_meta=false",
         ];
         adb.forward(device, port, "scrcpy")?;
         let mut process = adb.spawn_shell(device, &args)?;
