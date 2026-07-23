@@ -251,6 +251,12 @@ impl Core {
                 self.session_configs.remove(&serial);
             }
             Command::UpdateConfig { serial, clipboard_sync, notification_sync, audio_sync } => {
+                // 先写配置记录，确保 start_session（音频重启时）读到最新值
+                self.session_configs.insert(serial.clone(), session::SessionConfig {
+                    clipboard_sync,
+                    notification_sync,
+                    audio_enabled: audio_sync,
+                });
                 // 剪贴板和通知可直接切换原子标志
                 if let Some(handle) = self.sessions.get(&serial) {
                     handle.clipboard_enabled.store(clipboard_sync, Ordering::SeqCst);
@@ -259,7 +265,6 @@ impl Core {
                     if prev_audio != audio_sync {
                         // 音频切换需要重启 scrcpy → 重启 session
                         handle.audio_enabled.store(audio_sync, Ordering::SeqCst);
-                        // 先取出 device 再清理（避免同时可变借用 self）
                         let device_opt = self.device_watch.borrow().get(&serial).cloned();
                         if let Some(mut handle) = self.sessions.remove(&serial) {
                             handle.stop(self.adb_cmd.as_ref()).await;
@@ -270,12 +275,6 @@ impl Core {
                         }
                     }
                 }
-                // 更新 Core 的配置记录
-                self.session_configs.insert(serial, session::SessionConfig {
-                    clipboard_sync,
-                    notification_sync,
-                    audio_enabled: audio_sync,
-                });
             }
         }
     }
