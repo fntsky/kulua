@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncBufReadExt;
 use tokio_util::sync::CancellationToken;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -98,6 +99,26 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                 if let Err(e) = result {
                     eprintln!("track-devices read payload error: {}", e);
                     break;
+                }
+
+                // 消耗 payload 之后的换行符
+                // ADB on Windows 使用 \r\n 行尾，长度计数包含 \r 但不包含末尾的 \n，
+                // 如果不消耗掉 \n，下一帧的 4 字节长度头读到的第一个字节就是 \n → 非法 hex 字符
+                loop {
+                    let b = match reader.fill_buf().await {
+                        Ok(buf) if buf.is_empty() => break,
+                        Ok(buf) if buf[0] == b'\r' || buf[0] == b'\n' => buf[0],
+                        _ => break,
+                    };
+                    let n = if b == b'\r' {
+                        let extra = reader.fill_buf().await
+                            .map(|b| if b.len() > 1 && b[1] == b'\n' { 2 } else { 1 })
+                            .unwrap_or(1);
+                        extra
+                    } else {
+                        1
+                    };
+                    reader.consume(n);
                 }
 
                 // 解析并推送

@@ -1,17 +1,17 @@
 use crate::types::{AdbError, Device, DeviceState};
 
-/// 解析 `adb devices -l` / `adb track-devices` 输出的设备列表。
+/// 解析 `adb devices` / `adb track-devices` 输出的设备列表。
 ///
-/// 第一行 `"List of devices attached"` 被跳过，后续每行格式为 `<serial>\t<state>`。
+/// 如果第一行是 `"List of devices attached"` 则跳过，否则从第一行开始解析。
+/// 每行格式为 `<serial>\t<state>`。
 pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
     let text = std::str::from_utf8(stdout).map_err(AdbError::Utf8)?;
 
     let devices: Vec<Device> = text
         .lines()
-        .skip(1) // 跳过第一行 "List of devices attached"
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || line.eq_ignore_ascii_case("List of devices attached") {
                 return None;
             }
 
