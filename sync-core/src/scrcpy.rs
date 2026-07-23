@@ -73,13 +73,15 @@ impl ScrcpyServer {
         })
     }
     pub fn stop(&mut self, adb: &dyn AdbOps) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-        // 强制杀死设备上的远程 scrcpy-server 进程。
-        // Windows 上 process.kill() 使用 TerminateProcess 暴力终止本地 adb 进程，
-        // TCP 连接可能不会优雅关闭，ADB 服务端无法检测断开 → 远程进程残留。
+        // 先杀远程（设备端 scrcpy-server），确保无论本地如何终止都不会残留
         let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
         let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
+
+        // 再杀本地 adb shell 进程
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+
+        // 最后清理端口转发
         let _ = adb.run(&[
             "-s",
             &self.device.serial,

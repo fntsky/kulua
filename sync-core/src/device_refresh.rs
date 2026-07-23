@@ -4,9 +4,8 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
-use tokio::sync::watch;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncBufReadExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -56,7 +55,7 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                     _ = token.cancelled() => break 'frame,
                     r = reader.read_exact(&mut len_buf) => r,
                 };
-
+                println!("Read length header: {:?}", std::str::from_utf8(&len_buf));
                 if let Err(e) = result {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
                         eprintln!("track-devices disconnected: {}", e);
@@ -101,31 +100,20 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                     eprintln!("track-devices read payload error: {}", e);
                     break;
                 }
-
-                // 消耗 payload 之后的换行符
-                // ADB on Windows 使用 \r\n 行尾，长度计数包含 \r 但不包含末尾的 \n，
-                // 如果不消耗掉 \n，下一帧的 4 字节长度头读到的第一个字节就是 \n → 非法 hex 字符
-                loop {
-                    let buf = reader.fill_buf().await.unwrap_or(&[][..]);
-                    if buf.is_empty() || (buf[0] != b'\r' && buf[0] != b'\n') {
-                        break;
-                    }
-                    // 只有 \r/\n 会进入这里，而 hex 字符 (0-9a-f) 不可能等于 \r/\n，
-                    // 所以遇到下一帧长度头时一定 break，不会误吞数据。
-                    debug_assert!(buf[0] == b'\r' || buf[0] == b'\n');
-                    if buf[0] == b'\r' && buf.len() > 1 && buf[1] == b'\n' {
-                        reader.consume(2);
-                    } else {
-                        reader.consume(1);
-                    }
-                }
+                println!(
+                    "Read payload ({} bytes): {:?}",
+                    len,
+                    std::str::from_utf8(&payload)
+                );
 
                 // 解析并推送（解析失败记录日志，避免静默停止更新）
+                println!("Parsing devices from payload...");
                 match crate::protocol::devices::parse_devices(&payload) {
                     Ok(devices) => {
                         // 只推送 Device 状态的设备，offline/unauthorized 等暂不暴露给上层。
                         // 上层如果需要在 UI 提示"未授权"等状态，可在此放开过滤。
                         let mut map = HashMap::new();
+
                         for d in devices {
                             if d.state == DeviceState::Device {
                                 map.insert(d.serial.clone(), d);

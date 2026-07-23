@@ -19,6 +19,7 @@ pub enum Command {
         serial: String,
         clipboard_sync: bool,
         notification_sync: bool,
+        audio_sync: bool,
     },
 }
 
@@ -249,16 +250,31 @@ impl Core {
                 self.pending_serials.remove(&serial);
                 self.session_configs.remove(&serial);
             }
-            Command::UpdateConfig { serial, clipboard_sync, notification_sync } => {
-                // 直接切换原子标志，无需重启 session
+            Command::UpdateConfig { serial, clipboard_sync, notification_sync, audio_sync } => {
+                // 剪贴板和通知可直接切换原子标志
                 if let Some(handle) = self.sessions.get(&serial) {
                     handle.clipboard_enabled.store(clipboard_sync, Ordering::SeqCst);
                     handle.notification_enabled.store(notification_sync, Ordering::SeqCst);
+                    let prev_audio = handle.audio_enabled.load(Ordering::SeqCst);
+                    if prev_audio != audio_sync {
+                        // 音频切换需要重启 scrcpy → 重启 session
+                        handle.audio_enabled.store(audio_sync, Ordering::SeqCst);
+                        // 先取出 device 再清理（避免同时可变借用 self）
+                        let device_opt = self.device_watch.borrow().get(&serial).cloned();
+                        if let Some(mut handle) = self.sessions.remove(&serial) {
+                            handle.stop(self.adb_cmd.as_ref()).await;
+                            println!("Audio {} for {}, restarting session", if audio_sync { "enabled" } else { "disabled" }, serial);
+                            if let Some(device) = device_opt {
+                                self.start_session(device).await;
+                            }
+                        }
+                    }
                 }
-                // 更新 Core 的配置记录（供新 session 或后续查询使用）
+                // 更新 Core 的配置记录
                 self.session_configs.insert(serial, session::SessionConfig {
                     clipboard_sync,
                     notification_sync,
+                    audio_enabled: audio_sync,
                 });
             }
         }
@@ -373,9 +389,13 @@ impl Core {
         let adb = self.adb_cmd.clone();
         let jar_path = self.jar_path.clone();
 
-        // 共享原子标志，Core 后续可随时切换
-        let clipboard_enabled = Arc::new(AtomicBool::new(true));
-        let notification_enabled = Arc::new(AtomicBool::new(true));
+        // 从配置记录中读取开关状态，不存在时使用默认值
+        let cfg = self.session_configs.get(&device.serial).copied().unwrap_or_default();
+
+        // 共享原子标志，Core 后续可随时切换（音频除外，需要重启 session）
+        let clipboard_enabled = Arc::new(AtomicBool::new(cfg.clipboard_sync));
+        let notification_enabled = Arc::new(AtomicBool::new(cfg.notification_sync));
+        let audio_enabled = Arc::new(AtomicBool::new(cfg.audio_enabled));
 
         let mut sess = session::Session::new(
             adb,
@@ -388,6 +408,7 @@ impl Core {
             stop_rx,
             clipboard_enabled.clone(),
             notification_enabled.clone(),
+            audio_enabled.clone(),
             self.device_name_tx.clone(),
         );
 
@@ -397,10 +418,12 @@ impl Core {
             device.serial.clone(),
             session::Handle {
                 device,
+                port,
                 stop_tx: Some(stop_tx),
                 task,
                 clipboard_enabled,
                 notification_enabled,
+                audio_enabled,
             },
         );
     }

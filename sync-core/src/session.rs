@@ -1,7 +1,7 @@
 use crate::adb_cmd::AdbOps;
 use crate::notification::{self, NotifInfo};
 use crate::scrcpy;
-use crate::types::{AdbError, Device};
+use crate::types::Device;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,6 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
-
 /// 每个 session 的独立配置。
 #[derive(Debug, Clone, Copy)]
 pub struct SessionConfig {
@@ -17,6 +16,8 @@ pub struct SessionConfig {
     pub clipboard_sync: bool,
     /// 通知同步开关
     pub notification_sync: bool,
+    /// 音频同步开关
+    pub audio_enabled: bool,
 }
 
 impl Default for SessionConfig {
@@ -24,36 +25,54 @@ impl Default for SessionConfig {
         Self {
             clipboard_sync: true,
             notification_sync: true,
+            audio_enabled: false,
         }
     }
 }
+
 /// 轻量 session 句柄，主循环用来发停止信号 + 等待任务结束
 pub struct Handle {
     #[allow(dead_code)]
     pub device: Device,
+    /// session 占用的 ADB 转发端口，用于超时后的强制清理
+    pub port: u16,
     pub stop_tx: Option<oneshot::Sender<()>>,
     pub task: tokio::task::JoinHandle<()>,
     /// Core 通过此标志动态控制剪贴板同步
     pub clipboard_enabled: Arc<AtomicBool>,
     /// Core 通过此标志动态控制通知同步
     pub notification_enabled: Arc<AtomicBool>,
+    /// Core 通过此标志动态控制音频开关（重启 session 后生效）
+    pub audio_enabled: Arc<AtomicBool>,
 }
-
 impl Handle {
-    pub async fn stop(&mut self, _adb: &dyn AdbOps) {
+    pub async fn stop(&mut self, adb: &dyn AdbOps) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
-        // 给 session 一点时间自行清理
-        let _ = tokio::time::timeout(Duration::from_secs(3), &mut self.task).await;
+
+        // 给 session 一点时间自行清理（正常路径会调用 server.stop）
+        if tokio::time::timeout(Duration::from_secs(3), &mut self.task).await.is_err() {
+            // 超时：session 可能卡住，强制 abort + 直接清理远程进程
+            self.task.abort();
+            let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
+            let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
+            let _ = adb.run(&[
+                "-s",
+                &self.device.serial,
+                "forward",
+                "--remove",
+                &format!("tcp:{}", self.port),
+            ]);
+        }
     }
 }
 
 /// 单个设备的完整 session。
 ///
-/// 包含部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询的完整生命周期。
-/// 配置选项（`clipboard_enabled` / `notification_enabled`）是共享原子标志，
-/// Core 可通过 Handle 随时调整，无需重启 session。
+/// 包含部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询 + 音频播放的完整生命周期。
+/// 配置选项（`clipboard_enabled` / `notification_enabled` / `audio_enabled`）是共享原子标志，
+/// Core 可通过 Handle 随时调整。音频切换需要重启 session（redeploy scrcpy）。
 pub struct Session {
     adb: Arc<dyn AdbOps>,
     device: Device,
@@ -64,9 +83,9 @@ pub struct Session {
     notif_tx: mpsc::Sender<NotifInfo>,
     stop_rx: Option<oneshot::Receiver<()>>,
     clipboard_enabled: Arc<AtomicBool>,
-    /// 发送设备名称回 Core（serial, name）
-    device_name_tx: Option<mpsc::Sender<(String, String)>>,
     notification_enabled: Arc<AtomicBool>,
+    audio_enabled: Arc<AtomicBool>,
+    device_name_tx: Option<mpsc::Sender<(String, String)>>,
 }
 
 impl Session {
@@ -81,6 +100,7 @@ impl Session {
         stop_rx: oneshot::Receiver<()>,
         clipboard_enabled: Arc<AtomicBool>,
         notification_enabled: Arc<AtomicBool>,
+        audio_enabled: Arc<AtomicBool>,
         device_name_tx: mpsc::Sender<(String, String)>,
     ) -> Self {
         Self {
@@ -94,21 +114,22 @@ impl Session {
             stop_rx: Some(stop_rx),
             clipboard_enabled,
             notification_enabled,
+            audio_enabled,
             device_name_tx: Some(device_name_tx),
         }
     }
-
-    /// 运行 session 主循环：部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询。
+    /// 运行 session 主循环：部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 音频帧 + 通知轮询。
     pub async fn run(&mut self) {
         let mut stop_rx = self.stop_rx.take().expect("run can only be called once");
         let port = self.port; // copy before closure
+        let audio_enabled = self.audio_enabled.load(Ordering::SeqCst);
 
-        // 1. 部署 scrcpy-server
+        // 1. 部署 scrcpy-server（带音频开关）
         let adb = self.adb.clone();
         let device = self.device.clone();
         let jar_path = self.jar_path.clone();
         let server = tokio::task::spawn_blocking(move || {
-            scrcpy::ScrcpyServer::deploy_scrcpy(adb.as_ref(), &device, &jar_path, port)
+            scrcpy::ScrcpyServer::deploy_scrcpy(adb.as_ref(), &device, &jar_path, port, audio_enabled)
         })
         .await;
 
@@ -125,8 +146,8 @@ impl Session {
             }
         };
         println!(
-            "scrcpy-server alive on {} (port {})",
-            self.device.serial, self.port
+            "scrcpy-server alive on {} (port {}, audio={})",
+            self.device.serial, self.port, audio_enabled
         );
 
         // 2. 连接 scrcpy TCP 控制通道
@@ -163,7 +184,6 @@ impl Session {
         // 3. 读取设备名称（64 字节，scrcpy 协议设备信息交换）
         let mut name_buf = [0u8; 64];
         if stream.read_exact(&mut name_buf).await.is_ok() {
-            // 找 null 终止符，截断有效部分
             let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
             let device_name = String::from_utf8_lossy(&name_buf[..name_end]).to_string();
             if !device_name.is_empty() {
@@ -185,8 +205,8 @@ impl Session {
             self.notification_enabled.clone(),
         );
 
-        // 5. 双向剪贴板 I/O
-        self.run_clipboard_io(stream, stop_rx).await;
+        // 5. 双向设备 I/O（剪贴板 + 音频）
+        self.run_device_io(stream, stop_rx).await;
 
         // 6. 清理
         notif_stop.store(true, Ordering::SeqCst);
@@ -207,28 +227,69 @@ impl Session {
         let _ = stop_rx.await;
         stop.store(true, Ordering::SeqCst);
     }
-
-    /// 双向剪贴板 I/O。
-    ///
-    /// 内部通过 `self.clipboard_enabled` 控制是否实际转发数据：
-    /// - 发往手机（PC→Phone）：仅 enabled 时写入 scrcpy 控制连接
-    /// - 来自手机（Phone→PC）：仅 enabled 时发送给 Core
-    async fn run_clipboard_io(
+    /// 双向设备 I/O：剪贴板（PC←→Phone）+ 音频帧（Phone→PC 本地播放）。
+    async fn run_device_io(
         &mut self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (clip_tx, mut clip_rx) = mpsc::channel::<String>(16);
+
+        let clipboard_enabled = self.clipboard_enabled.clone();
+        let phone_clip_tx = self.phone_clip_tx.clone();
+        let audio_enabled = self.audio_enabled.clone();
+        let serial = self.device.serial.clone();
+
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let mut type_buf = [0u8; 1];
+                if reader.read_exact(&mut type_buf).await.is_err() { break; }
+                match type_buf[0] {
+                    0x00 => {
+                        let mut len_buf = [0u8; 4];
+                        if reader.read_exact(&mut len_buf).await.is_err() { break; }
+                        let text_len = u32::from_be_bytes(len_buf) as usize;
+                        let mut text = vec![0u8; text_len];
+                        if reader.read_exact(&mut text).await.is_err() { break; }
+                        if clipboard_enabled.load(Ordering::SeqCst) {
+                            if let Ok(t) = String::from_utf8(text) {
+                                let _ = clip_tx.send(t).await;
+                            }
+                        }
+                    }
+                    0x0a | 0x0b => {
+                        let mut pts_buf = [0u8; 8];
+                        if reader.read_exact(&mut pts_buf).await.is_err() { break; }
+                        let mut size_buf = [0u8; 4];
+                        if reader.read_exact(&mut size_buf).await.is_err() { break; }
+                        let frame_size = u32::from_le_bytes(size_buf) as usize;
+                        if frame_size > 524288 { break; }
+                        let mut audio_data = vec![0u8; frame_size];
+                        if reader.read_exact(&mut audio_data).await.is_err() { break; }
+                        if audio_enabled.load(Ordering::SeqCst) {
+                            println!("audio frame: {} bytes from {}", frame_size, serial);
+                            let _ = audio_data;
+                        }
+                    }
+                    _ => {
+                        let mut dump = [0u8; 8192];
+                        if reader.read(&mut dump).await.unwrap_or(0) == 0 { break; }
+                    }
+                }
+            }
+        });
+
         loop {
             tokio::select! {
                 biased;
                 _ = &mut stop_rx => break,
-
-                // PC→Phone
                 result = self.clip_sub.recv() => {
                     match result {
                         Ok(text) if self.clipboard_enabled.load(Ordering::SeqCst) => {
-                            if let Err(e) = scrcpy::send_clipboard_async(&mut stream, &text).await {
-                                eprintln!("send clipboard: {}", e);
+                            use tokio::io::AsyncWriteExt;
+                            let msg = build_clipboard_frame(&text);
+                            if writer.write_all(&msg).await.is_err() {
                                 break;
                             }
                         }
@@ -239,59 +300,25 @@ impl Session {
                         }
                     }
                 }
-
-                // Phone→PC
-                result = read_phone_clipboard(&mut stream) => {
-                    match result {
-                        Ok(Some(text)) if self.clipboard_enabled.load(Ordering::SeqCst) => {
-                            if self.phone_clip_tx.send(text).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
+                Some(text) = clip_rx.recv() => {
+                    println!("Phone clipboard: {}", text);
+                    if phone_clip_tx.send(text).await.is_err() { break; }
                 }
             }
         }
+
+        // 通知退出 reader 任务，释放 TCP 读半通道
+        reader_task.abort();
     }
 }
 
-/// 从 scrcpy 控制连接读取一条设备剪贴板消息（200ms 超时返回 None）。
-async fn read_phone_clipboard(stream: &mut TcpStream) -> Result<Option<String>, AdbError> {
-    let mut type_buf = [0u8; 1];
-    let result =
-        tokio::time::timeout(Duration::from_millis(200), stream.read_exact(&mut type_buf)).await;
-    match result {
-        Err(_timeout) => return Ok(None),
-        Ok(Err(e)) => return Err(AdbError::Io(e)),
-        Ok(Ok(_)) => {}
-    }
-
-    if type_buf[0] != 0x00 {
-        let mut extra = [0u8; 64];
-        let n = stream.read(&mut extra).await.unwrap_or(0);
-        println!(
-            "scrcpy msg: type=0x{:02X}, payload ({} bytes): {:02X?}",
-            type_buf[0],
-            n,
-            &extra[..n]
-        );
-        return Ok(None);
-    }
-
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(AdbError::Io)?;
-    let text_len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut text = vec![0u8; text_len];
-    stream.read_exact(&mut text).await.map_err(AdbError::Io)?;
-
-    let clip_text = String::from_utf8(text).map_err(|e| AdbError::Other(format!("{}", e)))?;
-    println!("Phone clipboard: {}", clip_text);
-    Ok(Some(clip_text))
+fn build_clipboard_frame(text: &str) -> Vec<u8> {
+    let text_bytes = text.as_bytes();
+    let mut buf = Vec::with_capacity(14 + text_bytes.len());
+    buf.push(0x09);
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.push(0);
+    buf.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(text_bytes);
+    buf
 }

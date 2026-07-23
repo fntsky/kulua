@@ -17,13 +17,18 @@ pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
 
             let mut parts = line.split_whitespace();
             let serial = parts.next()?.to_string();
+            println!("Serial: {}", serial); // Debug print to check the serial number
             let state = match parts.next().unwrap_or("unknown") {
                 "device" => DeviceState::Device,
                 "offline" => DeviceState::Offline,
                 "unauthorized" => DeviceState::Unauthorized,
                 s => DeviceState::Unknown(s.to_string()),
             };
-            Some(Device { serial, state, name: String::new() })
+            Some(Device {
+                serial,
+                state,
+                name: String::new(),
+            })
         })
         .collect();
 
@@ -98,7 +103,11 @@ mod tests {
         assert_device(&devices[0], "device1", DeviceState::Device);
         assert_device(&devices[1], "device2", DeviceState::Offline);
         assert_device(&devices[2], "device3", DeviceState::Unauthorized);
-        assert_device(&devices[3], "device4", DeviceState::Unknown("unknown_state".to_string()));
+        assert_device(
+            &devices[3],
+            "device4",
+            DeviceState::Unknown("unknown_state".to_string()),
+        );
     }
 
     #[test]
@@ -108,5 +117,20 @@ mod tests {
         assert_eq!(devices.len(), 2);
         assert_device(&devices[0], "device1", DeviceState::Device);
         assert_device(&devices[1], "device2", DeviceState::Offline);
+    }
+
+    #[test]
+    fn test_parse_devices_track_devices_two_devices() {
+        // adb track-devices 输出的原始帧（无 "List of devices attached" 头部），
+        // 两个设备之间用 \r\n 分隔。
+        let payload = b"192.168.1.6:46769\tdevice\r\nadb-10AE6X05XP001TD-TNpsVn._adb-tls-connect._tcp\tdevice";
+        let devices = parse_devices(payload).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_device(&devices[0], "192.168.1.6:46769", DeviceState::Device);
+        assert_device(
+            &devices[1],
+            "adb-10AE6X05XP001TD-TNpsVn._adb-tls-connect._tcp",
+            DeviceState::Device,
+        );
     }
 }
