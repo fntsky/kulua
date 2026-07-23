@@ -27,6 +27,7 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
     tokio::spawn(async move {
         use tokio::process::Command;
         let mut last: HashMap<String, Device> = HashMap::new();
+        let mut retry_delay = Duration::from_millis(100);
 
         while !token.is_cancelled() {
             let mut child = match Command::new(&adb_path)
@@ -105,35 +106,40 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                 // ADB on Windows 使用 \r\n 行尾，长度计数包含 \r 但不包含末尾的 \n，
                 // 如果不消耗掉 \n，下一帧的 4 字节长度头读到的第一个字节就是 \n → 非法 hex 字符
                 loop {
-                    let b = match reader.fill_buf().await {
-                        Ok(buf) if buf.is_empty() => break,
-                        Ok(buf) if buf[0] == b'\r' || buf[0] == b'\n' => buf[0],
-                        _ => break,
-                    };
-                    let n = if b == b'\r' {
-                        let extra = reader.fill_buf().await
-                            .map(|b| if b.len() > 1 && b[1] == b'\n' { 2 } else { 1 })
-                            .unwrap_or(1);
-                        extra
+                    let buf = reader.fill_buf().await.unwrap_or(&[][..]);
+                    if buf.is_empty() || (buf[0] != b'\r' && buf[0] != b'\n') {
+                        break;
+                    }
+                    // 只有 \r/\n 会进入这里，而 hex 字符 (0-9a-f) 不可能等于 \r/\n，
+                    // 所以遇到下一帧长度头时一定 break，不会误吞数据。
+                    debug_assert!(buf[0] == b'\r' || buf[0] == b'\n');
+                    if buf[0] == b'\r' && buf.len() > 1 && buf[1] == b'\n' {
+                        reader.consume(2);
                     } else {
-                        1
-                    };
-                    reader.consume(n);
+                        reader.consume(1);
+                    }
                 }
 
-                // 解析并推送
-                if let Ok(devices) = crate::protocol::devices::parse_devices(&payload) {
-                    let mut map = HashMap::new();
-                    for d in devices {
-                        if d.state == DeviceState::Device {
-                            map.insert(d.serial.clone(), d);
+                // 解析并推送（解析失败记录日志，避免静默停止更新）
+                match crate::protocol::devices::parse_devices(&payload) {
+                    Ok(devices) => {
+                        // 只推送 Device 状态的设备，offline/unauthorized 等暂不暴露给上层。
+                        // 上层如果需要在 UI 提示"未授权"等状态，可在此放开过滤。
+                        let mut map = HashMap::new();
+                        for d in devices {
+                            if d.state == DeviceState::Device {
+                                map.insert(d.serial.clone(), d);
+                            }
+                        }
+
+                        // 避免重复发送相同设备列表
+                        if map != last {
+                            last = map.clone();
+                            let _ = device_tx.send(map);
                         }
                     }
-
-                    // 避免重复发送相同设备列表
-                    if map != last {
-                        last = map.clone();
-                        let _ = device_tx.send(map);
+                    Err(e) => {
+                        eprintln!("parse_devices failed ({} bytes): {}", payload.len(), e);
                     }
                 }
             }
@@ -142,6 +148,16 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
             tokio::select! {
                 _ = token.cancelled() => {},
                 _ = child.wait() => {},
+            }
+            // 即使被取消也再试一次，避免 kill 未生效就 drop → 孤儿进程
+            let _ = child.wait().await;
+            // 'frame 循环因出错退出或断线后，退避再重连
+            // 避免 ADB 反复崩溃时 CPU 忙循环
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(retry_delay) => {
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                }
             }
         }
     });
