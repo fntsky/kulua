@@ -162,3 +162,115 @@ clipboard 设置流程缺少 sequence number 确认机制。
 | P1 | #4 清理和进程监控 | 优雅退出、异常感知 |
 | P2 | #3.2 缺少 ACK_CLIPBOARD 和 UHID_OUTPUT | 未来兼容性 |
 | P2 | #5 使用 scid | 多实例共存 |
+
+---
+
+## 7. 关闭流程 (Stop / Cleanup)
+
+### 7.1 官方 client 侧 (`app/src/server.c`)
+
+```c
+void sc_server_stop(struct sc_server *server) {
+    sc_mutex_lock(&server->mutex);
+    server->stopped = true;            // (1) 设标志
+    sc_cond_signal(&server->cond_stopped);  // (2) 唤醒 run_server 线程
+    sc_intr_interrupt(&server->intr);       // (3) 中断 ADB 操作
+    sc_mutex_unlock(&server->mutex);
+}
+```
+
+`run_server` 线程被 condvar 唤醒后:
+
+```
+(4) cond_wait 返回 → 持有 mutex
+(5) net_interrupt(video_socket)   ← ┐
+(6) net_interrupt(audio_socket)   ← ├── shutdown(SHUT_RDWR)
+(7) net_interrupt(control_socket) ← ┘    每个 socket
+(8) 1s 看门狗 (sc_process_observer_timedwait)
+(9) 超时未退 → sc_process_terminate(pid)  ← Unix: kill(SIGKILL), Win: TerminateProcess
+(10) sc_process_observer_join / destroy
+(11) sc_process_close(pid)               ← waitpid() 回收
+(12) (可选) sc_adb_kill_server()
+```
+
+### 7.2 官方 server 侧 (Java `Server.java`)
+
+服务端的主线程阻塞在 `Looper.loop()`:
+
+```java
+// Server.scrcpy():
+Looper.loop();  // ← 阻塞, 靠 Looper.quitSafely() 退出
+```
+
+各 `AsyncProcessor` 都在设备 socket 上阻塞:
+- `SurfaceEncoder` → `streamer.writePacket()` → `IO.writeFully(fd, buffer)` → 写入 FileDescriptor
+- `AudioEncoder` → 同上
+- `Controller` → `ControlChannel.recv()` → 读取 control socket
+
+关闭链:
+
+```
+Client net_interrupt(socket)
+     ↓
+Server 端 LocalSocket 的 FileDescriptor 收到 EOF / Broken pipe
+     ↓
+IO.writeFully() 抛出 IOException
+     ↓
+AsyncProcessor 线程退出 → listener.onTerminated(fatalError)
+     ↓
+Completion.addCompleted() → running 归零
+     ↓
+Looper.getMainLooper().quitSafely()
+     ↓
+finally 块执行:
+  1. cleanUp.interrupt()           ← 清理线程退出
+  2. for each processor: stop()   ← 设 stopped=true
+  3. connection.shutdown()        ← shutdownInput/Output 三个 socket
+  4. cleanUp.join()               ← 等清理线程
+  5. processor.join()              ← 等所有线程
+  6. OpenGLRunner.shutdown()
+  7. connection.close()           ← close() 三个 socket
+```
+
+### 7.3 你的实现 (`Handle::stop()`)
+
+```rust
+// Handle::stop()
+pub async fn stop(&mut self, adb: &dyn AdbOps) {
+    if let Some(tx) = self.stop_tx.take() {
+        let _ = tx.send(());                    // (1) 发停止信号
+    }
+    // 3s 超时等 task 退出
+    if tokio::time::timeout(3s, &mut self.task).await.is_err() {
+        self.task.abort();                      // (2) abort tokio task
+        // 远程: adb shell kill -9 $(ps | grep ...)   (3)
+        // 本地: process.kill() + wait()              (4)
+        // adb forward --remove                        (5)
+    }
+}
+```
+
+### 7.4 差距分析
+
+| 阶段 | 官方 | 你 | 后果 |
+|---|---|---|---|
+| **Socket 断连** | `net_interrupt()` 每个 socket → server 端 IO 立刻失败 | **无** — 仅发 `stop_tx` 信号 | server 不知道连接断开，继续在 native MediaCodec 或 writePacket 上 block |
+| **Server 退出路径** | 走 Java finally → `processor.stop()` / `shutdown()` / `close()` / jar cleanup | **不走 finally** — 被 kill -9 直接毙掉 | jar 残留设备、socket 不关闭、清理线程被截断 |
+| **等待策略** | 1s watchdog（socket interrupt 后 server 秒退） | 3s timeout（无 interrupt，server 在 native 调用里，等 OS 回收） | 慢 3 倍，且即使等到也是硬杀 |
+| **进程终止** | `kill(SIGKILL)` / `TerminateProcess` | 同左 + `adb shell kill -9 $(ps ...)` | 多一次 adb shell 开销，ps 格式依赖厂商 |
+| **observer** | `sc_process_observer` 监控 server 进程意外死亡 → 中断 accept/read | 无 | server 意外退出不被感知 |
+
+### 7.5 修复要点
+
+正确的关闭顺序应该是:
+
+```
+(1) stop_tx.send(())           ← 让 session 主循环退出
+(2) 关闭 control socket         ← shutdown(SHUT_RDWR)
+(3) 关闭 audio socket           ← shutdown(SHUT_RDWR)
+(4) 等待 task 退出 (短超时 1-2s)  ← server 收到 IO 错误后应快退
+(5) 没退出 → process.kill()     ← 最后手段
+(6) adb forward --remove
+```
+
+核心改动: **在发 stop 信号后立即 shutdown 两路 TCP socket**，这样 server 端的 `Streamer.writePacket()` 和 `ControlChannel.recv()` 会立刻因 `BrokenPipeException` / `IOException` 退出，走 Java 的 finally 清理路径。
