@@ -21,6 +21,7 @@ impl ScrcpyServer {
         device: &Device,
         local_jar: &str,
         port: u16,
+        audio_enabled: bool,
     ) -> Result<Self, crate::types::AdbError> {
         let remote_jar = "/data/local/tmp/scrcpy-server.jar";
         let needs_push = adb
@@ -31,9 +32,11 @@ impl ScrcpyServer {
         } else {
             println!("scrcpy-server.jar already exists on device, skipping push");
         }
-        adb.forward(device, port, "scrcpy")?;
-        let args = [
-            &format!("CLASSPATH={}", remote_jar),
+        let audio_flag = if audio_enabled { "true" } else { "false" };
+        let classpath = format!("CLASSPATH={}", remote_jar);
+        let audio_arg = format!("audio={}", audio_flag);
+        let args = vec![
+            &classpath,
             "app_process",
             "/",
             "com.genymobile.scrcpy.Server",
@@ -41,7 +44,7 @@ impl ScrcpyServer {
             "log_level=debug",
             "tunnel_forward=true",
             "video=false",
-            "audio=false",
+            &audio_arg,
             "control=true",
             "cleanup=true",
             "send_device_meta=true",
@@ -49,6 +52,7 @@ impl ScrcpyServer {
             "send_frame_meta=false",
             "send_stream_meta=false",
         ];
+        adb.forward(device, port, "scrcpy")?;
         let mut process = adb.spawn_shell(device, &args)?;
         if let Some(stderr) = process.stderr.take() {
             let serial = device.serial.clone();
@@ -71,6 +75,11 @@ impl ScrcpyServer {
     pub fn stop(&mut self, adb: &dyn AdbOps) {
         let _ = self.process.kill();
         let _ = self.process.wait();
+        // 强制杀死设备上的远程 scrcpy-server 进程。
+        // Windows 上 process.kill() 使用 TerminateProcess 暴力终止本地 adb 进程，
+        // TCP 连接可能不会优雅关闭，ADB 服务端无法检测断开 → 远程进程残留。
+        let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
+        let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
         let _ = adb.run(&[
             "-s",
             &self.device.serial,
