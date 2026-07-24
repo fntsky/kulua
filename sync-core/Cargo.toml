@@ -21,3 +21,5 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 opus = "0.3"
 rodio = "0.22"
+
+uuid = { version = "1", features = ["serde", "v4"] }

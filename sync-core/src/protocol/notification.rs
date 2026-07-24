@@ -91,6 +91,7 @@ pub fn parse_notification_detail(output: &str, key: &str) -> Option<NotifInfo> {
         package,
         title,
         body,
+        serial: String::new(),
     })
 }
 

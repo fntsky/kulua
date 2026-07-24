@@ -1,5 +1,6 @@
-use std::time::Instant;
 use serde::{Deserialize, Serialize};
+
+use uuid::Uuid;
 
 /// 来自 `adb get-serialno` 的规范设备 ID（主键）
 pub type DeviceId = String;
@@ -88,6 +89,8 @@ impl DeviceIdentity {
 /// 设备信息
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
+    /// 全局唯一标识（生成时分配，不可变）
+    pub uuid: Uuid,
     /// 规范设备 ID（来自 `adb get-serialno`，主键）
     pub id: DeviceId,
     /// 当前用于 adb 命令的最佳地址（最优先的已确认形式）
@@ -252,48 +255,3 @@ mod tests {
     }
 }
 
-/// 待连接设备，按 DeviceId 索引，包含三层地址（USB/mDNS/IP）
-#[derive(Debug, Clone)]
-pub struct PendingDevice {
-    pub added_at: Instant,
-    /// USB serial（自动连接，不需要 adb connect）
-    pub usb_addr: Option<String>,
-    /// mDNS host:port
-    pub mdns_addr: Option<String>,
-    /// IP:port
-    pub ip_addr: Option<String>,
-    /// 上次尝试 adb connect 的时间（per-device 重试间隔）
-    pub last_attempt: Option<Instant>,
-}
-
-impl PendingDevice {
-    /// 创建新的 PendingDevice，设置指定类型的地址
-    pub fn new(addr: String, kind: DeviceAddrKind) -> Self {
-        let mut pd = Self {
-            added_at: Instant::now(),
-            usb_addr: None,
-            mdns_addr: None,
-            ip_addr: None,
-            last_attempt: None,
-        };
-        pd.set_addr(addr, kind);
-        pd
-    }
-
-    /// 设置指定类型的地址（覆盖）
-    pub fn set_addr(&mut self, addr: String, kind: DeviceAddrKind) {
-        match kind {
-            DeviceAddrKind::Usb => self.usb_addr = Some(addr),
-            DeviceAddrKind::Mdns => self.mdns_addr = Some(addr),
-            DeviceAddrKind::Ip => self.ip_addr = Some(addr),
-        }
-    }
-
-    /// 按优先级获取可连接地址（USB 自动连接，不在此列）
-    /// 返回需要 adb connect 的最佳地址：mDNS > IP
-    pub fn best_connect_addr(&self) -> Option<&str> {
-        self.mdns_addr
-            .as_deref()
-            .or_else(|| self.ip_addr.as_deref())
-    }
-}

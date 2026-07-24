@@ -1,14 +1,14 @@
 use crate::app::Command;
 use crate::ipc::types::*;
-use crate::types::Device;
 use crate::notification::NotifInfo;
+use crate::types::Device;
 
+use crate::wireless_pair::WirelessPairing;
 use futures::SinkExt;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use tokio::net::{TcpListener, TcpStream};
-use crate::wireless_pair::WirelessPairing;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
@@ -112,13 +112,15 @@ pub fn serve(
 
 /// 处理单条 IPC 连接：读帧 → 解析 JSON-RPC → 分发 → 写响应。
 ///
-/// 同时监听四个事件源：
+/// 同时监听事件源：
 /// - **TCP 帧**：解析 Request 并回复 Response
-/// - **设备变更**（`device_watch.changed()`）：推送 `device.updated` 事件
+/// - **Session 变更**（`session_watch.changed()`）：推送 `session.updated` 事件
+/// - **剪贴板变更**（`clip_sub`）：推送 `clipboard.changed` 事件
+/// - **通知事件**（`notif_sub`）：推送 `notification` 事件
 async fn handle_ipc_connection(
     stream: TcpStream,
     cmd_tx: mpsc::Sender<Command>,
-    mut device_watch: watch::Receiver<HashMap<String, Device>>,
+    device_watch: watch::Receiver<HashMap<String, Device>>,
     mut session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
     mut clip_sub: broadcast::Receiver<String>,
     mut notif_sub: broadcast::Receiver<NotifInfo>,
@@ -143,16 +145,6 @@ async fn handle_ipc_connection(
                 }
             }
 
-            // ── 设备列表变更事件 ──
-            _ = device_watch.changed() => {
-                let devices: Vec<Device> = device_watch.borrow().values().cloned().collect();
-                let event = Event::DeviceUpdated { data: devices };
-                if let Ok(payload) = serde_json::to_vec(&event) {
-                    if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
-                        break;
-                    }
-                }
-            }
 
             // ── session 列表变更事件 ──
             _ = session_watch.changed() => {
@@ -194,7 +186,7 @@ async fn handle_ipc_connection(
                     Ok(notif) => {
                         let event = Event::Notification {
                             data: NotifData {
-                                serial: String::new(), // 后续从 NotifInfo 补充 serial
+                                serial: notif.serial.clone(),
                                 title: notif.title.unwrap_or_default(),
                                 text: notif.body.unwrap_or_default(),
                                 app: notif.package,
@@ -246,9 +238,7 @@ async fn on_frame(
             Ok(())
         }
 
-        FRAME_TYPE_AUDIO => {
-            Ok(())
-        }
+        FRAME_TYPE_AUDIO => Ok(()),
 
         _ => {
             eprintln!("IPC: 未知帧类型 0x{:02x}", frame_type);
@@ -283,7 +273,11 @@ async fn dispatch_request(
             if serial.is_empty() {
                 return make_error(req.id, -1, "缺少 serial 参数");
             }
-            if cmd_tx.send(Command::Connect(serial.to_string())).await.is_err() {
+            if cmd_tx
+                .send(Command::Connect(serial.to_string()))
+                .await
+                .is_err()
+            {
                 return make_error(req.id, -1, "core 正在关闭");
             }
             make_result(req.id, serde_json::Value::Null)
@@ -299,7 +293,11 @@ async fn dispatch_request(
             if serial.is_empty() {
                 return make_error(req.id, -1, "缺少 serial 参数");
             }
-            if cmd_tx.send(Command::Disconnect(serial.to_string())).await.is_err() {
+            if cmd_tx
+                .send(Command::Disconnect(serial.to_string()))
+                .await
+                .is_err()
+            {
                 return make_error(req.id, -1, "core 正在关闭");
             }
             make_result(req.id, serde_json::Value::Null)
@@ -315,32 +313,62 @@ async fn dispatch_request(
         }
 
         // 获取无线配对信息（二维码数据）
-        "pairing.info" => {
-            make_result(req.id, serde_json::json!({
+        "pairing.info" => make_result(
+            req.id,
+            serde_json::json!({
                 "dns_id": pair_info.dns_id,
                 "psk": pair_info.psk,
                 "wifi_string": pair_info.get_info(),
-            }))
-        }
+            }),
+        ),
 
         // 更新 session 配置（通知同步 / 剪贴板同步 / 音频开关）
         "session.update" => {
-            let serial = req.params.get("serial").and_then(|v| v.as_str()).unwrap_or("");
-            let clipboard_sync = req.params.get("clipboard_sync").and_then(|v| v.as_bool()).unwrap_or(true);
-            let notification_sync = req.params.get("notification_sync").and_then(|v| v.as_bool()).unwrap_or(true);
-            let audio_sync = req.params.get("audio_sync").and_then(|v| v.as_bool()).unwrap_or(false);
-            if serial.is_empty() {
-                return make_error(req.id, -1, "缺少 serial 参数");
+            let uuid = req
+                .params
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let clipboard_sync = req
+                .params
+                .get("clipboard_sync")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let notification_sync = req
+                .params
+                .get("notification_sync")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let audio_sync = req
+                .params
+                .get("audio_sync")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            println!(
+                "IPC: session.update: uuid={}, clipboard_sync={}, notification_sync={}, audio_sync={}",
+                uuid, clipboard_sync, notification_sync, audio_sync
+            );
+            if uuid.is_empty() {
+                return make_error(req.id, -1, "缺少 uuid 参数");
             }
-            if cmd_tx.send(Command::UpdateConfig {
-                serial: serial.to_string(),
-                clipboard_sync,
-                notification_sync,
-                audio_sync,
-            }).await.is_err() {
-                return make_error(req.id, -1, "core 正在关闭");
+            match uuid.parse::<uuid::Uuid>() {
+                Ok(parsed) => {
+                    if cmd_tx
+                        .send(Command::UpdateConfig {
+                            uuid: parsed,
+                            clipboard_sync,
+                            notification_sync,
+                            audio_sync,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return make_error(req.id, -1, "core 正在关闭");
+                    }
+                    make_result(req.id, serde_json::Value::Null)
+                }
+                Err(_) => make_error(req.id, -1, "无效 uuid 格式"),
             }
-            make_result(req.id, serde_json::Value::Null)
         }
 
         // 未知方法
@@ -422,7 +450,16 @@ mod tests {
         let join = tokio::spawn(async move {
             let stream = server.accept().await.unwrap();
             let clip_sub = clip_tx.subscribe();
-            handle_ipc_connection(stream, _cmd_tx, device_watch, session_watch, clip_sub, notif_rx, WirelessPairing::new()).await;
+            handle_ipc_connection(
+                stream,
+                _cmd_tx,
+                device_watch,
+                session_watch,
+                clip_sub,
+                notif_rx,
+                WirelessPairing::new(),
+            )
+            .await;
         });
 
         // 客户端连接并发送 device.list 请求
@@ -460,7 +497,16 @@ mod tests {
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, session_watch, clip_tx, notif_tx, WirelessPairing::new());
+        let _handle = serve(
+            server,
+            token.clone(),
+            _cmd_tx,
+            device_watch,
+            session_watch,
+            clip_tx,
+            notif_tx,
+            WirelessPairing::new(),
+        );
     }
 
     #[tokio::test]
@@ -474,7 +520,16 @@ mod tests {
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, session_watch, clip_tx, notif_tx, WirelessPairing::new());
+        let _handle = serve(
+            server,
+            token.clone(),
+            _cmd_tx,
+            device_watch,
+            session_watch,
+            clip_tx,
+            notif_tx,
+            WirelessPairing::new(),
+        );
 
         // 第一次连接
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();

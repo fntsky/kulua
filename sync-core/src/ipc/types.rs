@@ -1,6 +1,8 @@
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder};
+use uuid::Uuid;
+
 
 // ── 帧类型常量 ──
 
@@ -94,9 +96,10 @@ pub enum Event {
     Notification { data: NotifData },
 }
 
-/// `session.updated` 事件的载荷。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// UUID 主键
+    pub uuid: Uuid,
     /// 设备规范 ID（来自 mDNS fullname 首段 或 get-serialno）
     pub id: String,
     /// 当前用于 ADB 命令的地址
@@ -105,12 +108,16 @@ pub struct SessionSummary {
     pub name: String,
     /// ADB 连接状态
     pub state: String,
+    /// 剪贴板同步
+    pub clipboard_sync: bool,
+    /// 通知同步
+    pub notification_sync: bool,
     /// 音频是否已启用
     pub audio_enabled: bool,
 }
 
 /// `session.updated` 事件的载荷。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListData {
     pub sessions: Vec<SessionSummary>,
 }

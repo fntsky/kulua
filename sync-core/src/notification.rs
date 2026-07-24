@@ -19,6 +19,8 @@ pub struct NotifInfo {
     pub title: Option<String>,
     /// 正文 (android.text 或 android.bigText)
     pub body: Option<String>,
+    /// 来源设备 serial
+    pub serial: String,
 }
 
 pub use crate::protocol::notification::{parse_notification_list, parse_notification_detail};
@@ -132,13 +134,15 @@ pub fn spawn_notification_poller_tokio(
     stop: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    let serial = device.serial.clone();
     let (bridge_tx, bridge_rx) = std_mpsc::channel::<NotifInfo>();
     let (poller_handle, _) = spawn_notification_poller(adb, device, bridge_tx);
     // 后台转发：std mpsc → tokio mpsc，检查 enabled 标志
     tokio::task::spawn_blocking(move || {
         while !stop.load(Ordering::SeqCst) {
             match bridge_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(info) => {
+                Ok(mut info) => {
+                    info.serial = serial.clone();
                     if enabled.load(Ordering::SeqCst) {
                         if notif_tx.blocking_send(info).is_err() {
                             break;

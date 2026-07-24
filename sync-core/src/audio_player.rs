@@ -6,6 +6,8 @@
 use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
+use rodio::MixerDeviceSink;
+
 // ── PCM 数据源 ────────────────────────────────────────────────────
 
 /// 包装 `Vec<f32>` 使其实现 `rodio::Source`，可喂给 `rodio::Player`。
@@ -64,6 +66,8 @@ impl rodio::Source for PcmSource {
 /// 每帧经 `feed_frame` 喂入，解码为 PCM 后立即加入播放队列。
 pub struct AudioPlayer {
     decoder: opus::Decoder,
+    /// 保持设备输出流存活（drop 后播放停止）
+    _device_sink: MixerDeviceSink,
     player: rodio::Player,
     channels: NonZeroU16,
     sample_rate: NonZeroU32,
@@ -78,10 +82,16 @@ impl AudioPlayer {
         const CHANNELS: u16 = 2;
 
         let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)?;
-        let (player, _queue) = rodio::Player::new();
+
+        // 打开系统默认音频输出设备
+        let device_sink = rodio::DeviceSinkBuilder::open_default_sink()
+            .map_err(|e| format!("failed to open audio output device: {e:?}"))?;
+        // 将 Player 连接到设备 mixer，音频才能真正输出
+        let player = rodio::Player::connect_new(&device_sink.mixer());
 
         Ok(Self {
             decoder,
+            _device_sink: device_sink,
             player,
             channels: NonZeroU16::new(CHANNELS).unwrap(),
             sample_rate: NonZeroU32::new(SAMPLE_RATE).unwrap(),

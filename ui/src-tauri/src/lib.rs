@@ -32,6 +32,7 @@ struct PairingInfo {
 
 #[derive(Clone, serde::Serialize)]
 struct DeviceInfo {
+    uuid: String,
     serial: String,
     state: String,
     name: String,
@@ -83,11 +84,10 @@ async fn ipc_request(
 
     rx.await.map_err(|_| "daemon 已断开")?
 }
-
     #[tauri::command]
     async fn update_session_config(
         state: State<'_, AppState>,
-        serial: String,
+        uuid: String,
         clipboard_sync: bool,
         notification_sync: bool,
         audio_sync: bool,
@@ -96,7 +96,7 @@ async fn ipc_request(
             &state,
             "session.update",
             serde_json::json!({
-                "serial": serial,
+                "uuid": uuid,
                 "clipboard_sync": clipboard_sync,
                 "notification_sync": notification_sync,
                 "audio_sync": audio_sync,
@@ -188,6 +188,7 @@ async fn connect_daemon(app: AppHandle) {
                                             let infos: Vec<DeviceInfo> = devices
                                                 .iter()
                                                 .map(|d| DeviceInfo {
+                                                    uuid: d.uuid.to_string(),
                                                     serial: d.serial.clone(),
                                                     state: format!("{:?}", d.state),
                                                     name: d.name.clone(),
@@ -197,6 +198,15 @@ async fn connect_daemon(app: AppHandle) {
                                                 *st.devices.lock() = infos.clone();
                                             }
                                             let _ = app.emit("devices-updated", &infos);
+                                        }
+                                    }
+                                }
+                                Some("session.updated") => {
+                                    if let Some(sessions_val) = val.get("data") {
+                                        if let Ok(session_data) = serde_json::from_value::<sync_core::ipc::types::SessionListData>(
+                                            sessions_val.clone(),
+                                        ) {
+                                            let _ = app.emit("sessions-updated", &session_data);
                                         }
                                     }
                                 }
@@ -231,6 +241,7 @@ async fn connect_daemon(app: AppHandle) {
                                             let infos: Vec<DeviceInfo> = devices
                                                 .iter()
                                                 .map(|d| DeviceInfo {
+                                                    uuid: d.uuid.to_string(),
                                                     serial: d.serial.clone(),
                                                     state: format!("{:?}", d.state),
                                                     name: d.name.clone(),

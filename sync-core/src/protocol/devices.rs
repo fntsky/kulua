@@ -28,6 +28,7 @@ pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
             identity.set_by_kind(raw_serial.clone(), kind);
             // 初始 id 和 serial 都设为原始地址；后续通过 get-serialno 更新
             Some(Device {
+                uuid: uuid::Uuid::new_v4(),
                 id: raw_serial.clone(),
                 serial: raw_serial,
                 state,
