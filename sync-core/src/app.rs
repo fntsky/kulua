@@ -1,7 +1,7 @@
 use crate::adb_cmd::{AdbCmd, AdbOps};
 use crate::notification::{self, NotifInfo};
 use crate::session;
-use crate::types::{Device, DeviceAddrKind, DeviceId, DeviceIdentity, DeviceState};
+use crate::types::{Device, DeviceAddrKind, DeviceId, DeviceIdentity, DeviceState, PendingDevice};
 use crate::wireless_pair;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,8 +53,11 @@ pub struct Core {
     sessions: HashMap<String, session::Handle>,
     /// 每个连接的设备 session 配置
     session_configs: HashMap<String, session::SessionConfig>,
-    pending_serials: HashMap<String, Instant>,
-    /// 上次对每个 pending 设备发起 adb connect 的时间（用于 5s 重试间隔）
+    /// 按 DeviceId 索引，含三层地址（USB/mDNS/IP）
+    pending_serials: HashMap<DeviceId, PendingDevice>,
+    /// 尚未解析到 DeviceId 的地址（mDNS 发现、用户输入的 IP）
+    discovered_addrs: HashMap<String, Instant>,
+    /// 对 discovered_addrs 的重试间隔记录
     last_connect_attempt: HashMap<String, Instant>,
     /// 按规范 DeviceId 去重的设备映射（权威数据源）
     devices_by_id: HashMap<DeviceId, Device>,
@@ -131,6 +134,7 @@ impl Core {
             sessions: HashMap::new(),
             session_configs: HashMap::new(),
             pending_serials: HashMap::new(),
+            discovered_addrs: HashMap::new(),
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             last_connect_attempt: HashMap::new(),
@@ -201,21 +205,52 @@ impl Core {
                     self.poll_system_clipboard();
                     let from_track = self.device_watch.borrow_and_update().clone();
                     // 将 device_refresh 上报的设备合并到 devices_by_id
+                    // 并清理已连接的 pending/discovered 条目
                     for (serial, dev) in &from_track {
-                        let in_by_id = self.devices_by_id.values().any(|d| d.identity.contains_addr(serial));
-                        if !in_by_id {
-                            // 新设备（如 USB 直连），以 serial 作为 id 的初始值
-                            let kind = DeviceAddrKind::classify(serial);
+                        let kind = DeviceAddrKind::classify(serial);
+                        let device_id = if kind == DeviceAddrKind::Usb {
+                            // USB serial is the DeviceId
+                            serial.clone()
+                        } else {
+                            // Network address: try to resolve via identity
+                            self.devices_by_id
+                                .values()
+                                .find(|d| d.identity.contains_addr(serial))
+                                .map(|d| d.id.clone())
+                                .unwrap_or_else(|| serial.clone())
+                        };
+
+                        if let Some(existing) = self.devices_by_id.get_mut(&device_id) {
+                            // Update identity with this address
+                            existing.identity.set_by_kind(serial.clone(), kind);
+                            // Promote serial if higher priority address
+                            if kind.priority()
+                                > DeviceAddrKind::classify(&existing.serial).priority()
+                            {
+                                println!(
+                                    "Device {} serial promoted: {} -> {}",
+                                    existing.id, existing.serial, serial
+                                );
+                                existing.serial = serial.clone();
+                            }
+                        } else {
+                            // New device
                             let mut identity = DeviceIdentity::default();
                             identity.set_by_kind(serial.clone(), kind);
-                            let device_id = serial.clone();
-                            self.devices_by_id.entry(device_id.clone()).or_insert(Device {
-                                id: device_id,
+                            self.devices_by_id.insert(device_id.clone(), Device {
+                                id: device_id.clone(),
                                 serial: serial.clone(),
                                 state: dev.state.clone(),
                                 name: String::new(),
                                 identity,
                             });
+                        }
+
+                        // Clean up discovered_addrs if this address is now tracked
+                        self.discovered_addrs.remove(serial);
+                        // Clean up pending_serials if device is now connected
+                        if dev.state == DeviceState::Device {
+                            self.pending_serials.remove(&device_id);
                         }
                     }
                     self.try_connect_pending(&from_track);
@@ -252,9 +287,9 @@ impl Core {
                 }
             }
             wireless_pair::MdnsEvent::ConnectDiscovered { host, port } => {
-                println!("[CONNECT] Discovered device at {}:{}", host, port);
-                self.pending_serials
-                    .insert(format!("{}:{}", host, port), Instant::now());
+                let addr = format!("{}:{}", host, port);
+                println!("[CONNECT] Discovered device at {}", addr);
+                self.discovered_addrs.insert(addr, Instant::now());
             }
             wireless_pair::MdnsEvent::Error(e) => {
                 eprintln!("mDNS error: {}", e);
@@ -280,14 +315,54 @@ impl Core {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Connect(serial) => {
-                self.pending_serials.insert(serial, Instant::now());
+            Command::Connect(addr) => {
+                let kind = DeviceAddrKind::classify(&addr);
+                if kind == DeviceAddrKind::Usb {
+                    // USB serial is the DeviceId, add to pending_serials directly
+                    let device_id = addr.clone();
+                    self.pending_serials
+                        .entry(device_id)
+                        .or_insert_with(|| PendingDevice::new(addr, kind));
+                } else if let Some(device) = self
+                    .devices_by_id
+                    .values()
+                    .find(|d| d.identity.contains_addr(&addr))
+                {
+                    // Known device: add address tier to existing pending entry
+                    self.pending_serials
+                        .entry(device.id.clone())
+                        .or_insert_with(|| PendingDevice::new(addr.clone(), kind))
+                        .set_addr(addr, kind);
+                } else {
+                    // Unknown network address: add to discovered (pre-DeviceId)
+                    self.discovered_addrs.insert(addr, Instant::now());
+                }
             }
             Command::Disconnect(serial) => {
-                if let Some(mut handle) = self.sessions.remove(&serial) {
+                // Try direct session lookup by serial (current address)
+                let found = if let Some(mut handle) = self.sessions.remove(&serial) {
                     handle.stop(self.adb_cmd.as_ref()).await;
+                    true
+                } else {
+                    false
+                };
+                // Fallback: look up by DeviceId or identity
+                if !found {
+                    let key = self
+                        .sessions
+                        .iter()
+                        .find(|(_, h)| {
+                            h.device.id == serial || h.device.identity.contains_addr(&serial)
+                        })
+                        .map(|(k, _)| k.clone());
+                    if let Some(key) = key {
+                        if let Some(mut handle) = self.sessions.remove(&key) {
+                            handle.stop(self.adb_cmd.as_ref()).await;
+                        }
+                    }
                 }
                 self.pending_serials.remove(&serial);
+                self.discovered_addrs.remove(&serial);
                 self.session_configs.remove(&serial);
             }
             Command::UpdateConfig {
@@ -365,69 +440,63 @@ impl Core {
         }
     }
 
-    /// 对 pending 队列中的设备发起 adb connect。
+    /// 按优先级连接待处理设备。
     ///
-    /// 对 pending 队列中的设备发起 adb connect，连接后获取 serialno 去重。
+    /// 分为两个阶段：
+    /// 1. `discovered_addrs`：连接尚未解析 DeviceId 的地址（mDNS、用户 IP），
+    ///    成功后通过 `adb get-serialno` 获取 DeviceId 并移入 `pending_serials`。
+    /// 2. `pending_serials`：对已知 DeviceId 的设备按优先级（mDNS > IP）尝试连接。
     ///
-    /// - 设备已在 `devices` 中（刷新线程确认已连接）→ 从 pending 移除
-    /// - 5 秒内已尝试过 → 跳过（避免高频重试）
-    /// - 否则发起 adb connect → 成功后 `adb get-serialno` → 按 DeviceId 去重合并
-    /// - pending 超过 30 秒未连接成功 → 自动丢弃
+    /// 连接已在 `devices`（adb track-devices）中的设备自动从待处理队列移除。
+    /// 30 秒超时的 pending 设备自动丢弃。
+    /// 同一地址/设备 5 秒内不会重复尝试。
     fn try_connect_pending(&mut self, devices: &HashMap<String, Device>) {
         let now = Instant::now();
 
-        // 清理超时条目（30 秒未连接成功则放弃）
-        let timed_out: Vec<String> = self
-            .pending_serials
-            .iter()
-            .filter(|(_, added)| now.duration_since(**added) > Duration::from_secs(30))
-            .map(|(serial, _)| serial.clone())
-            .collect();
-        for serial in &timed_out {
-            self.pending_serials.remove(serial);
-            self.last_connect_attempt.remove(serial);
-        }
-
-        let serials: Vec<String> = self.pending_serials.keys().cloned().collect();
-        for addr in &serials {
+        // ═══════════════════════════════════════════════
+        // Stage 1: Process discovered_addrs (pre-DeviceId)
+        // ═══════════════════════════════════════════════
+        let addrs: Vec<String> = self.discovered_addrs.keys().cloned().collect();
+        for addr in &addrs {
+            // Already connected, remove from discovered
             if devices.contains_key(addr) {
-                // 刷新线程已确认设备在线，从 pending 移除
-                self.pending_serials.remove(addr);
+                self.discovered_addrs.remove(addr);
                 self.last_connect_attempt.remove(addr);
                 continue;
             }
-            // 5 秒内已试过，跳过
+
+            // 5s cooldown per address
             if let Some(last) = self.last_connect_attempt.get(addr) {
                 if now.duration_since(*last) < Duration::from_secs(5) {
                     continue;
                 }
             }
+
             match self.adb_cmd.connect(addr) {
                 Ok(()) => {
                     println!("  connect {}: connected", addr);
-                    self.pending_serials.remove(addr);
+                    self.discovered_addrs.remove(addr);
                     self.last_connect_attempt.remove(addr);
 
-                    // 连接成功后获取规范 serialno 用于去重
+                    // Get serialno for dedup and DeviceId resolution
                     match self.adb_cmd.get_serialno(addr) {
                         Ok(device_id) => {
                             let kind = DeviceAddrKind::classify(addr);
                             let mut identity = DeviceIdentity::default();
                             identity.set_by_kind(addr.clone(), kind);
 
+                            // Merge into devices_by_id
                             if let Some(existing) = self.devices_by_id.get_mut(&device_id) {
-                                // 已存在：合并 identity，保留更优先的 serial
                                 existing.identity.merge(&identity);
-                                // 更新 state
                                 existing.state = DeviceState::Device;
-                                // 如果新地址优先级更高，更新 serial
-                                if kind.priority() > DeviceAddrKind::classify(&existing.serial).priority() {
+                                if kind.priority()
+                                    > DeviceAddrKind::classify(&existing.serial).priority()
+                                {
                                     existing.serial = addr.clone();
                                 }
                             } else {
-                                // 新设备：用 serialno 作为 id，addr 作为 serial
                                 self.devices_by_id.insert(device_id.clone(), Device {
-                                    id: device_id,
+                                    id: device_id.clone(),
                                     serial: addr.clone(),
                                     state: DeviceState::Device,
                                     name: String::new(),
@@ -435,17 +504,23 @@ impl Core {
                                 });
                             }
                             self.sync_device_watch();
+
+                            // Add to pending_serials with DeviceId and tiered address
+                            self.pending_serials
+                                .entry(device_id)
+                                .or_insert_with(|| PendingDevice::new(addr.clone(), kind))
+                                .set_addr(addr.clone(), kind);
                         }
                         Err(e) => {
                             eprintln!("  get-serialno for {} failed: {}", addr, e);
-                            // 即使 get-serialno 失败也保留设备（用 addr 作为 id）
+                            // Still create a device entry with address as DeviceId
                             let kind = DeviceAddrKind::classify(addr);
                             let mut identity = DeviceIdentity::default();
                             identity.set_by_kind(addr.clone(), kind);
                             let device_id = addr.clone();
                             if !self.devices_by_id.contains_key(&device_id) {
-                                self.devices_by_id.insert(device_id, Device {
-                                    id: addr.clone(),
+                                self.devices_by_id.insert(device_id.clone(), Device {
+                                    id: device_id.clone(),
                                     serial: addr.clone(),
                                     state: DeviceState::Device,
                                     name: String::new(),
@@ -453,12 +528,83 @@ impl Core {
                                 });
                                 self.sync_device_watch();
                             }
+                            // Still add to pending_serials with address as key
+                            self.pending_serials
+                                .entry(device_id)
+                                .or_insert_with(|| PendingDevice::new(addr.clone(), kind));
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("  connect {} failed: {}", addr, e);
                     self.last_connect_attempt.insert(addr.clone(), now);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════
+        // Stage 2: Process pending_serials (known DeviceId)
+        // ═══════════════════════════════════════════════
+
+        // Clean up 30s timeout entries
+        let timed_out: Vec<DeviceId> = self
+            .pending_serials
+            .iter()
+            .filter(|(_, pd)| now.duration_since(pd.added_at) > Duration::from_secs(30))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &timed_out {
+            self.pending_serials.remove(id);
+        }
+
+        let ids: Vec<DeviceId> = self.pending_serials.keys().cloned().collect();
+        for device_id in &ids {
+            let pending = match self.pending_serials.get(device_id) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            // Check if any known address is already connected (in track-devices)
+            let is_connected = pending
+                .usb_addr
+                .as_ref()
+                .map_or(false, |a| devices.contains_key(a))
+                || pending
+                    .mdns_addr
+                    .as_ref()
+                    .map_or(false, |a| devices.contains_key(a))
+                || pending
+                    .ip_addr
+                    .as_ref()
+                    .map_or(false, |a| devices.contains_key(a));
+
+            if is_connected {
+                self.pending_serials.remove(device_id);
+                continue;
+            }
+
+            // Per-device 5s cooldown
+            if let Some(last) = pending.last_attempt {
+                if now.duration_since(last) < Duration::from_secs(5) {
+                    continue;
+                }
+            }
+
+            // Try best connectable address: mDNS > IP (USB is auto-connected)
+            if let Some(best_addr) = pending.best_connect_addr() {
+                match self.adb_cmd.connect(best_addr) {
+                    Ok(()) => {
+                        println!("  connect {}: connected", best_addr);
+                        if let Some(p) = self.pending_serials.get_mut(device_id) {
+                            p.last_attempt = None;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  connect {} failed: {}", best_addr, e);
+                        if let Some(p) = self.pending_serials.get_mut(device_id) {
+                            p.last_attempt = Some(now);
+                        }
+                    }
                 }
             }
         }
@@ -469,6 +615,21 @@ impl Core {
             if self.sessions.contains_key(serial) {
                 continue;
             }
+
+            // 检查是否有相同 DeviceId 的 session（serial 可能因优先级变化而改变）
+            if let Some(old_serial) = self
+                .sessions
+                .iter()
+                .find(|(_, h)| h.device.id == device.id)
+                .map(|(s, _)| s.clone())
+            {
+                // serial 变了，rekey session 而不是启动新的
+                let handle = self.sessions.remove(&old_serial).unwrap();
+                self.sessions.insert(serial.clone(), handle);
+                println!("Session rekeyed: {} -> {}", old_serial, serial);
+                continue;
+            }
+
             self.start_session(device.clone()).await;
         }
 
@@ -484,6 +645,14 @@ impl Core {
     }
 
     async fn start_session(&mut self, device: Device) {
+        // Guard: 相同 DeviceId 的 session 已在运行则不重复启动
+        if self.sessions.iter().any(|(_, h)| h.device.id == device.id) {
+            println!(
+                "Session already running for device {}, skipping start_session",
+                device.id
+            );
+            return;
+        }
         let port = self.port_counter;
         self.port_counter += 1;
 
@@ -641,7 +810,8 @@ mod tests {
             cmd_rx: Some(mpsc::channel(32).1),
             sessions: HashMap::new(),
             session_configs: HashMap::new(),
-            pending_serials: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
+            pending_serials: HashMap::new(),
+            discovered_addrs: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
             last_connect_attempt: HashMap::new(),
             devices_by_id: HashMap::new(),
             port_counter: 27183,
@@ -666,7 +836,7 @@ mod tests {
         )]);
 
         core.try_connect_pending(&devices);
-        assert!(core.pending_serials.is_empty());
+        assert!(core.discovered_addrs.is_empty());
         assert!(devices.contains_key("192.168.1.100:5555"));
     }
 }
