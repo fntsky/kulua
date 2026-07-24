@@ -1,7 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -30,9 +29,10 @@ pub struct Session {
     clipboard_enabled: Arc<AtomicBool>,
     notification_enabled: Arc<AtomicBool>,
     audio_enabled: Arc<AtomicBool>,
+    /// 音量百分比（0-100）
+    volume: Arc<AtomicU16>,
     device_name_tx: Option<mpsc::Sender<(String, String)>>,
 }
-
 impl Session {
     pub fn new(
         adb: Arc<dyn AdbOps>,
@@ -46,6 +46,7 @@ impl Session {
         clipboard_enabled: Arc<AtomicBool>,
         notification_enabled: Arc<AtomicBool>,
         audio_enabled: Arc<AtomicBool>,
+        volume: Arc<AtomicU16>,
         device_name_tx: mpsc::Sender<(String, String)>,
     ) -> Self {
         Self {
@@ -60,6 +61,7 @@ impl Session {
             clipboard_enabled,
             notification_enabled,
             audio_enabled,
+            volume,
             device_name_tx: Some(device_name_tx),
         }
     }
@@ -205,6 +207,7 @@ impl Session {
         } else {
             // OPUS → 解码播放
             let serial = self.device.serial.clone();
+            let volume = self.volume.clone();
             Some(tokio::spawn(async move {
                 let mut player = match crate::audio_player::AudioPlayer::new() {
                     Ok(p) => p,
@@ -213,8 +216,18 @@ impl Session {
                         return;
                     }
                 };
+                // 初始音量
+                player.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
 
+                let mut last_vol = volume.load(Ordering::Relaxed);
                 loop {
+                    // 同步音量变更
+                    let cur = volume.load(Ordering::Relaxed);
+                    if cur != last_vol {
+                        player.set_volume(cur as f32 / 100.0);
+                        last_vol = cur;
+                    }
+
                     // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
                     let mut header = [0u8; 12];
                     if audio_reader.read_exact(&mut header).await.is_err() {

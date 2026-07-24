@@ -91,6 +91,7 @@ async fn ipc_request(
         clipboard_sync: bool,
         notification_sync: bool,
         audio_sync: bool,
+        volume: u16,
     ) -> Result<(), String> {
         ipc_request(
             &state,
@@ -100,6 +101,7 @@ async fn ipc_request(
                 "clipboard_sync": clipboard_sync,
                 "notification_sync": notification_sync,
                 "audio_sync": audio_sync,
+                "volume": volume,
             }),
         ).await?;
         Ok(())

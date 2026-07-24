@@ -322,7 +322,7 @@ async fn dispatch_request(
             }),
         ),
 
-        // 更新 session 配置（通知同步 / 剪贴板同步 / 音频开关）
+        // 更新 session 配置（通知同步 / 剪贴板同步 / 音频开关 / 音量）
         "session.update" => {
             let uuid = req
                 .params
@@ -344,9 +344,15 @@ async fn dispatch_request(
                 .get("audio_sync")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let volume = req
+                .params
+                .get("volume")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(100) as u16)
+                .unwrap_or(80);
             println!(
-                "IPC: session.update: uuid={}, clipboard_sync={}, notification_sync={}, audio_sync={}",
-                uuid, clipboard_sync, notification_sync, audio_sync
+                "IPC: session.update: uuid={}, clipboard={}, notification={}, audio={}, volume={}",
+                uuid, clipboard_sync, notification_sync, audio_sync, volume
             );
             if uuid.is_empty() {
                 return make_error(req.id, -1, "缺少 uuid 参数");
@@ -359,6 +365,7 @@ async fn dispatch_request(
                             clipboard_sync,
                             notification_sync,
                             audio_sync,
+                            volume,
                         })
                         .await
                         .is_err()

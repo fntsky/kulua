@@ -6,7 +6,7 @@ use crate::types::{Device, DeviceAddrKind, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,7 @@ pub enum Command {
         clipboard_sync: bool,
         notification_sync: bool,
         audio_sync: bool,
+        volume: u16,
     },
 }
 
@@ -213,109 +214,102 @@ impl Core {
                     if let Some(entry) = self.devices.values_mut().find(|e| e.device.serial == serial) {
                         entry.device.name = name.clone();
                     }
-                    // 也更新 device_tx 用于 IPC
-                    self.sync_device_watch();
                 }
                 _ = tick.tick() => {
                     self.poll_system_clipboard();
                     let from_track = self.device_watch.borrow_and_update().clone();
-                    // 将 device_refresh 上报的设备合并到 devices 映射
-                    // 并清理已连接的 pending 条目
                     for (serial, dev) in &from_track {
-                        let kind = DeviceAddrKind::classify(serial);
-
-                        // ── 判定归属（Step 1 → Step 2 → Step 3）──
-                        let device_id = if kind == DeviceAddrKind::Usb {
-                            // USB serial 即为 DeviceId
-                            serial.clone()
-                        } else if let Some(existing) = self
-                            .devices
-                            .values()
-                            .find(|e| e.device.identity.contains_addr(serial))
-                        {
-                            // Step 1: Identity 命中
-                            existing.device.id.clone()
-                        } else if dev.state == DeviceState::Device {
-                            // Step 2: 设备已连接 → 调 get-serialno 解析真实 DeviceId
-                            match self.adb_cmd.get_serialno(serial) {
-                                Ok(real_id) => {
-                                    println!("  get-serialno {} -> {}", serial, real_id);
-                                    real_id
-                                }
-                                Err(_) => {
-                                    // Step 3: 解析失败 → 临时条目（以地址为 DeviceId）
-                                    serial.clone()
-                                }
-                            }
-                        } else {
-                            // 未连接 → 无法解析，临时条目
-                            serial.clone()
-                        };
-
-                        let mut identity = DeviceIdentity::default();
-                        identity.set_by_kind(serial.clone(), kind);
-
-                        if let Some(existing) = self
-                            .devices
-                            .values_mut()
-                            .find(|e| e.device.id == device_id || e.device.identity.contains_addr(serial))
-                        {
-                            // 归入已有设备
-                            existing.device.identity.merge(&identity);
-                            if kind.priority()
-                                > DeviceAddrKind::classify(&existing.device.serial).priority()
-                                // mDNS fullname（含 ._tcp）不能作为 ADB target，不提升
-                                && !serial.contains("._tcp")
-                            {
-                                println!(
-                                    "Device {} serial promoted: {} -> {}",
-                                    existing.device.id, existing.device.serial, serial
-                                );
-                                existing.device.serial = serial.clone();
-                            }
-                        } else {
-                            // 新设备：创建带 UUID 的 Device
-                            let new_device = Device {
-                                uuid: Uuid::new_v4(),
-                                id: device_id.clone(),
-                                serial: serial.clone(),
-                                state: dev.state.clone(),
-                                name: String::new(),
-                                identity,
-                            };
-                            self.devices.insert(new_device.uuid, DeviceEntry::new(new_device));
-                        }
-
-                        // 清理 pending_serials（尝试原始 serial 和解析后 device_id）
+                        self.insert_device(serial, dev.state.clone());
                         if dev.state == DeviceState::Device {
-                            self.pending_serials.retain(|e| e.addr != *serial && e.addr != device_id);
+                            self.pending_serials.retain(|e| e.addr != *serial);
                         }
                     }
                     self.try_connect_pending(&from_track);
-                    // 用 devices 的值同步到 device_tx
                     self.sync_device_watch();
-                    // sync_sessions 使用 devices 的值
                     self.sync_sessions(&from_track).await;
-                    // 推送 session 列表给 IPC
                     self.push_session_list();
-                    // 输出session列表
-                    // println!("Current sessions:");
-                    // for entry in self.devices.values() {
-                    //     if let Some(handle) = &entry.session {
-                    //         println!(
-                    //             "  {} (uuid={}, name={}, audio={})",
-                    //             entry.device.serial,
-                    //             entry.device.uuid,
-                    //             entry.device.name,
-                    //             handle.audio_enabled.load(Ordering::SeqCst)
-                    //         );
-                    //     }
-                    // }
                 }
             }
         }
 
         self.stop_all().await;
+    }
+
+    /// 将 adb 上报的设备插入/合并到 `devices` 映射。
+    ///
+    /// 1. 按地址分类构造 identity
+    /// 2. 在现有设备中按 identity 匹配
+    /// 3. 未匹配且状态为 Device 时调用 `adb shell getprop ro.serialno` 获取硬件序列号
+    /// 4. 按该序列号再匹配一次
+    /// 5. 仍未匹配则创建新 Device（UUID 主键）
+    ///
+    /// 返回该设备条目的 UUID。**对 devices 的写入操作必须经由此函数。**
+    fn insert_device(&mut self, serial: &str, state: DeviceState) -> Uuid {
+        let kind = DeviceAddrKind::classify(serial);
+        let mut identity = DeviceIdentity::default();
+        identity.set_by_kind(serial.to_string(), kind);
+
+        // ── Step 1: 按 identity 匹配 ──
+        if let Some(entry) = self
+            .devices
+            .values_mut()
+            .find(|e| e.device.identity.contains_addr(serial))
+        {
+            entry.device.identity.merge(&identity);
+            entry.device.state = state;
+            if kind.priority() > DeviceAddrKind::classify(&entry.device.serial).priority()
+                && !serial.contains("._tcp")
+            {
+                entry.device.serial = serial.to_string();
+            }
+            return entry.device.uuid;
+        }
+
+        // ── Step 2: 已连接的设备 → 解析真实 DeviceId ──
+        let device_id = if state == DeviceState::Device {
+            match self
+                .adb_cmd
+                .run(&["-s", serial, "shell", "getprop", "ro.serialno"])
+            {
+                Ok(output) => {
+                    let real_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !real_id.is_empty() {
+                        println!("  getprop ro.serialno {} -> {}", serial, real_id);
+                        real_id
+                    } else {
+                        serial.to_string()
+                    }
+                }
+                Err(_) => serial.to_string(),
+            }
+        } else {
+            serial.to_string()
+        };
+
+        // ── Step 3: 按 device_id 再匹配一次 ──
+        if let Some(entry) = self.devices.values_mut().find(|e| e.device.id == device_id) {
+            entry.device.identity.merge(&identity);
+            entry.device.state = state;
+            if kind.priority() > DeviceAddrKind::classify(&entry.device.serial).priority()
+                && !serial.contains("._tcp")
+            {
+                entry.device.serial = serial.to_string();
+            }
+            return entry.device.uuid;
+        }
+
+        // ── Step 4: 真正的新设备 ──
+        let new = Device {
+            uuid: Uuid::new_v4(),
+            id: device_id,
+            serial: serial.to_string(),
+            state,
+            name: String::new(),
+            identity,
+        };
+        let uuid = new.uuid;
+        self.devices.insert(uuid, DeviceEntry::new(new));
+        uuid
     }
 
     // ─── 事件处理 ────────────────────────────────────────
@@ -342,83 +336,14 @@ impl Core {
                     "[CONNECT] Discovered {} at {} (serial={})",
                     fullname, addr, device_id
                 );
-
-                // mDNS 发现的地址始终标记为 Mdns
-                let kind = DeviceAddrKind::Mdns;
-                let mut identity = DeviceIdentity::default();
-                identity.set_by_kind(addr.clone(), kind);
-
-                // Merge into devices
-                let existing_uuid = self.devices.values().find_map(|entry| {
-                    if entry.device.id == device_id || entry.device.identity.contains_addr(&addr) {
-                        Some(entry.device.uuid)
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(uuid) = existing_uuid {
-                    let entry = self.devices.get_mut(&uuid).unwrap();
-                    entry.device.identity.merge(&identity);
-                    entry.device.state = DeviceState::Device;
-                    if kind.priority() > DeviceAddrKind::classify(&entry.device.serial).priority() {
-                        entry.device.serial = addr.clone();
-                    }
-                } else {
-                    let new_device = Device {
-                        uuid: Uuid::new_v4(),
-                        id: device_id.clone(),
-                        serial: addr.clone(),
-                        state: DeviceState::Device,
-                        name: String::new(),
-                        identity,
-                    };
-                    self.devices
-                        .insert(new_device.uuid, DeviceEntry::new(new_device));
-                }
-                self.sync_device_watch();
-
-                // Add to pending_serials
+                // 仅加入 pending 环，由 tick 循环负责 connect 后 insert_device
                 if !self
                     .pending_serials
                     .iter()
                     .any(|e| e.addr == device_id || e.addr == addr)
                 {
-                    self.pending_serials.push_back(PendingEntry {
-                        addr: addr.clone(),
-                        attempts: 0,
-                    });
-                }
-
-                // Step 3: 合并已有临时条目（通过 UUID 找到 IP:port 的临时设备并入）
-                let temp_uuids: Vec<Uuid> = self
-                    .devices
-                    .iter()
-                    .filter(|(_, entry)| {
-                        DeviceAddrKind::classify(&entry.device.id) == DeviceAddrKind::Ip
-                            && entry.device.identity.contains_addr(&addr)
-                    })
-                    .map(|(uuid, _)| *uuid)
-                    .collect();
-
-                for temp_uuid in &temp_uuids {
-                    let temp_entry = match self.devices.remove(temp_uuid) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    if let Some(entry) = self.devices.get_mut(&existing_uuid.unwrap()) {
-                        println!(
-                            "[MERGE] Merging temp entry {} into {}",
-                            temp_uuid,
-                            existing_uuid.unwrap()
-                        );
-                        entry.device.identity.merge(&temp_entry.device.identity);
-                        // 如果临时设备有 session，接过来
-                        if entry.session.is_none() && temp_entry.session.is_some() {
-                            entry.session = temp_entry.session;
-                        }
-                    }
-                    // pending_serials 中的地址由 addr 统一覆盖，无需合并三层
+                    self.pending_serials
+                        .push_back(PendingEntry { addr, attempts: 0 });
                 }
             }
             wireless_pair::MdnsEvent::Error(e) => {
@@ -475,19 +400,22 @@ impl Core {
                 // 清理 pending_serials 中的对应地址
                 self.pending_serials.retain(|e| e.addr != serial);
                 // 放弃 Disconnect 中对 session_configs 的清理（config 随 DeviceEntry 保留）
-            }
+                }
             Command::UpdateConfig {
                 uuid,
                 clipboard_sync,
                 notification_sync,
                 audio_sync,
+                volume,
             } => {
                 // 更新配置
                 if let Some(entry) = self.devices.get_mut(&uuid) {
+                    let prev_audio = entry.config.audio_enabled;
                     entry.config = session::SessionConfig {
                         clipboard_sync,
                         notification_sync,
                         audio_enabled: audio_sync,
+                        volume,
                     };
 
                     // 剪贴板和通知可直接切换原子标志
@@ -498,19 +426,18 @@ impl Core {
                         handle
                             .notification_enabled
                             .store(notification_sync, Ordering::SeqCst);
-                        let prev_audio = handle.audio_enabled.load(Ordering::SeqCst);
+                        // 音量实时生效（无需重启 session）
+                        handle.volume.store(volume, Ordering::Relaxed);
                         if prev_audio != audio_sync {
-                            // 音频切换需要重启 scrcpy → 重启 session
                             handle.audio_enabled.store(audio_sync, Ordering::SeqCst);
                         }
                     }
                 }
 
-                // 音频变更需要重启 session——在 mutable borrow 外执行
+                // 音频开关变更需要重启 session
                 let need_restart = self.devices.get(&uuid).is_some_and(|entry| {
                     entry.session.as_ref().is_some_and(|h| {
-                        let prev = h.audio_enabled.load(Ordering::SeqCst);
-                        prev != audio_sync
+                        h.audio_enabled.load(Ordering::SeqCst) != audio_sync
                     })
                 });
                 if need_restart {
@@ -669,6 +596,7 @@ impl Core {
                     clipboard_sync: entry.config.clipboard_sync,
                     notification_sync: entry.config.notification_sync,
                     audio_enabled: handle.audio_enabled.load(Ordering::SeqCst),
+                    volume: entry.config.volume,
                 })
             })
             .collect();
@@ -712,11 +640,11 @@ impl Core {
             .get(&device.uuid)
             .map(|entry| entry.config)
             .unwrap_or_default();
-
-        // 共享原子标志，Core 后续可随时切换（音频除外，需要重启 session）
+        // 共享原子标志，Core 后续可随时切换
         let clipboard_enabled = Arc::new(AtomicBool::new(cfg.clipboard_sync));
         let notification_enabled = Arc::new(AtomicBool::new(cfg.notification_sync));
         let audio_enabled = Arc::new(AtomicBool::new(cfg.audio_enabled));
+        let volume = Arc::new(AtomicU16::new(cfg.volume));
 
         let mut sess = session::Session::new(
             adb,
@@ -730,6 +658,7 @@ impl Core {
             clipboard_enabled.clone(),
             notification_enabled.clone(),
             audio_enabled.clone(),
+            volume.clone(),
             self.device_name_tx.clone(),
         );
 
@@ -743,6 +672,7 @@ impl Core {
             clipboard_enabled,
             notification_enabled,
             audio_enabled,
+            volume,
         };
 
         let uuid = handle.device.uuid;

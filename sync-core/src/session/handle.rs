@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::time::Duration;
 
 use crate::adb_cmd::AdbOps;
@@ -20,8 +20,9 @@ pub struct Handle {
     pub notification_enabled: Arc<AtomicBool>,
     /// Core 通过此标志动态控制音频开关（重启 session 后生效）
     pub audio_enabled: Arc<AtomicBool>,
+    /// 音量百分比（0-100），Core 可实时调整
+    pub volume: Arc<AtomicU16>,
 }
-
 impl Handle {
     /// 停止 session（模仿官方关闭流程）。
     ///

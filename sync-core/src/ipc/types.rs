@@ -114,6 +114,8 @@ pub struct SessionSummary {
     pub notification_sync: bool,
     /// 音频是否已启用
     pub audio_enabled: bool,
+    /// 音量百分比（0-100）
+    pub volume: u16,
 }
 
 /// `session.updated` 事件的载荷。

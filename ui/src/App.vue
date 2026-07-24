@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import QRCode from "qrcode";
 
 interface DeviceInfo {
+  uuid: string;
   serial: string;
   state: string;
   name: string;
@@ -15,11 +16,11 @@ interface PairingInfo {
   psk: string;
   wifi_string: string;
 }
-
 interface DeviceConfig {
   clipboardSync: boolean;
   notificationSync: boolean;
   audioSync: boolean;
+  volume: number;
 }
 const connected = ref(false);
 const devices = ref<DeviceInfo[]>([]);
@@ -27,60 +28,79 @@ const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
 const qrCanvas = ref<HTMLCanvasElement | null>(null);
 const deviceConfigs = ref<Record<string, DeviceConfig>>({});
-
-function getDeviceConfig(serial: string): DeviceConfig {
-  if (!deviceConfigs.value[serial]) {
-    deviceConfigs.value[serial] = {
+function getDeviceConfig(uuid: string): DeviceConfig {
+  if (!deviceConfigs.value[uuid]) {
+    deviceConfigs.value[uuid] = {
       clipboardSync: true,
       notificationSync: true,
       audioSync: false,
+      volume: 80,
     };
   }
-  return deviceConfigs.value[serial];
+  return deviceConfigs.value[uuid];
 }
 
-async function toggleClipboardSync(serial: string) {
-  const cfg = getDeviceConfig(serial);
+async function toggleClipboardSync(uuid: string) {
+  const cfg = getDeviceConfig(uuid);
   cfg.clipboardSync = !cfg.clipboardSync;
   try {
     await invoke("update_session_config", {
-      serial,
+      uuid,
       clipboardSync: cfg.clipboardSync,
       notificationSync: cfg.notificationSync,
       audioSync: cfg.audioSync,
+      volume: cfg.volume,
     });
   } catch (e) {
     console.error("toggleClipboardSync failed:", e);
   }
 }
 
-async function toggleNotificationSync(serial: string) {
-  const cfg = getDeviceConfig(serial);
+async function toggleNotificationSync(uuid: string) {
+  const cfg = getDeviceConfig(uuid);
   cfg.notificationSync = !cfg.notificationSync;
   try {
     await invoke("update_session_config", {
-      serial,
+      uuid,
       clipboardSync: cfg.clipboardSync,
       notificationSync: cfg.notificationSync,
       audioSync: cfg.audioSync,
+      volume: cfg.volume,
     });
   } catch (e) {
     console.error("toggleNotificationSync failed:", e);
   }
 }
 
-async function toggleAudioSync(serial: string) {
-  const cfg = getDeviceConfig(serial);
+async function toggleAudioSync(uuid: string) {
+  const cfg = getDeviceConfig(uuid);
   cfg.audioSync = !cfg.audioSync;
   try {
     await invoke("update_session_config", {
-      serial,
+      uuid,
       clipboardSync: cfg.clipboardSync,
       notificationSync: cfg.notificationSync,
       audioSync: cfg.audioSync,
+      volume: cfg.volume,
     });
   } catch (e) {
     console.error("toggleAudioSync failed:", e);
+  }
+}
+
+async function setVolume(uuid: string, volume: number) {
+  const cfg = getDeviceConfig(uuid);
+  cfg.volume = Math.max(0, Math.min(100, Math.round(volume)));
+  try {
+    await invoke("update_session_config", {
+      uuid,
+      clipboardSync: cfg.clipboardSync,
+      notificationSync: cfg.notificationSync,
+      audioSync: cfg.audioSync,
+      volume: cfg.volume,
+    });
+  } catch (e) {
+    console.error("setVolume failed:", e);
   }
 }
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
@@ -133,6 +153,16 @@ onMounted(async () => {
   listen<PairingInfo>("pairing-info-updated", (e) => {
     renderQR(e.payload);
   });
+  listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; volume: number }> }>("sessions-updated", (e) => {
+    for (const s of e.payload.sessions) {
+      deviceConfigs.value[s.uuid] = {
+        clipboardSync: s.clipboard_sync,
+        notificationSync: s.notification_sync,
+        audioSync: s.audio_enabled,
+        volume: s.volume,
+      };
+    }
+  });
 
   // load existing state
   refresh();
@@ -167,7 +197,6 @@ onMounted(async () => {
           </div>
         </div>
       </div>
-
       <!-- device list -->
       <div class="section">在线设备</div>
       <div class="device-list">
@@ -175,7 +204,7 @@ onMounted(async () => {
         <div v-else-if="devices.length === 0" class="hint">暂无在线设备</div>
         <div
           v-for="d in devices"
-          :key="d.serial"
+          :key="d.uuid"
           class="device-card"
         >
           <div class="device-header">
@@ -190,24 +219,34 @@ onMounted(async () => {
               <span class="toggle-label">剪贴板</span>
               <span
                 class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.serial).clipboardSync }"
-                @click="toggleClipboardSync(d.serial)"
+                :class="{ active: getDeviceConfig(d.uuid).clipboardSync }"
+                @click="toggleClipboardSync(d.uuid)"
               />
             </label>
             <label class="toggle-row" title="通知同步">
               <span class="toggle-label">通知</span>
               <span
                 class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.serial).notificationSync }"
-                @click="toggleNotificationSync(d.serial)"
+                :class="{ active: getDeviceConfig(d.uuid).notificationSync }"
+                @click="toggleNotificationSync(d.uuid)"
               />
             </label>
             <label class="toggle-row" title="音频同步">
               <span class="toggle-label">音频</span>
               <span
                 class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.serial).audioSync }"
-                @click="toggleAudioSync(d.serial)"
+                :class="{ active: getDeviceConfig(d.uuid).audioSync }"
+                @click="toggleAudioSync(d.uuid)"
+              />
+            </label>
+            <label class="toggle-row" title="音量">
+              <span class="toggle-label">音量 {{ getDeviceConfig(d.uuid).volume }}%</span>
+              <input
+                type="range"
+                min="0" max="100"
+                class="volume-slider"
+                :value="getDeviceConfig(d.uuid).volume"
+                @input="setVolume(d.uuid, ($event.target as HTMLInputElement).valueAsNumber)"
               />
             </label>
           </div>
@@ -324,6 +363,34 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
 }
 .state {
   font-size: 12px; padding: 3px 10px; border-radius: 20px; font-weight: 500;
+}
+
+.volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 4px;
+  border-radius: 2px;
+  background: #444;
+  outline: none;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  cursor: pointer;
+}
+.volume-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  cursor: pointer;
 }
 .state.Device { background: #1b5e20; color: #a5d6a7; }
 .state.Offline { background: #b71c1c; color: #ef9a9a; }

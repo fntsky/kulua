@@ -126,6 +126,11 @@ impl AudioPlayer {
         self.player.clear();
     }
 
+    /// 设置播放音量（0.0–1.0）。
+    pub fn set_volume(&self, vol: f32) {
+        self.player.set_volume(vol.clamp(0.0, 1.0));
+    }
+
     /// 队列是否为空。
     pub fn empty(&self) -> bool {
         self.player.empty()
