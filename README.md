@@ -17,6 +17,7 @@
 │                           ┌────────┴────────┐        │
 │                           │  adb / scrcpy    │        │
 │                           │  clipboard sync   │        │
+│                           │  notification sync│        │
 │                           │  device mgmt      │        │
 │                           └────────┬────────┘        │
 │                                    │                  │
@@ -34,10 +35,12 @@
 ## Features
 
 - **无线配对** — mDNS 发现设备 + QR 码配对，无需 USB 线
-- **剪贴板同步** — 手机→PC 实时同步（PC→手机 即将支持）
-- **设备管理** — 列出已连接设备、查看状态、管理连接
-- **通知转发** — 手机通知实时推送到桌面（WIP）
+- **剪贴板同步** — 手机↔PC 双向实时同步（含防回环）
+- **设备管理** — 按 UUID 索引设备，自动合并多地址（USB / mDNS / IP）设备身份
+- **通知转发** — 手机通知实时推送到桌面
+- **Session 配置** — 每设备独立开关（剪贴板同步 / 通知同步 / 音频开关）
 - **跨平台 GUI** — Tauri v2 + Vue 3 原生桌面界面
+- **音频转发** — 预留 scrcpy 音频协议支持（实验性）
 
 ## Architecture
 
@@ -54,14 +57,41 @@ Core (device mgmt + session orchestration)
 
 | Module | Responsibility |
 |--------|---------------|
-| `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`） |
-| `app` / `Core` | 设备发现、连接、会话调度 |
-| `session` | 单设备生命周期管理 |
+| `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`, `getprop`） |
+| `app` / `Core` | 设备发现、身份合并、连接调度、Session 编排 |
+| `session` | 单设备声明周期管理（scrcpy 部署、剪贴板 I/O、通知轮询、音频） |
 | `scrcpy` | scrcpy-server 部署/启停 + 剪贴板协议解析 |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
 | `ipc` | TCP JSON-RPC 服务（GUI 通信） |
 | `cli` | 终端交互界面 |
-| `types` | 共享类型定义（`Device`, `AdbError`, `DeviceState`） |
+| `types` | 共享类型定义（`Device`, `DeviceEntry`, `PendingEntry`） |
+| `device_refresh` | 后台 adb track-devices 长连接，推送设备状态变更 |
+| `audio_player` | 音频解码与播放（集成 rodio + Opus） |
+| `notification` | 桌面通知展示 |
+
+### Core Data Model
+
+```
+DeviceEntry { device, session?, config }
+    │
+    ├─ Device { uuid, id, serial, state, name, identity }
+    │     uuid  : 不可变主键（生成时分配）
+    │     id    : adb getprop ro.serialno（硬件序列号）
+    │     serial: 当前最佳连接地址
+    │     identity: 三层地址集（USB / mDNS / IP）
+    │
+    ├─ session::Handle (Option)
+    │     └─ 每个 Device 至多一个 session
+    │
+    └─ SessionConfig { clipboard_sync, notification_sync, audio_enabled }
+```
+
+设备发现与合并流程：
+
+1. mDNS 发现 → 加入 `pending_serials` 环（round-robin，失败 5 次自动丢弃）
+2. Tick 循环 → `adb connect` → 设备出现在 `adb track-devices`
+3. `insert_device()` → `adb shell getprop ro.serialno` → 匹配或创建 `DeviceEntry`
+4. 同一硬件设备的不同地址（USB / mDNS / IP）自动合并到同一个 UUID 条目
 
 ### IPC Protocol
 
@@ -75,8 +105,28 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 ```
 
 - 单客户端独占模式
-- 支持 Request/Response/Event/Audio 四种帧类型
+- 支持 Request / Response / Event / Audio 四种帧类型
 - 端口号写入 `%TEMP%/sync-daemon.port`
+
+#### RPC 方法
+
+| Method | Direction | Description |
+|--------|-----------|-------------|
+| `device.list` | Request | 获取设备列表（含 uuid / serial / state / name） |
+| `device.connect` | Request | 发起 adb connect |
+| `device.disconnect` | Request | 断开设备连接 |
+| `session.update` | Request | 更新 session 配置（按 uuid 标识设备） |
+| `clipboard.get` | Request | 读取 PC 端剪贴板 |
+| `pairing.info` | Request | 获取配对二维码信息 |
+
+#### 推送事件
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `device.updated` | `Vec<Device>` | 设备列表变更 |
+| `session.updated` | `SessionListData` | Session 状态/配置变更（含 uuid / clipboard_sync / notification_sync / audio_enabled） |
+| `clipboard.changed` | `ClipboardData` | 剪贴板变更 |
+| `notification` | `NotifData` | 手机通知推送 |
 
 详见 [IPC-DESIGN.md](./IPC-DESIGN.md)。
 
@@ -121,14 +171,17 @@ sync-workspace/
 │   └── src/main.rs
 ├── sync-core/           # 核心库 (Rust)
 │   └── src/
-│       ├── app.rs       # 设备管理主循环
-│       ├── session.rs   # 会话生命周期
+│       ├── app.rs       # 设备管理主循环 + insert_device
+│       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
 │       ├── scrcpy.rs    # scrcpy-server 交互
 │       ├── adb_cmd.rs   # ADB CLI 封装
 │       ├── ipc/         # TCP JSON-RPC 服务
-│       └── wireless_pair.rs
+│       ├── wireless_pair.rs
+│       ├── device_refresh.rs
+│       ├── audio_player.rs
+│       └── notification.rs
 ├── ui/                  # 桌面 GUI (Tauri v2 + Vue 3)
-│   ├── src/             # Vue 3 前端
+│   ├── src/             # Vue 3 前端（App.vue）
 │   └── src-tauri/       # Tauri Rust 后端
 ├── build.sh             # 构建脚本 (Linux/macOS)
 ├── build.ps1            # 构建脚本 (Windows)
@@ -148,12 +201,14 @@ sync-workspace/
 - ✅ QR 码配对
 - ✅ 自动配对 + 连接已发现的设备
 - ✅ Push scrcpy-server 到手机并启动
-- ✅ 剪贴板监听（手机→PC）
+- ✅ 剪贴板监听（手机↔PC 双向）
+- ✅ 通知转发与桌面展示
 - ✅ TCP IPC 服务（daemon ↔ GUI）
-- ✅ Tauri v2 GUI（设备列表、连接管理）
-- ✅ 剪贴板写入（PC→手机）
-- ✅ 系统剪贴板自动同步
-- ❌ 音频转发（预留协议）
+- ✅ Tauri v2 GUI（设备列表、连接管理、配置开关）
+- ✅ UUID 主键设备索引（多地址自动合并）
+- ✅ Session 配置（每设备独立开关，IPC 实时同步 UI）
+- ✅ pending_serials 环（自动重试，失败 5 次丢弃）
+- ⏳ 音频转发（实验性，支持 Opus 解码 + rodio 播放）
 
 ## License
 Apache 2.0
