@@ -12,16 +12,7 @@ const MAX_PAYLOAD: usize = 64 * 1024;
 
 /// 通过 `adb track-devices` 长连接监听设备状态变化，通过 watch channel 推送。
 pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: CancellationToken) {
-    #[cfg(windows)]
-    let adb_candidate = "./adb.exe";
-    #[cfg(not(windows))]
-    let adb_candidate = "./adb";
-
-    let adb_path = if std::path::Path::new(adb_candidate).exists() {
-        std::path::PathBuf::from(adb_candidate)
-    } else {
-        std::path::PathBuf::from("adb")
-    };
+    let adb_path = crate::adb_cmd::resolve_adb();
 
     tokio::spawn(async move {
         use tokio::process::Command;

@@ -213,21 +213,24 @@ impl AdbOps for AdbCmd {
     }
 }
 
+/// 解析 adb 路径：当前目录优先，PATH 兜底。
+pub fn resolve_adb() -> PathBuf {
+    #[cfg(windows)]
+    let local = "./adb.exe";
+    #[cfg(not(windows))]
+    let local = "./adb";
+
+    if std::path::Path::new(local).exists() {
+        PathBuf::from(local)
+    } else {
+        PathBuf::from("adb")
+    }
+}
+
 impl AdbCmd {
     pub fn new() -> Self {
-        #[cfg(windows)]
-        let local = "./adb.exe";
-        #[cfg(not(windows))]
-        let local = "./adb";
-
-        if std::path::Path::new(local).exists() {
-            return Self {
-                adb_path: PathBuf::from(local),
-            };
-        }
-        // 兜底：使用 PATH 中的 adb；若也不存在，run() 会给出友好提示
         Self {
-            adb_path: PathBuf::from("adb"),
+            adb_path: resolve_adb(),
         }
     }
 
