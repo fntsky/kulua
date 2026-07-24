@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Release
 )
 
@@ -18,7 +18,7 @@ Write-Host "`n[2/2] Building UI (exe, no installer)..." -ForegroundColor Yellow
 Push-Location ui
 npm install --silent
 if ($Release) {
-    npm run tauri build
+    powershell -Command "Remove-Item env:CI -ErrorAction Ignore; npm run tauri build"
 } else {
     # CI 环境变量会干扰 tauri CLI，在子进程中清除
     powershell -Command "Remove-Item env:CI -ErrorAction Ignore; npm run tauri -- build --debug --no-bundle"
@@ -59,7 +59,7 @@ if ($Release) {
         }
     }
     if (-not $jarFound) {
-        Write-Host "  WARNING: scrcpy-server not found — place it manually in $dist/" -ForegroundColor Yellow
+        Write-Host "  WARNING: scrcpy-server not found -- place it manually in $dist/" -ForegroundColor Yellow
     }
 
     # ── adb.exe + 依赖 DLL ──
@@ -97,7 +97,7 @@ if ($Release) {
         }
     }
     if (-not $adbFound) {
-        Write-Host "  WARNING: adb.exe not found — place it manually in $dist/ so daemon can find it" -ForegroundColor Red
+        Write-Host "  WARNING: adb.exe not found -- place it manually in $dist/ so daemon can find it" -ForegroundColor Red
     }
 
     # ── 验证 ──
