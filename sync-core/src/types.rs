@@ -1,15 +1,103 @@
 use serde::{Deserialize, Serialize};
 
+/// 来自 `adb get-serialno` 的规范设备 ID（主键）
+pub type DeviceId = String;
+
+/// 设备地址形式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAddrKind {
+    Usb,
+    Mdns,
+    Ip,
+}
+
+impl DeviceAddrKind {
+    /// 根据地址字符串猜测其形式
+    pub fn classify(addr: &str) -> Self {
+        // USB serial: 纯字母数字，无冒号（如 "10AE6X05XP001TD"）
+        // IP:port: 包含冒号和点（如 "192.168.1.100:5555"）
+        // mDNS:port: 包含 ".local:" 或 "._tcp"
+        if addr.contains(".local:") || addr.contains("._tcp") {
+            DeviceAddrKind::Mdns
+        } else if addr.contains(':') {
+            DeviceAddrKind::Ip
+        } else {
+            DeviceAddrKind::Usb
+        }
+    }
+
+    /// 优先级权重，越大越优先
+    pub fn priority(self) -> u8 {
+        match self {
+            DeviceAddrKind::Usb => 3,
+            DeviceAddrKind::Mdns => 2,
+            DeviceAddrKind::Ip => 1,
+        }
+    }
+}
+
+/// 设备三种身份形式，用于去重和选择最佳连接地址
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    pub usb: Option<String>,
+    pub mdns: Option<String>,
+    pub ip: Option<String>,
+}
+
+impl DeviceIdentity {
+    /// 获取优先级最高的已有地址
+    pub fn best_serial(&self) -> Option<&str> {
+        self.usb
+            .as_deref()
+            .or_else(|| self.mdns.as_deref())
+            .or_else(|| self.ip.as_deref())
+    }
+
+    /// 合并另一个 identity（较高优先级的地址覆盖较低优先级的）
+    pub fn merge(&mut self, other: &DeviceIdentity) {
+        if other.usb.is_some() {
+            self.usb = other.usb.clone();
+        }
+        if other.mdns.is_some() {
+            self.mdns = other.mdns.clone();
+        }
+        if other.ip.is_some() {
+            self.ip = other.ip.clone();
+        }
+    }
+
+    /// 根据 address 和已知的 form 填入对应字段
+    pub fn set_by_kind(&mut self, addr: String, kind: DeviceAddrKind) {
+        match kind {
+            DeviceAddrKind::Usb => self.usb = Some(addr),
+            DeviceAddrKind::Mdns => self.mdns = Some(addr),
+            DeviceAddrKind::Ip => self.ip = Some(addr),
+        }
+    }
+
+    /// 检查是否包含某地址（任意形式）
+    pub fn contains_addr(&self, addr: &str) -> bool {
+        self.usb.as_deref() == Some(addr)
+            || self.mdns.as_deref() == Some(addr)
+            || self.ip.as_deref() == Some(addr)
+    }
+}
+
 /// 设备信息
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
-    /// 设备序列号 / IP 地址
+    /// 规范设备 ID（来自 `adb get-serialno`，主键）
+    pub id: DeviceId,
+    /// 当前用于 adb 命令的最佳地址（最优先的已确认形式）
     pub serial: String,
     /// 连接状态
     pub state: DeviceState,
     /// 设备名称（从 scrcpy 协议获取，空表示未知）
     #[serde(default)]
     pub name: String,
+    /// 所有已知身份的地址形式
+    #[serde(default)]
+    pub identity: DeviceIdentity,
 }
 
 /// 设备状态

@@ -19,8 +19,8 @@ interface PairingInfo {
 interface DeviceConfig {
   clipboardSync: boolean;
   notificationSync: boolean;
+  audioSync: boolean;
 }
-
 const connected = ref(false);
 const devices = ref<DeviceInfo[]>([]);
 const error = ref("");
@@ -30,7 +30,11 @@ const deviceConfigs = ref<Record<string, DeviceConfig>>({});
 
 function getDeviceConfig(serial: string): DeviceConfig {
   if (!deviceConfigs.value[serial]) {
-    deviceConfigs.value[serial] = { clipboardSync: true, notificationSync: true };
+    deviceConfigs.value[serial] = {
+      clipboardSync: true,
+      notificationSync: true,
+      audioSync: false,
+    };
   }
   return deviceConfigs.value[serial];
 }
@@ -43,6 +47,7 @@ async function toggleClipboardSync(serial: string) {
       serial,
       clipboardSync: cfg.clipboardSync,
       notificationSync: cfg.notificationSync,
+      audioSync: cfg.audioSync,
     });
   } catch (e) {
     console.error("toggleClipboardSync failed:", e);
@@ -57,9 +62,25 @@ async function toggleNotificationSync(serial: string) {
       serial,
       clipboardSync: cfg.clipboardSync,
       notificationSync: cfg.notificationSync,
+      audioSync: cfg.audioSync,
     });
   } catch (e) {
     console.error("toggleNotificationSync failed:", e);
+  }
+}
+
+async function toggleAudioSync(serial: string) {
+  const cfg = getDeviceConfig(serial);
+  cfg.audioSync = !cfg.audioSync;
+  try {
+    await invoke("update_session_config", {
+      serial,
+      clipboardSync: cfg.clipboardSync,
+      notificationSync: cfg.notificationSync,
+      audioSync: cfg.audioSync,
+    });
+  } catch (e) {
+    console.error("toggleAudioSync failed:", e);
   }
 }
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
@@ -179,6 +200,14 @@ onMounted(async () => {
                 class="toggle-switch"
                 :class="{ active: getDeviceConfig(d.serial).notificationSync }"
                 @click="toggleNotificationSync(d.serial)"
+              />
+            </label>
+            <label class="toggle-row" title="音频同步">
+              <span class="toggle-label">音频</span>
+              <span
+                class="toggle-switch"
+                :class="{ active: getDeviceConfig(d.serial).audioSync }"
+                @click="toggleAudioSync(d.serial)"
               />
             </label>
           </div>

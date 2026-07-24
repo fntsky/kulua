@@ -1,11 +1,11 @@
 use crate::adb_cmd::{AdbCmd, AdbOps};
 use crate::notification::{self, NotifInfo};
 use crate::session;
-use crate::types::Device;
+use crate::types::{Device, DeviceAddrKind, DeviceId, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -56,6 +56,8 @@ pub struct Core {
     pending_serials: HashMap<String, Instant>,
     /// 上次对每个 pending 设备发起 adb connect 的时间（用于 5s 重试间隔）
     last_connect_attempt: HashMap<String, Instant>,
+    /// 按规范 DeviceId 去重的设备映射（权威数据源）
+    devices_by_id: HashMap<DeviceId, Device>,
     port_counter: u16,
     token: CancellationToken,
     /// 用于从 session 接收设备名称并更新 device_watch
@@ -132,6 +134,7 @@ impl Core {
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             last_connect_attempt: HashMap::new(),
+            devices_by_id: HashMap::new(),
             port_counter: 27183,
             token,
             device_name_rx,
@@ -147,12 +150,13 @@ impl Core {
         self.token.clone()
     }
 
-
     // ─── 主循环 ──────────────────────────────────────────
 
     pub async fn run(&mut self) {
         // 取出内部命令通道（仅能调用一次）
-        let mut cmd_rx = self.cmd_rx.take()
+        let mut cmd_rx = self
+            .cmd_rx
+            .take()
             .expect("Core::run can only be called once");
 
         // 启动 IPC 服务器后台 accept 循环
@@ -182,6 +186,11 @@ impl Core {
                 Some(n)    = self.notif_rx.recv()       => self.on_notification(n),
                 Some(cmd)  = cmd_rx.recv()              => self.on_command(cmd).await,
                 Some((serial, name)) = self.device_name_rx.recv() => {
+                    // 更新 devices_by_id
+                    if let Some(device) = self.devices_by_id.get_mut(&serial) {
+                        device.name = name.clone();
+                    }
+                    // 也更新 device_tx 用于 IPC
                     self.device_tx.send_modify(|devices| {
                         if let Some(device) = devices.get_mut(&serial) {
                             device.name = name;
@@ -190,9 +199,39 @@ impl Core {
                 }
                 _ = tick.tick() => {
                     self.poll_system_clipboard();
-                    let devices = self.device_watch.borrow_and_update().clone();
-                    self.try_connect_pending(&devices);
-                    self.sync_sessions(devices).await;
+                    let from_track = self.device_watch.borrow_and_update().clone();
+                    // 将 device_refresh 上报的设备合并到 devices_by_id
+                    for (serial, dev) in &from_track {
+                        let in_by_id = self.devices_by_id.values().any(|d| d.identity.contains_addr(serial));
+                        if !in_by_id {
+                            // 新设备（如 USB 直连），以 serial 作为 id 的初始值
+                            let kind = DeviceAddrKind::classify(serial);
+                            let mut identity = DeviceIdentity::default();
+                            identity.set_by_kind(serial.clone(), kind);
+                            let device_id = serial.clone();
+                            self.devices_by_id.entry(device_id.clone()).or_insert(Device {
+                                id: device_id,
+                                serial: serial.clone(),
+                                state: dev.state.clone(),
+                                name: String::new(),
+                                identity,
+                            });
+                        }
+                    }
+                    self.try_connect_pending(&from_track);
+                    // 用 devices_by_id 的值同步到 device_tx
+                    let watch_devices: HashMap<String, Device> = self.devices_by_id
+                        .values()
+                        .map(|d| (d.serial.clone(), d.clone()))
+                        .collect();
+                    // 注意：这个不会产生无限循环，因为 device_tx 的改变不会回传到 device_watch (watch 是广播)
+                    let _ = self.device_tx.send(watch_devices);
+                    // sync_sessions 使用 devices_by_id 的值
+                    let current_devices: HashMap<String, Device> = self.devices_by_id
+                        .values()
+                        .map(|d| (d.serial.clone(), d.clone()))
+                        .collect();
+                    self.sync_sessions(current_devices).await;
                 }
             }
         }
@@ -214,7 +253,8 @@ impl Core {
             }
             wireless_pair::MdnsEvent::ConnectDiscovered { host, port } => {
                 println!("[CONNECT] Discovered device at {}:{}", host, port);
-                self.pending_serials.insert(format!("{}:{}", host, port), Instant::now());
+                self.pending_serials
+                    .insert(format!("{}:{}", host, port), Instant::now());
             }
             wireless_pair::MdnsEvent::Error(e) => {
                 eprintln!("mDNS error: {}", e);
@@ -250,17 +290,29 @@ impl Core {
                 self.pending_serials.remove(&serial);
                 self.session_configs.remove(&serial);
             }
-            Command::UpdateConfig { serial, clipboard_sync, notification_sync, audio_sync } => {
+            Command::UpdateConfig {
+                serial,
+                clipboard_sync,
+                notification_sync,
+                audio_sync,
+            } => {
                 // 先写配置记录，确保 start_session（音频重启时）读到最新值
-                self.session_configs.insert(serial.clone(), session::SessionConfig {
-                    clipboard_sync,
-                    notification_sync,
-                    audio_enabled: audio_sync,
-                });
+                self.session_configs.insert(
+                    serial.clone(),
+                    session::SessionConfig {
+                        clipboard_sync,
+                        notification_sync,
+                        audio_enabled: audio_sync,
+                    },
+                );
                 // 剪贴板和通知可直接切换原子标志
                 if let Some(handle) = self.sessions.get(&serial) {
-                    handle.clipboard_enabled.store(clipboard_sync, Ordering::SeqCst);
-                    handle.notification_enabled.store(notification_sync, Ordering::SeqCst);
+                    handle
+                        .clipboard_enabled
+                        .store(clipboard_sync, Ordering::SeqCst);
+                    handle
+                        .notification_enabled
+                        .store(notification_sync, Ordering::SeqCst);
                     let prev_audio = handle.audio_enabled.load(Ordering::SeqCst);
                     if prev_audio != audio_sync {
                         // 音频切换需要重启 scrcpy → 重启 session
@@ -268,7 +320,11 @@ impl Core {
                         let device_opt = self.device_watch.borrow().get(&serial).cloned();
                         if let Some(mut handle) = self.sessions.remove(&serial) {
                             handle.stop(self.adb_cmd.as_ref()).await;
-                            println!("Audio {} for {}, restarting session", if audio_sync { "enabled" } else { "disabled" }, serial);
+                            println!(
+                                "Audio {} for {}, restarting session",
+                                if audio_sync { "enabled" } else { "disabled" },
+                                serial
+                            );
                             if let Some(device) = device_opt {
                                 self.start_session(device).await;
                             }
@@ -311,9 +367,11 @@ impl Core {
 
     /// 对 pending 队列中的设备发起 adb connect。
     ///
+    /// 对 pending 队列中的设备发起 adb connect，连接后获取 serialno 去重。
+    ///
     /// - 设备已在 `devices` 中（刷新线程确认已连接）→ 从 pending 移除
     /// - 5 秒内已尝试过 → 跳过（避免高频重试）
-    /// - 否则发起 adb connect（无论成功失败，等刷新线程确认）
+    /// - 否则发起 adb connect → 成功后 `adb get-serialno` → 按 DeviceId 去重合并
     /// - pending 超过 30 秒未连接成功 → 自动丢弃
     fn try_connect_pending(&mut self, devices: &HashMap<String, Device>) {
         let now = Instant::now();
@@ -331,28 +389,76 @@ impl Core {
         }
 
         let serials: Vec<String> = self.pending_serials.keys().cloned().collect();
-        for serial in &serials {
-            if devices.contains_key(serial) {
+        for addr in &serials {
+            if devices.contains_key(addr) {
                 // 刷新线程已确认设备在线，从 pending 移除
-                self.pending_serials.remove(serial);
-                self.last_connect_attempt.remove(serial);
+                self.pending_serials.remove(addr);
+                self.last_connect_attempt.remove(addr);
                 continue;
             }
             // 5 秒内已试过，跳过
-            if let Some(last) = self.last_connect_attempt.get(serial) {
+            if let Some(last) = self.last_connect_attempt.get(addr) {
                 if now.duration_since(*last) < Duration::from_secs(5) {
                     continue;
                 }
             }
-            match self.adb_cmd.connect(serial) {
+            match self.adb_cmd.connect(addr) {
                 Ok(()) => {
-                    println!("  connect {}: connected", serial);
-                    self.pending_serials.remove(serial);
-                    self.last_connect_attempt.remove(serial);
+                    println!("  connect {}: connected", addr);
+                    self.pending_serials.remove(addr);
+                    self.last_connect_attempt.remove(addr);
+
+                    // 连接成功后获取规范 serialno 用于去重
+                    match self.adb_cmd.get_serialno(addr) {
+                        Ok(device_id) => {
+                            let kind = DeviceAddrKind::classify(addr);
+                            let mut identity = DeviceIdentity::default();
+                            identity.set_by_kind(addr.clone(), kind);
+
+                            if let Some(existing) = self.devices_by_id.get_mut(&device_id) {
+                                // 已存在：合并 identity，保留更优先的 serial
+                                existing.identity.merge(&identity);
+                                // 更新 state
+                                existing.state = DeviceState::Device;
+                                // 如果新地址优先级更高，更新 serial
+                                if kind.priority() > DeviceAddrKind::classify(&existing.serial).priority() {
+                                    existing.serial = addr.clone();
+                                }
+                            } else {
+                                // 新设备：用 serialno 作为 id，addr 作为 serial
+                                self.devices_by_id.insert(device_id.clone(), Device {
+                                    id: device_id,
+                                    serial: addr.clone(),
+                                    state: DeviceState::Device,
+                                    name: String::new(),
+                                    identity,
+                                });
+                            }
+                            self.sync_device_watch();
+                        }
+                        Err(e) => {
+                            eprintln!("  get-serialno for {} failed: {}", addr, e);
+                            // 即使 get-serialno 失败也保留设备（用 addr 作为 id）
+                            let kind = DeviceAddrKind::classify(addr);
+                            let mut identity = DeviceIdentity::default();
+                            identity.set_by_kind(addr.clone(), kind);
+                            let device_id = addr.clone();
+                            if !self.devices_by_id.contains_key(&device_id) {
+                                self.devices_by_id.insert(device_id, Device {
+                                    id: addr.clone(),
+                                    serial: addr.clone(),
+                                    state: DeviceState::Device,
+                                    name: String::new(),
+                                    identity,
+                                });
+                                self.sync_device_watch();
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("  connect {} failed: {}", serial, e);
-                    self.last_connect_attempt.insert(serial.clone(), now);
+                    eprintln!("  connect {} failed: {}", addr, e);
+                    self.last_connect_attempt.insert(addr.clone(), now);
                 }
             }
         }
@@ -389,7 +495,11 @@ impl Core {
         let jar_path = self.jar_path.clone();
 
         // 从配置记录中读取开关状态，不存在时使用默认值
-        let cfg = self.session_configs.get(&device.serial).copied().unwrap_or_default();
+        let cfg = self
+            .session_configs
+            .get(&device.serial)
+            .copied()
+            .unwrap_or_default();
 
         // 共享原子标志，Core 后续可随时切换（音频除外，需要重启 session）
         let clipboard_enabled = Arc::new(AtomicBool::new(cfg.clipboard_sync));
@@ -429,9 +539,24 @@ impl Core {
 
     async fn stop_all(&mut self) {
         self.token.cancel();
+        println!("Stopping all sessions...");
+        //输出Session列表
+        for (serial, handle) in &self.sessions {
+            println!("Stopping session for {} on port {}", serial, handle.port);
+        }
         for (_, mut handle) in self.sessions.drain() {
             handle.stop(self.adb_cmd.as_ref()).await;
         }
+    }
+
+    /// 将 devices_by_id 同步到 device_tx（IPC 使用的 watch channel）
+    fn sync_device_watch(&self) {
+        let watch_devices: HashMap<String, Device> = self
+            .devices_by_id
+            .values()
+            .map(|d| (d.serial.clone(), d.clone()))
+            .collect();
+        let _ = self.device_tx.send(watch_devices);
     }
 }
 
@@ -450,24 +575,32 @@ mod tests {
     fn test_device_filter() {
         let raw = vec![
             Device {
+                id: "ok".into(),
                 serial: "ok".into(),
                 state: DeviceState::Device,
                 name: String::new(),
+                identity: DeviceIdentity::default(),
             },
             Device {
+                id: "off".into(),
                 serial: "off".into(),
                 state: DeviceState::Offline,
                 name: String::new(),
+                identity: DeviceIdentity::default(),
             },
             Device {
+                id: "unauth".into(),
                 serial: "unauth".into(),
                 state: DeviceState::Unauthorized,
                 name: String::new(),
+                identity: DeviceIdentity::default(),
             },
             Device {
+                id: "ok2".into(),
                 serial: "ok2".into(),
                 state: DeviceState::Device,
                 name: String::new(),
+                identity: DeviceIdentity::default(),
             },
         ];
         let mut map = HashMap::new();
@@ -510,6 +643,7 @@ mod tests {
             session_configs: HashMap::new(),
             pending_serials: HashMap::from([("192.168.1.100:5555".into(), Instant::now())]),
             last_connect_attempt: HashMap::new(),
+            devices_by_id: HashMap::new(),
             port_counter: 27183,
             token: CancellationToken::new(),
             device_name_rx: mpsc::channel::<(String, String)>(32).1,
@@ -520,13 +654,14 @@ mod tests {
             last_clipboard_error_print: Instant::now(),
         };
 
-        // devices map 已有该设备，try_connect_pending 应将其从 pending 移除
         let devices = HashMap::from([(
             "192.168.1.100:5555".into(),
             Device {
+                id: "192.168.1.100:5555".into(),
                 serial: "192.168.1.100:5555".into(),
                 state: DeviceState::Device,
                 name: String::new(),
+                identity: DeviceIdentity::default(),
             },
         )]);
 

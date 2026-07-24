@@ -309,11 +309,12 @@ async fn dispatch_request(
             }))
         }
 
-        // 更新 session 配置（通知同步 / 剪贴板同步开关）
+        // 更新 session 配置（通知同步 / 剪贴板同步 / 音频开关）
         "session.update" => {
             let serial = req.params.get("serial").and_then(|v| v.as_str()).unwrap_or("");
             let clipboard_sync = req.params.get("clipboard_sync").and_then(|v| v.as_bool()).unwrap_or(true);
             let notification_sync = req.params.get("notification_sync").and_then(|v| v.as_bool()).unwrap_or(true);
+            let audio_sync = req.params.get("audio_sync").and_then(|v| v.as_bool()).unwrap_or(false);
             if serial.is_empty() {
                 return make_error(req.id, -1, "缺少 serial 参数");
             }
@@ -321,6 +322,7 @@ async fn dispatch_request(
                 serial: serial.to_string(),
                 clipboard_sync,
                 notification_sync,
+                audio_sync,
             }).await.is_err() {
                 return make_error(req.id, -1, "core 正在关闭");
             }

@@ -16,18 +16,23 @@ pub fn parse_devices(stdout: &[u8]) -> Result<Vec<Device>, AdbError> {
             }
 
             let mut parts = line.split_whitespace();
-            let serial = parts.next()?.to_string();
-            println!("Serial: {}", serial); // Debug print to check the serial number
+            let raw_serial = parts.next()?.to_string();
             let state = match parts.next().unwrap_or("unknown") {
                 "device" => DeviceState::Device,
                 "offline" => DeviceState::Offline,
                 "unauthorized" => DeviceState::Unauthorized,
                 s => DeviceState::Unknown(s.to_string()),
             };
+            let kind = crate::types::DeviceAddrKind::classify(&raw_serial);
+            let mut identity = crate::types::DeviceIdentity::default();
+            identity.set_by_kind(raw_serial.clone(), kind);
+            // 初始 id 和 serial 都设为原始地址；后续通过 get-serialno 更新
             Some(Device {
-                serial,
+                id: raw_serial.clone(),
+                serial: raw_serial,
                 state,
                 name: String::new(),
+                identity,
             })
         })
         .collect();
@@ -41,9 +46,11 @@ mod tests {
     use crate::types::DeviceState;
 
     fn assert_device(d: &Device, expected_serial: &str, expected_state: DeviceState) {
-        assert_eq!(d.serial, expected_serial);
-        assert_eq!(d.state, expected_state);
+        assert_eq!(d.id, expected_serial, "device id mismatch");
+        assert_eq!(d.serial, expected_serial, "device serial mismatch");
+        assert_eq!(d.state, expected_state, "device state mismatch");
     }
+
 
     #[test]
     fn test_parse_devices_normal() {

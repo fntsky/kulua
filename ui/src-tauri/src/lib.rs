@@ -84,24 +84,26 @@ async fn ipc_request(
     rx.await.map_err(|_| "daemon 已断开")?
 }
 
-#[tauri::command]
-async fn update_session_config(
-    state: State<'_, AppState>,
-    serial: String,
-    clipboard_sync: bool,
-    notification_sync: bool,
-) -> Result<(), String> {
-    ipc_request(
-        &state,
-        "session.update",
-        serde_json::json!({
-            "serial": serial,
-            "clipboard_sync": clipboard_sync,
-            "notification_sync": notification_sync,
-        }),
-    ).await?;
-    Ok(())
-}
+    #[tauri::command]
+    async fn update_session_config(
+        state: State<'_, AppState>,
+        serial: String,
+        clipboard_sync: bool,
+        notification_sync: bool,
+        audio_sync: bool,
+    ) -> Result<(), String> {
+        ipc_request(
+            &state,
+            "session.update",
+            serde_json::json!({
+                "serial": serial,
+                "clipboard_sync": clipboard_sync,
+                "notification_sync": notification_sync,
+                "audio_sync": audio_sync,
+            }),
+        ).await?;
+        Ok(())
+    }
 // ── IPC Client ──
 
 async fn connect_daemon(app: AppHandle) {

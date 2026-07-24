@@ -47,25 +47,42 @@ pub struct Handle {
     pub audio_enabled: Arc<AtomicBool>,
 }
 impl Handle {
+    /// 停止 session（模仿官方关闭流程）。
+    ///
+    /// 1. 发停止信号 → session 主循环退出
+    /// 2. session 内部 shutdown socket → server 收到 IO 错误 → 走 Java finally
+    /// 3. 等待 task 退出（1s 看门狗）
+    /// 4. 超时未退 → abort + ADB 强制清理
     pub async fn stop(&mut self, adb: &dyn AdbOps) {
+        // (1) 发停止信号
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
 
-        // 给 session 一点时间自行清理（正常路径会调用 server.stop）
-        if tokio::time::timeout(Duration::from_secs(3), &mut self.task).await.is_err() {
-            // 超时：session 可能卡住，强制 abort + 直接清理远程进程
+        // (2) 等待 session 自行清理（socket shutdown → server 应快速退出）
+        //     官方 1s 看门狗，此处留 2s 给 Windows TCP 栈一点余量
+        if tokio::time::timeout(Duration::from_secs(2), &mut self.task)
+            .await
+            .is_err()
+        {
+            // (3) 超时：task 可能卡住，强制 abort 后直接清理远程进程
             self.task.abort();
+            eprintln!(
+                "session {} stop timeout, force killing remote",
+                self.device.serial
+            );
             let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
             let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
-            let _ = adb.run(&[
-                "-s",
-                &self.device.serial,
-                "forward",
-                "--remove",
-                &format!("tcp:{}", self.port),
-            ]);
         }
+
+        // (4) 清理 ADB 转发
+        let _ = adb.run(&[
+            "-s",
+            &self.device.serial,
+            "forward",
+            "--remove",
+            &format!("tcp:{}", self.port),
+        ]);
     }
 }
 
@@ -131,7 +148,13 @@ impl Session {
         let device = self.device.clone();
         let jar_path = self.jar_path.clone();
         let server = tokio::task::spawn_blocking(move || {
-            scrcpy::ScrcpyServer::deploy_scrcpy(adb.as_ref(), &device, &jar_path, port, audio_enabled)
+            scrcpy::ScrcpyServer::deploy_scrcpy(
+                adb.as_ref(),
+                &device,
+                &jar_path,
+                port,
+                audio_enabled,
+            )
         })
         .await;
 
@@ -161,25 +184,28 @@ impl Session {
 
         // ── 音频启用：双连接架构 ──
 
-        // 2. 第一路连接：audio socket（含 dummy byte + 64B 设备名 + 4B codec header）
-        let audio_stream = self.connect_socket(port, &mut server, &mut stop_rx).await;
+        let audio_stream = self
+            .connect_socket(port, &mut server, &mut stop_rx, true)
+            .await;
         if audio_stream.is_none() {
             return;
         }
         let mut audio_stream = audio_stream.unwrap();
         // 启用 TCP_NODELAY 及时检测断连
         let _ = audio_stream.set_nodelay(true);
-
-        // 读 dummy byte
-        let mut dummy = [0u8; 1];
-        if audio_stream.read_exact(&mut dummy).await.is_err() {
-            eprintln!("failed to read dummy byte from audio socket");
-            server.stop(self.adb.as_ref());
+        // 先连 control socket，让 server 的 open() 能 accept 完所有 socket 后返回
+        let control_stream = self
+            .connect_socket(port, &mut server, &mut stop_rx, false)
+            .await;
+        if control_stream.is_none() {
             return;
         }
+        let control_stream = control_stream.unwrap();
+        // 控制通道禁用 Nagle（官方默认行为）
+        let _ = control_stream.set_nodelay(true);
 
-        // 读设备名称（64 字节，scrcpy 协议设备信息交换）
         let mut name_buf = [0u8; 64];
+        // 读设备名称（64 字节，scrcpy 协议设备信息交换）
         if audio_stream.read_exact(&mut name_buf).await.is_ok() {
             let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
             let device_name = String::from_utf8_lossy(&name_buf[..name_end]).to_string();
@@ -195,7 +221,10 @@ impl Session {
         // 读 codec ID header（4 字节大端序）
         let mut codec_buf = [0u8; 4];
         if audio_stream.read_exact(&mut codec_buf).await.is_err() {
-            eprintln!("failed to read audio codec header from {}", self.device.serial);
+            eprintln!(
+                "failed to read audio codec header from {}",
+                self.device.serial
+            );
             server.stop(self.adb.as_ref());
             return;
         }
@@ -208,18 +237,11 @@ impl Session {
             return;
         } else {
             let codec_name = audio_codec_name(codec_id);
-            println!("Audio codec: {} (0x{:08x}) from {}", codec_name, codec_id, self.device.serial);
+            println!(
+                "Audio codec: {} (0x{:08x}) from {}",
+                codec_name, codec_id, self.device.serial
+            );
         }
-
-        // 3. 第二路连接：control socket（纯控制消息，无 dummy byte）
-        let control_stream = self.connect_socket(port, &mut server, &mut stop_rx).await;
-        if control_stream.is_none() {
-            return;
-        }
-        let control_stream = control_stream.unwrap();
-        // 控制通道禁用 Nagle（官方默认行为）
-        let _ = control_stream.set_nodelay(true);
-
         // 4. 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
         notification::spawn_notification_poller_tokio(
@@ -230,7 +252,7 @@ impl Session {
             self.notification_enabled.clone(),
         );
 
-        let (mut audio_reader, _audio_writer) = tokio::io::split(audio_stream);
+        let (mut audio_reader, audio_writer) = tokio::io::split(audio_stream);
         let (mut control_reader, mut control_writer) = tokio::io::split(control_stream);
 
         // 6. 音频读取任务（独立于控制通道）
@@ -247,12 +269,9 @@ impl Session {
                         break;
                     }
 
-                    let pts_raw = u64::from_be_bytes(
-                        <[u8; 8]>::try_from(&header[..8]).unwrap(),
-                    );
-                    let frame_size = u32::from_be_bytes(
-                        <[u8; 4]>::try_from(&header[8..12]).unwrap(),
-                    ) as usize;
+                    let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
+                    let frame_size =
+                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
 
                     // 检查 session 元数据标记（bit 63）
                     if (pts_raw >> 63) & 1 != 0 {
@@ -279,29 +298,82 @@ impl Session {
         };
 
         // 7. 双向剪贴板 I/O（control channel）
-        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx).await;
+        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx, self.device.serial.clone())
+            .await;
 
-        // 8. 清理
+        // 8. 清理（模仿官方关闭流程）
+        //    run_clipboard_io 返回 → control_reader/writer 已释放 → control socket 关闭
+        //    → server 侧 ControlChannel.recv() 收到 IOException
+
+        // (a) shutdown audio socket → server 侧 Streamer.writePacket() 收到 IO 错误
+        drop(audio_writer);   // 释放我们的 WriteHalf 引用
         if let Some(task) = audio_task {
-            task.abort();
+            task.abort();     // 释放 ReadHalf → Arc 归零 → socket 关闭
         }
+
+        // (b) 停通知轮询
         notif_stop.store(true, Ordering::SeqCst);
-        server.stop(self.adb.as_ref());
+
+        // (c) 1s 看门狗：给 server 时间检测 socket 断开 → 走 Java finally → 进程退出
+        let mut exited = server.try_wait();
+        if exited.is_none() {
+            // 等 1s，每 100ms 检查一次
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                exited = server.try_wait();
+                if exited.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // (d) 看门狗超时 → force kill（同官方 watchdog 超时后 kill(SIGKILL)）
+        if exited.is_none() {
+            eprintln!("server {} did not exit after socket shutdown, force killing", self.device.serial);
+            server.stop(self.adb.as_ref());
+        }
+
         println!("Session {} cleaned up", self.device.serial);
     }
 
-    /// 连接到 scrcpy ADB forward 端口
+    /// 连接到 scrcpy ADB forward 端口。
+    ///
+    /// `read_dummy=true` 时连上后读一个 dummy byte（第一个 socket），
+    /// 读失败说明 server 未就绪，重试整个流程。
     async fn connect_socket(
         &self,
         port: u16,
         server: &mut scrcpy::ScrcpyServer,
         stop_rx: &mut oneshot::Receiver<()>,
+        read_dummy: bool,
     ) -> Option<TcpStream> {
         loop {
             match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-                Ok(s) => return Some(s),
+                Ok(mut s) => {
+                    if read_dummy {
+                        let mut dummy = [0u8; 1];
+                        // 异步读 dummy byte，server 在 DesktopConnection.accept() 后发送
+                        // 用 select! 同时监听 stop 信号，避免死等
+                        let read_result = tokio::select! {
+                            _ = &mut *stop_rx => {
+                                server.stop(self.adb.as_ref());
+                                return None;
+                            }
+                            r = s.read_exact(&mut dummy) => r,
+                        };
+                        if read_result.is_err() {
+                            // 读失败（极少见：server 在写完前就挂了），drop 重试
+                            drop(s);
+                        } else {
+                            return Some(s);
+                        }
+                    } else {
+                        return Some(s);
+                    }
+                }
                 Err(_) => {}
             }
+            // 连接失败或 dummy 读失败，等 500ms 或 stop 信号
             tokio::select! {
                 _ = &mut *stop_rx => {
                     server.stop(self.adb.as_ref());
@@ -318,26 +390,37 @@ impl Session {
         control_reader: &mut (impl AsyncReadExt + Unpin),
         control_writer: &mut (impl AsyncWriteExt + Unpin),
         mut stop_rx: oneshot::Receiver<()>,
+        serial: String,
     ) {
+        eprintln!("[{}] run_clipboard_io ENTER", serial);
         let clipboard_enabled = self.clipboard_enabled.clone();
         let phone_clip_tx = self.phone_clip_tx.clone();
 
         loop {
             tokio::select! {
                 biased;
-                _ = &mut stop_rx => break,
+                _ = &mut stop_rx => {
+                    eprintln!("[{}] BREAK: stop_rx fired", serial);
+                    break;
+                }
                 result = self.clip_sub.recv() => {
                     match result {
                         Ok(text) if clipboard_enabled.load(Ordering::SeqCst) => {
                             let msg = build_clipboard_frame(&text);
                             if control_writer.write_all(&msg).await.is_err() {
+                                eprintln!("[{}] BREAK: write_all error", serial);
                                 break;
                             }
                         }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        Ok(_) => {
+                            eprintln!("[{}] clip_sub.recv Ok(_) clipboard disabled, continue", serial);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            eprintln!("[{}] BREAK: clip_sub Closed", serial);
+                            break;
+                        }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            eprintln!("clipboard broadcast lagged by {}", n);
+                            eprintln!("[{}] clip_sub lagged by {}", serial, n);
                         }
                     }
                 }
@@ -345,16 +428,23 @@ impl Session {
                     match result {
                         Ok(Some(text)) => {
                             if clipboard_enabled.load(Ordering::SeqCst) {
-                                println!("Phone clipboard: {}", text);
-                                if phone_clip_tx.send(text).await.is_err() { break; }
+                                println!("Phone clipboard from {}: {}", serial, text);
+                                if phone_clip_tx.send(text).await.is_err() {
+                                    eprintln!("[{}] BREAK: phone_clip_tx send error", serial);
+                                    break;
+                                }
                             }
                         }
                         Ok(None) => {}
-                        Err(()) => break,
+                        Err(()) => {
+                            eprintln!("[{}] BREAK: read_device_message error", serial);
+                            break;
+                        }
                     }
                 }
             }
         }
+        eprintln!("[{}] run_clipboard_io EXIT", serial);
     }
 
     /// 音频未启用时：单连接 control-only
@@ -364,17 +454,13 @@ impl Session {
         mut stop_rx: oneshot::Receiver<()>,
     ) {
         // 只需要 1 个 socket（control）
-        let mut stream = match self.connect_socket(self.port, server, &mut stop_rx).await {
+        let mut stream = match self
+            .connect_socket(self.port, server, &mut stop_rx, true)
+            .await
+        {
             Some(s) => s,
             None => return,
         };
-
-        // 读 dummy byte（server 第一个 socket 会发）
-        let mut dummy = [0u8; 1];
-        if stream.read_exact(&mut dummy).await.is_err() {
-            server.stop(self.adb.as_ref());
-            return;
-        }
 
         // 读设备名
         let mut name_buf = [0u8; 64];
@@ -400,12 +486,12 @@ impl Session {
             self.notification_enabled.clone(),
         );
         let (mut control_reader, mut control_writer) = tokio::io::split(stream);
-        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx).await;
+        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx, self.device.serial.clone())
+            .await;
 
         notif_stop.store(true, Ordering::SeqCst);
         server.stop(self.adb.as_ref());
     }
-
     /// 剪贴板服务不可用时仅启动通知轮询。
     async fn run_notification_only(&mut self, stop_rx: oneshot::Receiver<()>) {
         let stop = Arc::new(AtomicBool::new(false));
@@ -494,9 +580,9 @@ fn audio_codec_name(id: u32) -> &'static str {
 fn build_clipboard_frame(text: &str) -> Vec<u8> {
     let text_bytes = text.as_bytes();
     let mut buf = Vec::with_capacity(14 + text_bytes.len());
-    buf.push(0x09);                             // TYPE_SET_CLIPBOARD
-    buf.extend_from_slice(&[0u8; 8]);           // 序列号（固定 0）
-    buf.push(0);                                // paste 标记（不自动粘贴）
+    buf.push(0x09); // TYPE_SET_CLIPBOARD
+    buf.extend_from_slice(&[0u8; 8]); // 序列号（固定 0）
+    buf.push(0); // paste 标记（不自动粘贴）
     buf.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(text_bytes);
     buf

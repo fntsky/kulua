@@ -38,6 +38,8 @@ pub trait AdbOps: Send + Sync {
     ) -> Result<std::process::Child, AdbError>;
     /// 启动 `adb track-devices` 长连接进程，其 stdout 输出可逐行读取。
     fn track_devices(&self) -> Result<std::process::Child, AdbError>;
+    /// 通过 adb get-serialno 获取设备的规范序列号
+    fn get_serialno(&self, addr: &str) -> Result<String, AdbError>;
     fn run(&self, args: &[&str]) -> Result<std::process::Output, AdbError>;
 }
 
@@ -173,6 +175,18 @@ impl AdbOps for AdbCmd {
         cmd.spawn().map_err(AdbError::Io)
     }
 
+    fn get_serialno(&self, addr: &str) -> Result<String, AdbError> {
+        let output = self.run(&["-s", addr, "get-serialno"])?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            return Err(AdbError::CommandFailed(format!(
+                "adb -s {} get-serialno returned empty",
+                addr
+            )));
+        }
+        Ok(text)
+    }
+
     fn run(&self, args: &[&str]) -> Result<std::process::Output, AdbError> {
         let output = Command::new(&self.adb_path)
             .args(args)
@@ -255,6 +269,8 @@ pub mod mock {
         pub calls: Mutex<Vec<&'static str>>,
         /// Dummy successful output for `run()`
         default_output: std::process::Output,
+        /// Result for `get_serialno()` calls
+        pub serialno_result: String,
     }
 
     impl MockAdb {
@@ -277,8 +293,10 @@ pub mod mock {
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                 },
+                serialno_result: String::new(),
             }
-        }
+    }
+
     }
 
     impl AdbOps for MockAdb {
@@ -368,6 +386,11 @@ pub mod mock {
                 .spawn()
                 .map_err(AdbError::Io)?;
             Ok(dummy)
+        }
+
+        fn get_serialno(&self, _addr: &str) -> Result<String, AdbError> {
+            self.calls.lock().unwrap().push("get_serialno");
+            Ok(self.serialno_result.clone())
         }
 
         fn run(&self, _args: &[&str]) -> Result<std::process::Output, AdbError> {

@@ -151,10 +151,9 @@ sync-workspace/
 - ✅ 剪贴板监听（手机→PC）
 - ✅ TCP IPC 服务（daemon ↔ GUI）
 - ✅ Tauri v2 GUI（设备列表、连接管理）
-- ❌ 剪贴板写入（PC→手机）
-- ❌ 系统剪贴板自动同步
+- ✅ 剪贴板写入（PC→手机）
+- ✅ 系统剪贴板自动同步
 - ❌ 音频转发（预留协议）
 
 ## License
-
-MIT
+Apache 2.0

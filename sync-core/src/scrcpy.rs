@@ -70,6 +70,13 @@ impl ScrcpyServer {
             port,
         })
     }
+    /// 非阻塞检查 server 进程是否已退出。
+    /// 返回 `None` 表示仍在运行，`Some(exit_status)` 表示已退出。
+    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.process.try_wait().ok().flatten()
+    }
+
+    /// 强制停止 server（清理远程进程和本地 adb shell）。
     pub fn stop(&mut self, adb: &dyn AdbOps) {
         // 先杀远程（设备端 scrcpy-server），确保无论本地如何终止都不会残留
         let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
@@ -78,15 +85,6 @@ impl ScrcpyServer {
         // 再杀本地 adb shell 进程
         let _ = self.process.kill();
         let _ = self.process.wait();
-
-        // 最后清理端口转发
-        let _ = adb.run(&[
-            "-s",
-            &self.device.serial,
-            "forward",
-            "--remove",
-            &format!("tcp:{}", self.port),
-        ]);
     }
 }
 
