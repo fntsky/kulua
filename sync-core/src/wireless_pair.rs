@@ -53,6 +53,7 @@ pub enum MdnsEvent {
     ConnectDiscovered {
         host: String,
         port: u16,
+        fullname: String,
     },
     #[allow(dead_code)]
     Error(String),
@@ -128,6 +129,7 @@ pub fn start_discovery(
                             let _ = tx.send(MdnsEvent::ConnectDiscovered {
                                 host: addr.to_string(),
                                 port: info.get_port(),
+                                fullname: info.get_fullname().to_string(),
                             });
                         }
                     }

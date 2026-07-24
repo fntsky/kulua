@@ -86,10 +86,33 @@ pub struct JsonRpcError {
 pub enum Event {
     #[serde(rename = "device.updated")]
     DeviceUpdated { data: Vec<crate::types::Device> },
+    #[serde(rename = "session.updated")]
+    SessionUpdated { data: SessionListData },
     #[serde(rename = "clipboard.changed")]
     ClipboardChanged { data: ClipboardData },
     #[serde(rename = "notification")]
     Notification { data: NotifData },
+}
+
+/// `session.updated` 事件的载荷。
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    /// 设备规范 ID（来自 mDNS fullname 首段 或 get-serialno）
+    pub id: String,
+    /// 当前用于 ADB 命令的地址
+    pub serial: String,
+    /// 设备名称（来自 scrcpy 协议）
+    pub name: String,
+    /// ADB 连接状态
+    pub state: String,
+    /// 音频是否已启用
+    pub audio_enabled: bool,
+}
+
+/// `session.updated` 事件的载荷。
+#[derive(Debug, Serialize)]
+pub struct SessionListData {
+    pub sessions: Vec<SessionSummary>,
 }
 
 /// `clipboard.changed` 事件的载荷。

@@ -1,0 +1,5 @@
+[env]
+# audiopus_sys/opus 的 CMakeLists.txt 使用 `cmake_minimum_required(VERSION 2.8)`,
+# 但 CMake ≥4.0 不再兼容 <3.5 的版本声明。
+# 通过此变量让 CMake 兼容旧版语法。
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

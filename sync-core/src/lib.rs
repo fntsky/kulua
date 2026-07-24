@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod device_refresh;
 pub mod scrcpy;
 pub mod session;
+pub mod audio_player;
 pub mod types;
 pub mod wireless_pair;
 pub use app::Core;

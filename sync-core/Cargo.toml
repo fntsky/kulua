@@ -19,3 +19,5 @@ thiserror = "2"
 tokio-stream = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+opus = "0.3"
+rodio = "0.22"

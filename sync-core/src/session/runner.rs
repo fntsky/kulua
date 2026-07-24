@@ -186,9 +186,34 @@ impl Session {
         let audio_task = if codec_id == 0 {
             // 设备禁用了音频流，无需读取
             None
+        } else if codec_id != 0x6f707573 {
+            // 非 OPUS codec → 只读取丢弃（暂无对应播放支持）
+            Some(tokio::spawn(async move {
+                let mut header = [0u8; 12];
+                while audio_reader.read_exact(&mut header).await.is_ok() {
+                    let frame_size =
+                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
+                    if frame_size == 0 || frame_size > 10_000_000 {
+                        break;
+                    }
+                    let mut _frame = vec![0u8; frame_size];
+                    if audio_reader.read_exact(&mut _frame).await.is_err() {
+                        break;
+                    }
+                }
+            }))
         } else {
+            // OPUS → 解码播放
             let serial = self.device.serial.clone();
             Some(tokio::spawn(async move {
+                let mut player = match crate::audio_player::AudioPlayer::new() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[audio] failed to init player on {serial}: {e}");
+                        return;
+                    }
+                };
+
                 loop {
                     // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
                     let mut header = [0u8; 12];
@@ -196,9 +221,11 @@ impl Session {
                         break;
                     }
 
-                    let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
+                    let pts_raw =
+                        u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
                     let frame_size =
-                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
+                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap())
+                            as usize;
 
                     // 检查 session 元数据标记（bit 63）
                     if (pts_raw >> 63) & 1 != 0 {
@@ -216,9 +243,10 @@ impl Session {
                     }
 
                     if (pts_raw >> 62) & 1 == 0 {
-                        // 不是 config packet → 正常音频帧
-                        // TODO: 解码播放
-                        println!("audio frame: {} bytes from {}", frame_size, serial);
+                        // 正常音频帧 → 解码播放
+                        if let Err(e) = player.feed_frame(&frame_data) {
+                            eprintln!("[audio] opus decode error on {serial}: {e}");
+                        }
                     }
                 }
             }))

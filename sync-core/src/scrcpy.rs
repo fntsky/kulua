@@ -16,6 +16,12 @@ pub struct ScrcpyServer {
 }
 
 impl ScrcpyServer {
+    /// 强制杀死设备上的 scrcpy-server 进程（与 `stop` 逻辑相同）。
+    fn force_kill_remote(adb: &dyn AdbOps, serial: &str) {
+        let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
+        let _ = adb.run(&["-s", serial, "shell", kill_cmd]);
+    }
+
     pub fn deploy_scrcpy(
         adb: &dyn AdbOps,
         device: &Device,
@@ -23,6 +29,9 @@ impl ScrcpyServer {
         port: u16,
         audio_enabled: bool,
     ) -> Result<Self, crate::types::AdbError> {
+        // 强制杀死设备上已有的 scrcpy-server，再重新部署
+        Self::force_kill_remote(adb, &device.serial);
+
         let remote_jar = "/data/local/tmp/scrcpy-server.jar";
         let needs_push = adb
             .run(&["-s", &device.serial, "shell", "test", "-f", remote_jar])

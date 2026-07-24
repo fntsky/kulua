@@ -71,6 +71,7 @@ pub fn serve(
     token: CancellationToken,
     cmd_tx: mpsc::Sender<Command>,
     device_watch: watch::Receiver<HashMap<String, Device>>,
+    session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
     clip_tx: broadcast::Sender<String>,
     notif_tx: broadcast::Sender<NotifInfo>,
     pair_info: WirelessPairing,
@@ -87,11 +88,12 @@ pub fn serve(
                         Ok(stream) => {
                             let cmd_tx = cmd_tx.clone();
                             let dw = device_watch.clone();
+                            let sw = session_watch.clone();
                             let clip_sub = clip_tx.subscribe();
                             let notif_sub = notif_tx.subscribe();
                             let pi = pair_info.clone();
                             tokio::spawn(handle_ipc_connection(
-                                stream, cmd_tx, dw, clip_sub, notif_sub, pi,
+                                stream, cmd_tx, dw, sw, clip_sub, notif_sub, pi,
                             ));
                         }
                         Err(e) => {
@@ -113,12 +115,11 @@ pub fn serve(
 /// 同时监听四个事件源：
 /// - **TCP 帧**：解析 Request 并回复 Response
 /// - **设备变更**（`device_watch.changed()`）：推送 `device.updated` 事件
-/// - **剪贴板变更**（`clip_sub`）：推送 `clipboard.changed` 事件
-/// - **通知事件**（`notif_sub`）：推送 `notification` 事件
 async fn handle_ipc_connection(
     stream: TcpStream,
     cmd_tx: mpsc::Sender<Command>,
     mut device_watch: watch::Receiver<HashMap<String, Device>>,
+    mut session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
     mut clip_sub: broadcast::Receiver<String>,
     mut notif_sub: broadcast::Receiver<NotifInfo>,
     pair_info: WirelessPairing,
@@ -146,6 +147,19 @@ async fn handle_ipc_connection(
             _ = device_watch.changed() => {
                 let devices: Vec<Device> = device_watch.borrow().values().cloned().collect();
                 let event = Event::DeviceUpdated { data: devices };
+                if let Ok(payload) = serde_json::to_vec(&event) {
+                    if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // ── session 列表变更事件 ──
+            _ = session_watch.changed() => {
+                let sessions = session_watch.borrow().clone();
+                let event = Event::SessionUpdated {
+                    data: SessionListData { sessions },
+                };
                 if let Ok(payload) = serde_json::to_vec(&event) {
                     if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
                         break;
@@ -400,6 +414,7 @@ mod tests {
         // 构造最小 dispatch 通道
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, notif_rx) = broadcast::channel(64);
 
@@ -407,7 +422,7 @@ mod tests {
         let join = tokio::spawn(async move {
             let stream = server.accept().await.unwrap();
             let clip_sub = clip_tx.subscribe();
-            handle_ipc_connection(stream, _cmd_tx, device_watch, clip_sub, notif_rx, WirelessPairing::new()).await;
+            handle_ipc_connection(stream, _cmd_tx, device_watch, session_watch, clip_sub, notif_rx, WirelessPairing::new()).await;
         });
 
         // 客户端连接并发送 device.list 请求
@@ -441,10 +456,11 @@ mod tests {
         let token = CancellationToken::new();
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, notif_tx, WirelessPairing::new());
+        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, session_watch, clip_tx, notif_tx, WirelessPairing::new());
     }
 
     #[tokio::test]
@@ -454,10 +470,11 @@ mod tests {
         let token = CancellationToken::new();
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
-        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, clip_tx, notif_tx, WirelessPairing::new());
+        let _handle = serve(server, token.clone(), _cmd_tx, device_watch, session_watch, clip_tx, notif_tx, WirelessPairing::new());
 
         // 第一次连接
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();

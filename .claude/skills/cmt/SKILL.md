@@ -34,12 +34,13 @@ description: 自动分析 git diff 并生成符合规范的 commit message
    <body>
    ```
 
-5. **可选交互**
+5. **交互**
 
-   - 如果用户确认（回答 y/yes），直接执行 `git commit`
+   - **如果用户已确认**（命令中包含 "yes" 或上下文已明确表示要提交），**跳过确认步骤**，直接生成 commit message 并执行 `git commit`
+   - 如果用户要求展示（如 `/cmt show`），只展示不提交
+   - 如果用户回答 y/yes，直接执行 `git commit`
    - 如果用户要修改，根据反馈调整
    - 如果用户拒绝，直接退出
-
 ## Type 选择规则（按优先级）
 
 | 变更内容 | type |
@@ -60,4 +61,4 @@ description: 自动分析 git diff 并生成符合规范的 commit message
 - 正文永远用**中文**
 - 正文永远是 WHY 而不是 WHAT——WHAT 看 diff 就知道
 - 如果用户有多个逻辑上独立的变更，提示用户分开提交
-- 生成的 message 要展示给用户确认后再提交
+- **除非用户已提前确认**（命令中带 "yes" 或上下文已明确表态），否则生成的 message 要展示给用户确认后再提交
