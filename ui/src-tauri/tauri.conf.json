@@ -14,8 +14,10 @@
     "windows": [
       {
         "title": "Sync Workspace",
-        "width": 700,
+        "width": 900,
         "height": 480,
+        "minWidth": 900,
+        "minHeight": 480,
         "resizable": true
       }
     ],

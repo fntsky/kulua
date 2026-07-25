@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from "vue";
+import { ref, watch, onMounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import QRCode from "qrcode";
@@ -23,6 +23,14 @@ interface DeviceConfig {
   volume: number;
 }
 const connected = ref(false);
+const theme = ref(localStorage.getItem("theme") || "dark");
+watch(theme, (v) => {
+  localStorage.setItem("theme", v);
+  nextTick(() => rerenderQR());
+});
+function toggleTheme() {
+  theme.value = theme.value === "dark" ? "light" : "dark";
+}
 const devices = ref<DeviceInfo[]>([]);
 const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
@@ -130,13 +138,20 @@ async function refresh() {
 async function renderQR(info: PairingInfo) {
   pairingInfo.value = info;
   await nextTick();
-  if (qrCanvas.value) {
-    QRCode.toCanvas(qrCanvas.value, info.wifi_string, {
-      width: 200,
-      margin: 2,
-      color: { dark: "#e0e0e0", light: "#16213e" },
-    }).catch((e) => console.error("QR render error:", e));
-  }
+  renderQRCanvas();
+}
+function renderQRCanvas() {
+  const info = pairingInfo.value;
+  if (!info || !qrCanvas.value) return;
+  const isDark = theme.value === "dark";
+  QRCode.toCanvas(qrCanvas.value, info.wifi_string, {
+    width: 200,
+    margin: 2,
+    color: { dark: isDark ? "#e0e0e0" : "#333", light: isDark ? "#16213e" : "#fff" },
+  }).catch((e) => console.error("QR render error:", e));
+}
+function rerenderQR() {
+  renderQRCanvas();
 }
 
 onMounted(async () => {
@@ -174,7 +189,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="container">
+  <div class="container" :class="theme">
     <div class="left-panel">
       <!-- device list -->
       <div class="section">在线设备</div>
@@ -246,10 +261,24 @@ onMounted(async () => {
           <span class="placeholder-text">等待 daemon 提供配对信息…</span>
         </div>
       </div>
-      <!-- status bar -->
       <div class="status-bar">
+        <span class="theme-btn" @click="toggleTheme" :title="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'">
+          <svg v-if="theme === 'dark'" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <svg v-else xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </span>
         <span class="dot" :class="{ on: connected, off: !connected }" />
-        <span class="label">{{ connected ? "已连接" : "未连接" }}</span>
       </div>
     </div>
   </div>
@@ -269,6 +298,26 @@ function stateClass(s: string): string {
   --dim: #888;
   --green: #4caf50;
   --red: #e94560;
+  --border: rgba(255,255,255,0.08);
+  --toggle-bg: #444;
+  --toggle-knob: #888;
+  --error-bg: #2a1a1a;
+  --device-name: #fff;
+  --slider-bg: #444;
+  color-scheme: dark;
+}
+.container.light {
+  --bg: #f5f5f5;
+  --card: #ffffff;
+  --text: #333;
+  --dim: #999;
+  --border: rgba(0,0,0,0.1);
+  --toggle-bg: #ccc;
+  --toggle-knob: #f5f5f5;
+  --error-bg: #ffe0e0;
+  --device-name: #1a1a1a;
+  --slider-bg: #ccc;
+  color-scheme: light;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -279,25 +328,18 @@ body {
   user-select: none;
 }
 .container {
-  max-width: 480px;
-  min-height: 100vh;
-  margin: 0 auto;
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-}
-.container {
   display: flex;
   flex-direction: row;
   height: 100vh;
   padding: 0;
+  background: var(--bg);
 }
 .left-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
   padding: 20px;
-  border-right: 1px solid rgba(255,255,255,0.08);
+  border-right: 1px solid var(--border);
   overflow-y: auto;
   gap: 10px;
 }
@@ -308,23 +350,20 @@ body {
   padding: 20px;
   gap: 16px;
 }
-.right-panel {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  padding: 20px;
-  overflow-y: auto;
-  gap: 10px;
-}
 .status-bar {
   display: flex; align-items: center; gap: 8px;
   margin-top: auto;
   padding: 8px 0 0;
 }
-
+.theme-btn {
+  cursor: pointer; font-size: 16px; line-height: 1;
+  padding: 2px 4px; border-radius: 4px;
+  user-select: none;
+}
+.theme-btn:hover { background: var(--border); }
 .error {
   color: var(--red); font-size: 13px; text-align: center; padding: 10px;
-  background: #2a1a1a; border-radius: 8px; margin-bottom: 12px;
+  background: var(--error-bg); border-radius: 8px; margin-bottom: 12px;
 }
 .section {
   font-size: 13px; font-weight: 600; text-transform: uppercase;
@@ -341,7 +380,7 @@ body {
 }
 .device-toggles {
   display: flex; align-items: center; gap: 16px; padding-top: 4px;
-  border-top: 1px solid rgba(255,255,255,0.06);
+  border-top: 1px solid var(--border);
 }
 .toggle-row {
   display: flex; align-items: center; gap: 8px; cursor: pointer;
@@ -350,13 +389,13 @@ body {
 .toggle-label { user-select: none; }
 .toggle-switch {
   position: relative; width: 36px; height: 20px;
-  background: #444; border-radius: 10px; transition: 0.2s; cursor: pointer;
+  background: var(--toggle-bg); border-radius: 10px; transition: 0.2s; cursor: pointer;
   flex-shrink: 0;
 }
 .toggle-switch::after {
   content: ''; position: absolute; top: 2px; left: 2px;
   width: 16px; height: 16px; border-radius: 50%;
-  background: #888; transition: 0.2s;
+  background: var(--toggle-knob); transition: 0.2s;
 }
 .toggle-switch.active { background: var(--green); }
 .toggle-switch.active::after {
@@ -371,7 +410,7 @@ body {
   min-width: 0;
 }
 .device-name {
-  font-size: 14px; font-weight: 600; color: #fff;
+  font-size: 14px; font-weight: 600; color: var(--device-name);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .state {
@@ -384,7 +423,7 @@ body {
   width: 80px;
   height: 4px;
   border-radius: 2px;
-  background: #444;
+  background: var(--slider-bg);
   outline: none;
   cursor: pointer;
   flex-shrink: 0;
