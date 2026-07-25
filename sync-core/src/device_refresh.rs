@@ -20,12 +20,13 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
         let mut retry_delay = Duration::from_millis(100);
 
         while !token.is_cancelled() {
-            let mut child = match Command::new(&adb_path)
-                .arg("track-devices")
+            let mut cmd = Command::new(&adb_path);
+            cmd.arg("track-devices")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to spawn adb track-devices: {}", e);

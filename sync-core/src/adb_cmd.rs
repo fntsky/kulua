@@ -50,8 +50,11 @@ pub struct AdbCmd {
 
 impl AdbOps for AdbCmd {
     fn check(&self) -> Result<(), AdbError> {
-        let output = Command::new(&self.adb_path)
-            .arg("version")
+        let mut cmd = Command::new(&self.adb_path);
+        cmd.arg("version");
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let output = cmd
             .output()
             .map_err(|_| AdbError::AdbNotFound {
                 tried: self.adb_path.display().to_string(),
@@ -103,8 +106,11 @@ impl AdbOps for AdbCmd {
 
     fn push(&self, device: &Device, local: &str, remote: &str) -> Result<(), AdbError> {
         let serial = &device.serial;
-        let output = Command::new(&self.adb_path)
-            .args(["-s", serial, "push", local, remote])
+        let mut cmd = Command::new(&self.adb_path);
+        cmd.args(["-s", serial, "push", local, remote]);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let output = cmd
             .output()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
@@ -188,8 +194,11 @@ impl AdbOps for AdbCmd {
     }
 
     fn run(&self, args: &[&str]) -> Result<std::process::Output, AdbError> {
-        let output = Command::new(&self.adb_path)
-            .args(args)
+        let mut cmd = Command::new(&self.adb_path);
+        cmd.args(args);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let output = cmd
             .output()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
