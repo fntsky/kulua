@@ -1,3 +1,6 @@
+// Release 构建不显示控制台窗口
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use sync_core::cli;
 use sync_core::app;
 use sync_core::wireless_pair;
@@ -37,15 +40,13 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
         menu.append(&open_item).expect("append menu item");
         menu.append(&quit_item).expect("append menu item");
 
-        let icon = Icon::from_rgba(
-            std::iter::repeat([0x44u8, 0xbb, 0xff, 0xff])
-                .take(16 * 16)
-                .flatten()
-                .collect(),
-            16,
-            16,
-        )
-        .expect("create icon");
+        // 从项目根 logo.png 解码为托盘图标
+        let logo_bytes = include_bytes!("../../logo.png");
+        let img = image::load_from_memory(logo_bytes).expect("decode logo.png");
+        let rgba = img.to_rgba8();
+        let (icon_w, icon_h) = rgba.dimensions();
+        let icon = Icon::from_rgba(rgba.into_raw(), icon_w, icon_h)
+            .expect("create tray icon");
 
         let _tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -129,6 +130,14 @@ async fn main() {
 
     let wireless_pair_info = wireless_pair::WirelessPairing::new();
     cli::print_qr_to_terminal(&wireless_pair_info.get_info());
+
+    // 隐藏控制台窗口（Release 构建双击无黑框，但所有 println! 仍正常工作）
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        unsafe { ShowWindow(GetConsoleWindow(), SW_HIDE); }
+    }
 
     let mut core = app::Core::new(jar_path, wireless_pair_info);
     let token = core.get_token();
