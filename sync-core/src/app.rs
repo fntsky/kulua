@@ -530,15 +530,19 @@ impl Core {
     }
 
     async fn sync_sessions(&mut self, adb_devices: &HashMap<String, Device>) {
-        // 检查每个 device，启动 session
-        let uuids: Vec<Uuid> = self
+        // 检查每个 device，按地址优先级（USB > mDNS > IP:port）启动 session
+        let mut pending: Vec<Uuid> = self
             .devices
             .iter()
             .filter(|(_, entry)| entry.session.is_none())
             .map(|(uuid, _)| *uuid)
             .collect();
+        pending.sort_by_key(|uuid| {
+            let entry = self.devices.get(uuid).expect("uuid from iteration");
+            std::cmp::Reverse(DeviceAddrKind::classify(&entry.device.serial).priority())
+        });
 
-        for uuid in uuids {
+        for uuid in pending {
             let device = match self.devices.get(&uuid) {
                 Some(entry) => entry.device.clone(),
                 None => continue,
@@ -604,14 +608,6 @@ impl Core {
     }
 
     async fn start_session(&mut self, device: Device) {
-        // 跳过 IP:port 格式标识的设备（没有有效 serial，session 无法正常工作）
-        if DeviceAddrKind::classify(&device.id) == DeviceAddrKind::Ip {
-            println!(
-                "Skip starting session for {} (IP:port identifier)",
-                device.id
-            );
-            return;
-        }
         // Guard: 相同 Device 的 session 已在运行则不重复启动
         if self
             .devices
@@ -681,6 +677,7 @@ impl Core {
         }
     }
 
+
     async fn stop_all(&mut self) {
         self.token.cancel();
         println!("Stopping all sessions...");
@@ -710,7 +707,6 @@ impl Core {
         let _ = self.device_tx.send(watch_devices);
     }
 }
-
 impl Drop for Core {
     fn drop(&mut self) {
         self.token.cancel();
