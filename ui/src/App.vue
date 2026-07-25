@@ -175,28 +175,7 @@ onMounted(async () => {
 
 <template>
   <div class="container">
-
-    <!-- main content -->
-    <div class="main">
-      <h1>Sync Workspace</h1>
-
-      <!-- pairing qr code -->
-      <div v-if="pairingInfo" class="qr-section">
-        <div class="section">连接二维码</div>
-        <div class="qr-card">
-          <canvas ref="qrCanvas" class="qr-canvas"></canvas>
-          <div class="qr-info">
-            <div class="qr-row">
-              <span class="qr-label">DNS ID</span>
-              <span class="qr-value mono">{{ pairingInfo.dns_id }}</span>
-            </div>
-            <div class="qr-row">
-              <span class="qr-label">PSK</span>
-              <span class="qr-value mono">{{ pairingInfo.psk }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div class="left-panel">
       <!-- device list -->
       <div class="section">在线设备</div>
       <div class="device-list">
@@ -209,58 +188,69 @@ onMounted(async () => {
         >
           <div class="device-header">
             <div class="device-title">
-              <span class="device-name" v-if="d.name">{{ d.name }}</span>
+              <span class="device-name">{{ d.name || d.serial }}</span>
               <span class="serial">{{ d.serial }}</span>
             </div>
             <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
           </div>
           <div class="device-toggles">
-            <label class="toggle-row" title="剪贴板同步">
+            <div class="toggle-row" @click="toggleClipboardSync(d.uuid)">
+              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).clipboardSync }" />
               <span class="toggle-label">剪贴板</span>
-              <span
-                class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.uuid).clipboardSync }"
-                @click="toggleClipboardSync(d.uuid)"
-              />
-            </label>
-            <label class="toggle-row" title="通知同步">
+            </div>
+            <div class="toggle-row" @click="toggleNotificationSync(d.uuid)">
+              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).notificationSync }" />
               <span class="toggle-label">通知</span>
-              <span
-                class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.uuid).notificationSync }"
-                @click="toggleNotificationSync(d.uuid)"
-              />
-            </label>
-            <label class="toggle-row" title="音频同步">
+            </div>
+            <div class="toggle-row" @click="toggleAudioSync(d.uuid)">
+              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).audioSync }" />
               <span class="toggle-label">音频</span>
-              <span
-                class="toggle-switch"
-                :class="{ active: getDeviceConfig(d.uuid).audioSync }"
-                @click="toggleAudioSync(d.uuid)"
-              />
-            </label>
-            <label class="toggle-row" title="音量">
-              <span class="toggle-label">音量 {{ getDeviceConfig(d.uuid).volume }}%</span>
+            </div>
+            <div class="toggle-row" style="gap:4px">
               <input
+                class="volume-slider"
                 type="range"
                 min="0" max="100"
-                class="volume-slider"
                 :value="getDeviceConfig(d.uuid).volume"
-                @input="setVolume(d.uuid, ($event.target as HTMLInputElement).valueAsNumber)"
+                @input="setVolume(d.uuid, Number(($event.target as HTMLInputElement).value))"
               />
-            </label>
+              <span class="toggle-label">{{ getDeviceConfig(d.uuid).volume }}</span>
+            </div>
           </div>
         </div>
       </div>
-
       <!-- error -->
       <div v-if="error" class="error">{{ error }}</div>
     </div>
-
-    <!-- status bar (bottom-right) -->
-    <div class="status-bar">
-      <span class="dot" :class="{ on: connected, off: !connected }" />
-      <span class="label">{{ connected ? "已连接" : "未连接" }}</span>
+    <div class="right-panel">
+      <!-- pairing qr code -->
+      <div v-if="pairingInfo" class="qr-section">
+        <div class="section">连接二维码</div>
+        <div class="qr-card">
+          <canvas ref="qrCanvas" class="qr-canvas"></canvas>
+          <div class="qr-info">
+            <div class="qr-row">
+              <span class="qr-label">地址</span>
+              <span class="qr-value mono">{{ pairingInfo.dns_id }}</span>
+            </div>
+            <div class="qr-row">
+              <span class="qr-label">配对码</span>
+              <span class="qr-value mono">{{ pairingInfo.psk }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="qr-placeholder">
+        <div class="section">连接二维码</div>
+        <div class="placeholder-card">
+          <span class="placeholder-text">等待 daemon 提供配对信息…</span>
+        </div>
+      </div>
+      <!-- status bar -->
+      <div class="status-bar">
+        <span class="dot" :class="{ on: connected, off: !connected }" />
+        <span class="label">{{ connected ? "已连接" : "未连接" }}</span>
+      </div>
     </div>
   </div>
 </template>
@@ -296,19 +286,42 @@ body {
   display: flex;
   flex-direction: column;
 }
-.main { flex: 1; }
-h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
+.container {
+  display: flex;
+  flex-direction: row;
+  height: 100vh;
+  padding: 0;
+}
+.left-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  border-right: 1px solid rgba(255,255,255,0.08);
+  overflow-y: auto;
+  gap: 10px;
+}
+.right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  gap: 16px;
+}
+.right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  overflow-y: auto;
+  gap: 10px;
+}
 .status-bar {
   display: flex; align-items: center; gap: 8px;
-  justify-content: flex-end;
-  padding: 12px 0;
+  margin-top: auto;
+  padding: 8px 0 0;
 }
-.dot {
-  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
-}
-.dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
-.dot.off { background: var(--red); box-shadow: 0 0 8px var(--red); }
-.label { font-size: 14px; font-weight: 500; }
+
 .error {
   color: var(--red); font-size: 13px; text-align: center; padding: 10px;
   background: #2a1a1a; border-radius: 8px; margin-bottom: 12px;
@@ -397,7 +410,7 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
 .state.Unauthorized { background: #e65100; color: #ffcc80; }
 .state.Unknown { background: #37474f; color: #b0bec5; }
 /* QR code */
-.qr-section { margin-bottom: 16px; }
+.qr-section { margin-bottom: 0; }
 .qr-card {
   background: var(--card); border-radius: 12px; padding: 20px;
   display: flex; flex-direction: column; align-items: center; gap: 14px;
@@ -411,4 +424,11 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
 .qr-label { color: var(--dim); }
 .qr-value { color: var(--text); font-weight: 500; }
 .mono { font-family: "Cascadia Code", "Fira Code", monospace; }
+.qr-placeholder { flex: 1; display: flex; flex-direction: column; }
+.placeholder-card {
+  background: var(--card); border-radius: 12px; padding: 20px;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 120px;
+}
+.placeholder-text { color: var(--dim); font-size: 13px; text-align: center; }
 </style>
