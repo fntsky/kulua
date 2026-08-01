@@ -1,4 +1,4 @@
-use crate::types::{Device, DeviceState};
+use crate::types::Device;
 
 use std::collections::HashMap;
 use std::io;
@@ -102,14 +102,12 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                 println!("Parsing devices from payload...");
                 match crate::protocol::devices::parse_devices(&payload) {
                     Ok(devices) => {
-                        // 只推送 Device 状态的设备，offline/unauthorized 等暂不暴露给上层。
-                        // 上层如果需要在 UI 提示"未授权"等状态，可在此放开过滤。
+                        // 推全量原始列表（含 Offline/Unauthorized/Unknown），
+                        // 供 IPC 的 device.adb_list / adb.updated（UI "ADB 连接" 页面）。
+                        // 上层（Core）自行过滤 Device 状态后再做设备合并。
                         let mut map = HashMap::new();
-
                         for d in devices {
-                            if d.state == DeviceState::Device {
-                                map.insert(d.serial.clone(), d);
-                            }
+                            map.insert(d.serial.clone(), d);
                         }
 
                         // 避免重复发送相同设备列表

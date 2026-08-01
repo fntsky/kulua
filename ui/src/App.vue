@@ -32,6 +32,22 @@ function toggleTheme() {
   theme.value = theme.value === "dark" ? "light" : "dark";
 }
 const devices = ref<DeviceInfo[]>([]);
+// 当前页面：设备卡片 / ADB 连接
+const view = ref<"devices" | "adb">("devices");
+// adb 原始设备列表（含 Offline/Unauthorized）
+const adbDevices = ref<Array<{ serial: string; state: string }>>([]);
+const adbStateTextMap: Record<string, string> = {
+  Device: "已连接",
+  Offline: "离线",
+  Unauthorized: "未授权",
+};
+function adbStateText(s: string): string {
+  return adbStateTextMap[s] || s.replace(/^Unknown\(|\)$/g, "");
+}
+// adb 列表的设备名：匹配合并列表（name 来自 scrcpy 协议）
+function adbName(serial: string): string {
+  return devices.value.find((x) => x.serial === serial)?.name || "";
+}
 const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
 const qrCanvas = ref<HTMLCanvasElement | null>(null);
@@ -183,6 +199,9 @@ onMounted(async () => {
       updateUI(false, []);
     }
   });
+  listen<{ serial: string; state: string }[]>("adb-updated", (e) => {
+    adbDevices.value = e.payload;
+  });
   listen<PairingInfo>("pairing-info-updated", (e) => {
     renderQR(e.payload);
   });
@@ -206,6 +225,9 @@ onMounted(async () => {
 
   // load existing state
   refresh();
+  invoke<Array<{ serial: string; state: string }>>("get_adb_devices")
+    .then((d) => (adbDevices.value = d))
+    .catch((e) => console.error("get_adb_devices failed:", e));
   const existing = await invoke<PairingInfo | null>("get_pairing_info");
   if (existing) {
     renderQR(existing);
@@ -217,8 +239,11 @@ onMounted(async () => {
   <div class="container" :class="theme">
     <div class="left-panel">
       <!-- device list -->
-      <div class="section">在线设备</div>
-      <div class="device-list">
+      <div class="tabs">
+        <span class="tab" :class="{ active: view === 'devices' }" @click="view = 'devices'">在线设备</span>
+        <span class="tab" :class="{ active: view === 'adb' }" @click="view = 'adb'">ADB 连接</span>
+      </div>
+      <div v-if="view === 'devices'" class="device-list">
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
         <div v-else-if="devices.length === 0" class="hint">暂无在线设备</div>
         <div
@@ -273,6 +298,22 @@ onMounted(async () => {
           <div v-if="sessionStates[d.uuid] === 'failed'" class="retry-row">
             <button class="retry-btn" @click="retrySession(d.uuid)">重试</button>
           </div>
+        </div>
+      </div>
+      <!-- adb raw device list -->
+      <div v-else class="adb-list">
+        <div v-if="!connected" class="hint">正在连接 daemon…</div>
+        <div v-else-if="adbDevices.length === 0" class="hint">无 ADB 设备</div>
+        <div
+          v-for="d in adbDevices"
+          :key="d.serial"
+          class="adb-row"
+        >
+          <div class="device-title">
+            <span class="device-name">{{ adbName(d.serial) || d.serial }}</span>
+            <span class="serial">{{ d.serial }}</span>
+          </div>
+          <span class="state" :class="stateClass(d.state)">{{ adbStateText(d.state) }}</span>
         </div>
       </div>
       <!-- error -->
@@ -411,6 +452,21 @@ body {
   letter-spacing: 0.5px; color: var(--dim); margin-bottom: 10px;
 }
 .device-list { display: flex; flex-direction: column; gap: 8px; }
+.tabs {
+  display: flex; gap: 8px;
+}
+.tab {
+  font-size: 12px; padding: 4px 14px; border-radius: 6px;
+  color: var(--dim); cursor: pointer; user-select: none;
+  border: 1px solid var(--border);
+}
+.tab.active { color: var(--text); background: var(--border); }
+.adb-list { display: flex; flex-direction: column; gap: 8px; }
+.adb-row {
+  background: var(--card); border-radius: 10px;
+  padding: 12px 16px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
 .hint { color: var(--dim); font-size: 14px; text-align: center; padding: 30px 0; }
 .device-card {
   background: var(--card); border-radius: 10px;

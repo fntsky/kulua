@@ -93,7 +93,9 @@ pub struct Core {
     /// session 列表的 watch channel（IPC 推送用）
     session_tx: watch::Sender<Vec<SessionSummary>>,
     session_watch: watch::Receiver<Vec<SessionSummary>>,
-    device_tx: watch::Sender<HashMap<String, Device>>,
+    /// 合并后设备列表（IPC device.list / device.updated 事件用）
+    merged_tx: watch::Sender<Vec<Device>>,
+    merged_watch: watch::Receiver<Vec<Device>>,
 
     // ── 剪贴板防回环 ──
     clipboard_last_seen: Option<String>,
@@ -108,6 +110,7 @@ impl Core {
         let (notif_tx, notif_rx) = mpsc::channel(64);
         let (notif_broadcast_tx, _) = broadcast::channel(64);
         let (device_tx, device_watch) = watch::channel(HashMap::new());
+        let (merged_tx, merged_watch) = watch::channel(Vec::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
 
         let token = CancellationToken::new();
@@ -136,8 +139,7 @@ impl Core {
             wireless_pair::MdnsHandle::empty()
         };
 
-        // 启动设备刷新后台任务（移走 device_tx，Core 保留 clone 以更新名称）
-        let core_device_tx = device_tx.clone();
+        // 启动设备刷新后台任务（原始 adb 列表，Core 只读，不再写回覆盖）
         crate::device_refresh::spawn(device_tx, token.clone());
 
         let (device_name_tx, device_name_rx) = mpsc::channel::<(String, String)>(32);
@@ -152,6 +154,8 @@ impl Core {
             _refresh_handle: true,
             mdns_rx,
             device_watch,
+            merged_tx,
+            merged_watch,
             clip_broadcast: clip_tx,
             phone_clip_rx,
             phone_clip_tx,
@@ -171,7 +175,6 @@ impl Core {
             last_clipboard_error_print: Instant::now(),
             session_tx,
             session_watch,
-            device_tx: core_device_tx,
         }
     }
 
@@ -194,6 +197,7 @@ impl Core {
                 token,
                 self.cmd_tx.clone(),
                 self.device_watch.clone(),
+                self.merged_watch.clone(),
                 self.session_watch.clone(),
                 self.clip_broadcast.clone(),
                 self.notif_broadcast.clone(),
@@ -222,16 +226,22 @@ impl Core {
                 _ = tick.tick() => {
                     self.poll_system_clipboard();
                     let from_track = self.device_watch.borrow_and_update().clone();
-                    for (serial, dev) in &from_track {
+                    // 原始列表含 Offline/Unauthorized 等，仅 Device 状态进入设备合并（卡片语义不变）
+                    let online: HashMap<String, Device> = from_track
+                        .iter()
+                        .filter(|(_, d)| d.state == DeviceState::Device)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (serial, dev) in &online {
                         self.insert_device(serial, dev.state.clone());
                         if dev.state == DeviceState::Device {
                             self.pending_serials.retain(|e| e.addr != *serial);
                         }
                     }
-                    self.try_connect_pending(&from_track);
-                    self.sync_device_watch();
+                    self.try_connect_pending(&online);
+                    self.push_merged_devices();
                     self.check_dead_sessions();
-                    self.sync_sessions(&from_track).await;
+                    self.sync_sessions(&online).await;
                     self.push_session_list();
                 }
             }
@@ -753,14 +763,10 @@ impl Core {
         }
     }
 
-    /// 将 devices 同步到 device_tx（IPC 使用的 watch channel）
-    fn sync_device_watch(&self) {
-        let watch_devices: HashMap<String, Device> = self
-            .devices
-            .values()
-            .map(|entry| (entry.device.serial.clone(), entry.device.clone()))
-            .collect();
-        let _ = self.device_tx.send(watch_devices);
+    /// 推送合并后设备列表（IPC device.list / device.updated 事件用）
+    fn push_merged_devices(&self) {
+        let merged: Vec<Device> = self.devices.values().map(|e| e.device.clone()).collect();
+        let _ = self.merged_tx.send(merged);
     }
 }
 impl Drop for Core {
@@ -856,7 +862,8 @@ mod tests {
             session_tx,
             clipboard_last_seen: None,
             session_watch,
-            device_tx: watch::channel(HashMap::new()).0,
+            merged_tx: watch::channel(Vec::new()).0,
+            merged_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };

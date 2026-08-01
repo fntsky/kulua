@@ -75,6 +75,7 @@ pub fn serve(
     token: CancellationToken,
     cmd_tx: mpsc::Sender<Command>,
     device_watch: watch::Receiver<HashMap<String, Device>>,
+    merged_watch: watch::Receiver<Vec<Device>>,
     session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
     clip_tx: broadcast::Sender<String>,
     notif_tx: broadcast::Sender<NotifInfo>,
@@ -92,12 +93,13 @@ pub fn serve(
                         Ok(stream) => {
                             let cmd_tx = cmd_tx.clone();
                             let dw = device_watch.clone();
+                            let mw = merged_watch.clone();
                             let sw = session_watch.clone();
                             let clip_sub = clip_tx.subscribe();
                             let notif_sub = notif_tx.subscribe();
                             let pi = pair_info.clone();
                             tokio::spawn(handle_ipc_connection(
-                                stream, cmd_tx, dw, sw, clip_sub, notif_sub, pi,
+                                stream, cmd_tx, dw, mw, sw, clip_sub, notif_sub, pi,
                             ));
                         }
                         Err(e) => {
@@ -124,7 +126,8 @@ pub fn serve(
 async fn handle_ipc_connection(
     stream: TcpStream,
     cmd_tx: mpsc::Sender<Command>,
-    device_watch: watch::Receiver<HashMap<String, Device>>,
+    mut device_watch: watch::Receiver<HashMap<String, Device>>,
+    mut merged_watch: watch::Receiver<Vec<Device>>,
     mut session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
     mut clip_sub: broadcast::Receiver<String>,
     mut notif_sub: broadcast::Receiver<NotifInfo>,
@@ -138,7 +141,7 @@ async fn handle_ipc_connection(
             frame = framed.next() => {
                 match frame {
                     Some(Ok((frame_type, payload))) => {
-                        if on_frame(frame_type, &payload, &mut framed, &cmd_tx, &device_watch, &pair_info).await.is_err() {
+                        if on_frame(frame_type, &payload, &mut framed, &cmd_tx, &device_watch, &merged_watch, &pair_info).await.is_err() {
                             break;
                         }
                     }
@@ -149,7 +152,29 @@ async fn handle_ipc_connection(
                 }
             }
 
+            // ── 合并设备列表变更事件 ──
+            _ = merged_watch.changed() => {
+                let devices = merged_watch.borrow().clone();
+                let event = Event::DeviceUpdated { data: devices };
+                if let Ok(payload) = serde_json::to_vec(&event) {
+                    if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
+                        break;
+                    }
+                }
+            }
 
+            // ── adb 原始设备列表变更事件 ──
+            _ = device_watch.changed() => {
+                let devices: Vec<Device> = device_watch.borrow().values().cloned().collect();
+                let event = Event::AdbUpdated { data: devices };
+                if let Ok(payload) = serde_json::to_vec(&event) {
+                    if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // ── session 列表变更事件 ──
             // ── session 列表变更事件 ──
             _ = session_watch.changed() => {
                 let sessions = session_watch.borrow().clone();
@@ -221,6 +246,7 @@ async fn on_frame(
     framed: &mut Framed<TcpStream, FrameCodec>,
     cmd_tx: &mpsc::Sender<Command>,
     device_watch: &watch::Receiver<HashMap<String, Device>>,
+    merged_watch: &watch::Receiver<Vec<Device>>,
     pair_info: &WirelessPairing,
 ) -> Result<(), ()> {
     match frame_type {
@@ -229,7 +255,7 @@ async fn on_frame(
                 eprintln!("IPC: JSON-RPC 解析失败: {}", e);
             })?;
 
-            let response = dispatch_request(&req, cmd_tx, device_watch, pair_info).await;
+            let response = dispatch_request(&req, cmd_tx, device_watch, merged_watch, pair_info).await;
 
             let payload = serde_json::to_vec(&response).map_err(|e| {
                 eprintln!("IPC: 序列化响应失败: {}", e);
@@ -258,11 +284,18 @@ async fn dispatch_request(
     req: &JsonRpcRequest,
     cmd_tx: &mpsc::Sender<Command>,
     device_watch: &watch::Receiver<HashMap<String, Device>>,
+    merged_watch: &watch::Receiver<Vec<Device>>,
     pair_info: &WirelessPairing,
 ) -> JsonRpcResponse {
     match req.method.as_str() {
-        // 获取设备列表
+        // 获取合并后设备列表（含 uuid/name/identity，UI 设备卡片用）
         "device.list" => {
+            let devices: Vec<Device> = merged_watch.borrow().clone();
+            make_result(req.id, serde_json::to_value(&devices).unwrap_or_default())
+        }
+
+        // 获取 adb 原始设备列表（含 Offline/Unauthorized，UI "ADB 连接" 页面用）
+        "device.adb_list" => {
             let devices: Vec<Device> = device_watch.borrow().values().cloned().collect();
             make_result(req.id, serde_json::to_value(&devices).unwrap_or_default())
         }
@@ -470,6 +503,7 @@ mod tests {
     async fn dispatch_session_retry() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
         let pair_info = WirelessPairing::new();
 
         let req = JsonRpcRequest {
@@ -477,7 +511,7 @@ mod tests {
             method: "session.retry".into(),
             params: serde_json::json!({"uuid": "11111111-2222-3333-4444-555555555555"}),
         };
-        let resp = dispatch_request(&req, &cmd_tx, &device_watch, &pair_info).await;
+        let resp = dispatch_request(&req, &cmd_tx, &device_watch, &merged_watch, &pair_info).await;
         assert!(resp.error.is_none(), "retry 应成功: {:?}", resp.error);
         assert_eq!(resp.id, 42);
 
@@ -495,7 +529,7 @@ mod tests {
             method: "session.retry".into(),
             params: serde_json::json!({"uuid": "not-a-uuid"}),
         };
-        let resp = dispatch_request(&bad, &cmd_tx, &device_watch, &pair_info).await;
+        let resp = dispatch_request(&bad, &cmd_tx, &device_watch, &merged_watch, &pair_info).await;
         assert!(resp.error.is_some(), "非法 uuid 应报错");
         assert_eq!(resp.id, 43);
     }
@@ -510,7 +544,8 @@ mod tests {
         // 构造最小 dispatch 通道
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
-        let (_session_tx, session_watch) = watch::channel(Vec::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::<SessionSummary>::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, notif_rx) = broadcast::channel(64);
 
@@ -522,6 +557,7 @@ mod tests {
                 stream,
                 _cmd_tx,
                 device_watch,
+                merged_watch,
                 session_watch,
                 clip_sub,
                 notif_rx,
@@ -561,7 +597,8 @@ mod tests {
         let token = CancellationToken::new();
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
-        let (_session_tx, session_watch) = watch::channel(Vec::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::<SessionSummary>::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
@@ -570,6 +607,7 @@ mod tests {
             token.clone(),
             _cmd_tx,
             device_watch,
+            merged_watch,
             session_watch,
             clip_tx,
             notif_tx,
@@ -584,7 +622,8 @@ mod tests {
         let token = CancellationToken::new();
         let (_cmd_tx, _cmd_rx) = mpsc::channel(32);
         let (_dev_tx, device_watch) = watch::channel(HashMap::new());
-        let (_session_tx, session_watch) = watch::channel(Vec::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let (_session_tx, session_watch) = watch::channel(Vec::<SessionSummary>::new());
         let (clip_tx, _) = broadcast::channel(64);
         let (notif_tx, _) = broadcast::channel(64);
 
@@ -593,6 +632,7 @@ mod tests {
             token.clone(),
             _cmd_tx,
             device_watch,
+            merged_watch,
             session_watch,
             clip_tx,
             notif_tx,

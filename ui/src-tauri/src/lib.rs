@@ -38,6 +38,13 @@ struct DeviceInfo {
     name: String,
 }
 
+/// adb 原始设备列表条目（"ADB 连接" 页面，含 Offline/Unauthorized）
+#[derive(Clone, serde::Serialize)]
+struct AdbDeviceInfo {
+    serial: String,
+    state: String,
+}
+
 // ── Commands ──
 
 #[tauri::command]
@@ -112,6 +119,21 @@ async fn ipc_request(
     async fn retry_session(state: State<'_, AppState>, uuid: String) -> Result<(), String> {
         ipc_request(&state, "session.retry", serde_json::json!({ "uuid": uuid })).await?;
         Ok(())
+    }
+
+    /// adb 原始设备列表（含 Offline/Unauthorized）
+    #[tauri::command]
+    async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo>, String> {
+        let result = ipc_request(&state, "device.adb_list", serde_json::json!({})).await?;
+        let devices: Vec<sync_core::types::Device> =
+            serde_json::from_value(result).map_err(|e| e.to_string())?;
+        Ok(devices
+            .iter()
+            .map(|d| AdbDeviceInfo {
+                serial: d.serial.clone(),
+                state: format!("{:?}", d.state),
+            })
+            .collect())
     }
 // ── IPC Client ──
 
@@ -207,6 +229,24 @@ async fn connect_daemon(app: AppHandle) {
                                                 *st.devices.lock() = infos.clone();
                                             }
                                             let _ = app.emit("devices-updated", &infos);
+                                        }
+                                    }
+                                }
+                                Some("adb.updated") => {
+                                    if let Some(devices_val) = val.get("data") {
+                                        if let Ok(devices) =
+                                            serde_json::from_value::<Vec<sync_core::types::Device>>(
+                                                devices_val.clone(),
+                                            )
+                                        {
+                                            let infos: Vec<AdbDeviceInfo> = devices
+                                                .iter()
+                                                .map(|d| AdbDeviceInfo {
+                                                    serial: d.serial.clone(),
+                                                    state: format!("{:?}", d.state),
+                                                })
+                                                .collect();
+                                            let _ = app.emit("adb-updated", &infos);
                                         }
                                     }
                                 }
@@ -336,6 +376,7 @@ pub fn run() {
             get_pairing_info,
             update_session_config,
             retry_session,
+            get_adb_devices,
         ])
         .setup(|app| {
             let h = app.handle().clone();

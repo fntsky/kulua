@@ -88,6 +88,8 @@ pub struct JsonRpcError {
 pub enum Event {
     #[serde(rename = "device.updated")]
     DeviceUpdated { data: Vec<crate::types::Device> },
+    #[serde(rename = "adb.updated")]
+    AdbUpdated { data: Vec<crate::types::Device> },
     #[serde(rename = "session.updated")]
     SessionUpdated { data: SessionListData },
     #[serde(rename = "clipboard.changed")]
