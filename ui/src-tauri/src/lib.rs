@@ -106,6 +106,13 @@ async fn ipc_request(
         ).await?;
         Ok(())
     }
+
+    /// 重试 failed 墓碑 session
+    #[tauri::command]
+    async fn retry_session(state: State<'_, AppState>, uuid: String) -> Result<(), String> {
+        ipc_request(&state, "session.retry", serde_json::json!({ "uuid": uuid })).await?;
+        Ok(())
+    }
 // ── IPC Client ──
 
 async fn connect_daemon(app: AppHandle) {
@@ -328,6 +335,7 @@ pub fn run() {
             get_connection_status,
             get_pairing_info,
             update_session_config,
+            retry_session,
         ])
         .setup(|app| {
             let h = app.handle().clone();

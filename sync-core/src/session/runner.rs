@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -10,7 +10,9 @@ use crate::notification::{self, NotifInfo};
 use crate::scrcpy;
 use crate::types::Device;
 
+use super::handle::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_RUNNING};
 use super::proto::{audio_codec_name, build_clipboard_frame, read_device_message};
+use crate::audio_player::AUDIO_BUFFER_MAX_MS;
 
 /// 单个设备的完整 session。
 ///
@@ -31,6 +33,10 @@ pub struct Session {
     audio_enabled: Arc<AtomicBool>,
     /// 音量百分比（0-100）
     volume: Arc<AtomicU16>,
+    /// session 生命周期状态（与 Handle 共享，阶段边界写入）
+    session_state: Arc<AtomicU8>,
+    /// 音频缓冲延迟（ms），audio_task 写，Core 读推 UI
+    audio_latency: Arc<AtomicU64>,
     device_name_tx: Option<mpsc::Sender<(String, String)>>,
 }
 impl Session {
@@ -48,7 +54,10 @@ impl Session {
         audio_enabled: Arc<AtomicBool>,
         volume: Arc<AtomicU16>,
         device_name_tx: mpsc::Sender<(String, String)>,
+        session_state: Arc<AtomicU8>,
+        audio_latency: Arc<AtomicU64>,
     ) -> Self {
+        session_state.store(SESSION_STATE_CONNECTING, Ordering::SeqCst);
         Self {
             adb,
             device,
@@ -62,6 +71,8 @@ impl Session {
             notification_enabled,
             audio_enabled,
             volume,
+            session_state,
+            audio_latency,
             device_name_tx: Some(device_name_tx),
         }
     }
@@ -91,11 +102,13 @@ impl Session {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 eprintln!("scrcpy deploy failed for {}: {:?}", self.device.serial, e);
-                self.run_notification_only(stop_rx).await;
+                // 判死：不再降级 notification-only（见 docs/session-state-design.md）
+                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 return;
             }
             Err(e) => {
                 eprintln!("spawn_blocking panic: {}", e);
+                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 return;
             }
         };
@@ -154,6 +167,7 @@ impl Session {
                 "failed to read audio codec header from {}",
                 self.device.serial
             );
+            self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
             server.stop(self.adb.as_ref());
             return;
         }
@@ -162,6 +176,7 @@ impl Session {
             println!("Audio stream disabled by device, continuing without audio");
         } else if codec_id == 1 {
             eprintln!("Audio stream configuration error on {}", self.device.serial);
+            self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
             server.stop(self.adb.as_ref());
             return;
         } else {
@@ -171,6 +186,8 @@ impl Session {
                 codec_name, codec_id, self.device.serial
             );
         }
+        // 握手完成（双 socket + 设备名 + codec header）→ running
+        self.session_state.store(SESSION_STATE_RUNNING, Ordering::SeqCst);
         // 4. 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
         notification::spawn_notification_poller_tokio(
@@ -208,6 +225,7 @@ impl Session {
             // OPUS → 解码播放
             let serial = self.device.serial.clone();
             let volume = self.volume.clone();
+            let latency = self.audio_latency.clone();
             Some(tokio::spawn(async move {
                 let mut player = match crate::audio_player::AudioPlayer::new() {
                     Ok(p) => p,
@@ -220,6 +238,7 @@ impl Session {
                 player.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
 
                 let mut last_vol = volume.load(Ordering::Relaxed);
+                let mut log_timer = tokio::time::Instant::now();
                 loop {
                     // 同步音量变更
                     let cur = volume.load(Ordering::Relaxed);
@@ -257,9 +276,26 @@ impl Session {
 
                     if (pts_raw >> 62) & 1 == 0 {
                         // 正常音频帧 → 解码播放
+                        // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
+                        if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
+                            eprintln!(
+                                "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
+                                player.buffer_ms()
+                            );
+                            player.clear();
+                        }
                         if let Err(e) = player.feed_frame(&frame_data) {
                             eprintln!("[audio] opus decode error on {serial}: {e}");
+                        } else {
+                            // 上报播放队列积压（缓冲延迟，ms）
+                            latency.store(player.buffer_ms(), Ordering::Relaxed);
                         }
+                    }
+
+                    // 诊断打点：每 5s 打印一次缓冲延迟
+                    if log_timer.elapsed() >= Duration::from_secs(5) {
+                        eprintln!("[audio] {serial} buffer: {} ms", player.buffer_ms());
+                        log_timer = tokio::time::Instant::now();
                     }
                 }
             }))
@@ -315,6 +351,8 @@ impl Session {
         stop_rx: &mut oneshot::Receiver<()>,
         read_dummy: bool,
     ) -> Option<TcpStream> {
+        // 最多重试 20 次（500ms 间隔 = 10s），超时判死写 failed（docs/session-state-design.md §3.3）
+        let mut attempts: u8 = 0;
         loop {
             match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
                 Ok(mut s) => {
@@ -340,6 +378,16 @@ impl Session {
                     }
                 }
                 Err(_) => {}
+            }
+            attempts += 1;
+            if attempts >= 20 {
+                eprintln!(
+                    "[{}] connect timeout after {} attempts (10s), giving up",
+                    self.device.serial, attempts
+                );
+                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                server.stop(self.adb.as_ref());
+                return None;
             }
             // 连接失败或 dummy 读失败，等 500ms 或 stop 信号
             tokio::select! {
@@ -429,6 +477,8 @@ impl Session {
             Some(s) => s,
             None => return,
         };
+        // 握手成功（dummy byte 就绪）→ running
+        self.session_state.store(SESSION_STATE_RUNNING, Ordering::SeqCst);
 
         // 读设备名
         let mut name_buf = [0u8; 64];
@@ -459,19 +509,5 @@ impl Session {
 
         notif_stop.store(true, Ordering::SeqCst);
         server.stop(self.adb.as_ref());
-    }
-
-    /// 剪贴板服务不可用时仅启动通知轮询。
-    async fn run_notification_only(&mut self, stop_rx: oneshot::Receiver<()>) {
-        let stop = Arc::new(AtomicBool::new(false));
-        notification::spawn_notification_poller_tokio(
-            self.adb.clone(),
-            self.device.clone(),
-            self.notif_tx.clone(),
-            stop.clone(),
-            self.notification_enabled.clone(),
-        );
-        let _ = stop_rx.await;
-        stop.store(true, Ordering::SeqCst);
     }
 }

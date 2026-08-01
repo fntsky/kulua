@@ -116,6 +116,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 | `device.connect` | Request | 发起 adb connect |
 | `device.disconnect` | Request | 断开设备连接 |
 | `session.update` | Request | 更新 session 配置（按 uuid 标识设备） |
+| `session.retry` | Request | 重试 failed 状态的 session（按 uuid 标识设备） |
 | `clipboard.get` | Request | 读取 PC 端剪贴板 |
 | `pairing.info` | Request | 获取配对二维码信息 |
 
@@ -124,7 +125,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 | Event | Payload | Description |
 |-------|---------|-------------|
 | `device.updated` | `Vec<Device>` | 设备列表变更 |
-| `session.updated` | `SessionListData` | Session 状态/配置变更（含 uuid / clipboard_sync / notification_sync / audio_enabled） |
+| `session.updated` | `SessionListData` | Session 状态/配置变更（含 uuid / session_state / clipboard_sync / notification_sync / audio_enabled / audio_buffer_ms） |
 | `clipboard.changed` | `ClipboardData` | 剪贴板变更 |
 | `notification` | `NotifData` | 手机通知推送 |
 
@@ -207,6 +208,8 @@ sync-workspace/
 - ✅ Tauri v2 GUI（设备列表、连接管理、配置开关）
 - ✅ UUID 主键设备索引（多地址自动合并）
 - ✅ Session 配置（每设备独立开关，IPC 实时同步 UI）
+- ✅ Session 状态机（connecting/running/failed 反馈 UI，failed 可重试）
+- ✅ 音频缓冲延迟显示（audio_buffer_ms，UI 显示播放队列积压 ms）
 - ✅ pending_serials 环（自动重试，失败 5 次丢弃）
 - ⏳ 音频转发（实验性，支持 Opus 解码 + rodio 播放）
 

@@ -108,6 +108,8 @@ pub struct SessionSummary {
     pub name: String,
     /// ADB 连接状态
     pub state: String,
+    /// session 生命周期状态: "connecting" | "running" | "failed" | "stopped"
+    pub session_state: String,
     /// 剪贴板同步
     pub clipboard_sync: bool,
     /// 通知同步
@@ -116,6 +118,8 @@ pub struct SessionSummary {
     pub audio_enabled: bool,
     /// 音量百分比（0-100）
     pub volume: u16,
+    /// 音频播放队列缓冲延迟（ms），0 = 无音频/未播放
+    pub audio_buffer_ms: u64,
 }
 
 /// `session.updated` 事件的载荷。

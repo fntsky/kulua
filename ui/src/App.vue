@@ -36,6 +36,16 @@ const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
 const qrCanvas = ref<HTMLCanvasElement | null>(null);
 const deviceConfigs = ref<Record<string, DeviceConfig>>({});
+// session 生命周期状态（来自 sessions-updated，按 uuid）
+const sessionStates = ref<Record<string, string>>({});
+// 音频缓冲延迟 ms（来自 sessions-updated，按 uuid）
+const audioBuffers = ref<Record<string, number>>({});
+const sessionStateText: Record<string, string> = {
+  connecting: "连接中",
+  running: "运行中",
+  failed: "连接失败",
+  stopped: "已停止",
+};
 function getDeviceConfig(uuid: string): DeviceConfig {
   if (!deviceConfigs.value[uuid]) {
     deviceConfigs.value[uuid] = {
@@ -111,6 +121,14 @@ async function setVolume(uuid: string, volume: number) {
     console.error("setVolume failed:", e);
   }
 }
+
+async function retrySession(uuid: string) {
+  try {
+    await invoke("retry_session", { uuid });
+  } catch (e) {
+    console.error("retrySession failed:", e);
+  }
+}
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
   connected.value = conn;
   devices.value = devs;
@@ -168,7 +186,10 @@ onMounted(async () => {
   listen<PairingInfo>("pairing-info-updated", (e) => {
     renderQR(e.payload);
   });
-  listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; volume: number }> }>("sessions-updated", (e) => {
+  listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; volume: number; session_state: string; audio_buffer_ms: number }> }>("sessions-updated", (e) => {
+    // 全量推送：同步重建状态表（列表外的 uuid 状态清除）
+    const next: Record<string, string> = {};
+    const nextBuffers: Record<string, number> = {};
     for (const s of e.payload.sessions) {
       deviceConfigs.value[s.uuid] = {
         clipboardSync: s.clipboard_sync,
@@ -176,7 +197,11 @@ onMounted(async () => {
         audioSync: s.audio_enabled,
         volume: s.volume,
       };
+      next[s.uuid] = s.session_state;
+      nextBuffers[s.uuid] = s.audio_buffer_ms;
     }
+    sessionStates.value = next;
+    audioBuffers.value = nextBuffers;
   });
 
   // load existing state
@@ -206,7 +231,12 @@ onMounted(async () => {
               <span class="device-name">{{ d.name || d.serial }}</span>
               <span class="serial">{{ d.serial }}</span>
             </div>
-            <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
+            <div class="device-states">
+              <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
+              <span v-if="sessionStates[d.uuid]" class="session-state" :class="'session-' + sessionStates[d.uuid]">
+                {{ sessionStateText[sessionStates[d.uuid]] || sessionStates[d.uuid] }}
+              </span>
+            </div>
           </div>
           <div class="device-toggles">
             <div class="toggle-row" @click="toggleClipboardSync(d.uuid)">
@@ -220,6 +250,14 @@ onMounted(async () => {
             <div class="toggle-row" @click="toggleAudioSync(d.uuid)">
               <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).audioSync }" />
               <span class="toggle-label">音频</span>
+              <span
+                v-if="getDeviceConfig(d.uuid).audioSync && audioBuffers[d.uuid] > 0"
+                class="audio-latency"
+                :class="{ high: audioBuffers[d.uuid] >= 200 }"
+                :title="'播放队列积压 ' + audioBuffers[d.uuid] + 'ms（延迟高时优先检查此项）'"
+              >
+                缓冲 {{ audioBuffers[d.uuid] }}ms
+              </span>
             </div>
             <div class="toggle-row" style="gap:4px">
               <input
@@ -231,6 +269,9 @@ onMounted(async () => {
               />
               <span class="toggle-label">{{ getDeviceConfig(d.uuid).volume }}</span>
             </div>
+          </div>
+          <div v-if="sessionStates[d.uuid] === 'failed'" class="retry-row">
+            <button class="retry-btn" @click="retrySession(d.uuid)">重试</button>
           </div>
         </div>
       </div>
@@ -378,6 +419,30 @@ body {
 .device-header {
   display: flex; align-items: center; justify-content: space-between;
 }
+.device-states {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+}
+.session-state {
+  font-size: 11px; color: var(--dim); font-weight: 500;
+}
+.session-connecting { color: #f0c040; }
+.session-running { color: var(--green); }
+.session-failed { color: var(--red); }
+.audio-latency {
+  font-size: 11px; color: var(--dim); font-weight: 500;
+}
+.audio-latency.high {
+  color: var(--red);
+}
+.retry-row {
+  display: flex; justify-content: flex-end;
+}
+.retry-btn {
+  background: var(--red); color: #fff;
+  border: none; border-radius: 4px;
+  padding: 4px 14px; font-size: 12px; cursor: pointer;
+}
+.retry-btn:hover { opacity: 0.85; }
 .device-toggles {
   display: flex; align-items: center; gap: 16px; padding-top: 4px;
   border-top: 1px solid var(--border);

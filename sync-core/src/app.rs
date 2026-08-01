@@ -2,20 +2,24 @@ use crate::adb_cmd::{AdbCmd, AdbOps};
 use crate::ipc::types::SessionSummary;
 use crate::notification::{self, NotifInfo};
 use crate::session;
+use crate::session::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_STOPPED};
 use crate::types::{Device, DeviceAddrKind, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub enum Command {
     Connect(String),
     Disconnect(String),
+    /// 重试 failed 墓碑 session（UI 重试按钮）
+    Retry(Uuid),
     UpdateConfig {
         uuid: Uuid,
         clipboard_sync: bool,
@@ -226,6 +230,7 @@ impl Core {
                     }
                     self.try_connect_pending(&from_track);
                     self.sync_device_watch();
+                    self.check_dead_sessions();
                     self.sync_sessions(&from_track).await;
                     self.push_session_list();
                 }
@@ -401,6 +406,32 @@ impl Core {
                 self.pending_serials.retain(|e| e.addr != serial);
                 // 放弃 Disconnect 中对 session_configs 的清理（config 随 DeviceEntry 保留）
                 }
+            Command::Retry(uuid) => {
+                // 仅 failed 墓碑可重试；活跃 session / 无墓碑 → no-op
+                let has_tombstone = self.devices.get(&uuid).is_some_and(|entry| {
+                    entry.session.as_ref().is_some_and(|h| h.is_failed())
+                });
+                if !has_tombstone {
+                    return;
+                }
+                // 拔墓碑（task 已结束，stop 立即返回并清理 adb forward）
+                let (mut handle, device) = match self.devices.get_mut(&uuid).map(|entry| {
+                    (entry.session.take(), entry.device.clone())
+                }) {
+                    Some((Some(h), d)) => (h, d),
+                    _ => return,
+                };
+                handle.stop(self.adb_cmd.as_ref()).await;
+                // 设备已不在 adb 列表 → 等重连后 sync_sessions 自动恢复
+                let online = self
+                    .device_watch
+                    .borrow()
+                    .get(&device.serial)
+                    .is_some_and(|d| d.state == DeviceState::Device);
+                if online {
+                    self.start_session(device).await;
+                }
+            }
             Command::UpdateConfig {
                 uuid,
                 clipboard_sync,
@@ -584,6 +615,21 @@ impl Core {
         }
     }
 
+    /// 检测 session task 异常结束（server 崩溃/panic）→ 强制写 failed 墓碑。
+    ///
+    /// 墓碑占着 `entry.session` 位：push_session_list 推送继续包含它（UI 可见 failed + 重试按钮），
+    /// sync_sessions 因 `session.is_some()` 不自动重启（重启闸门，防崩溃风暴）。
+    /// 正常停止由 Core 主动 take handle 触发，不会出现在这里；故 is_finished 且非 stopped 必为异常结束。
+    fn check_dead_sessions(&mut self) {
+        for (_, entry) in self.devices.iter_mut() {
+            if let Some(handle) = &entry.session {
+                if handle.task.is_finished() && handle.state() != SESSION_STATE_STOPPED {
+                    handle.set_state(SESSION_STATE_FAILED);
+                }
+            }
+        }
+    }
+
     /// 推送当前 session 列表到 `session_tx`，IPC 会将其转发给 UI。
     fn push_session_list(&self) {
         use std::sync::atomic::Ordering;
@@ -597,6 +643,8 @@ impl Core {
                     serial: entry.device.serial.clone(),
                     name: entry.device.name.clone(),
                     state: format!("{:?}", entry.device.state),
+                    session_state: handle.state_str().to_string(),
+                    audio_buffer_ms: handle.audio_latency.load(Ordering::SeqCst),
                     clipboard_sync: entry.config.clipboard_sync,
                     notification_sync: entry.config.notification_sync,
                     audio_enabled: handle.audio_enabled.load(Ordering::SeqCst),
@@ -641,6 +689,10 @@ impl Core {
         let notification_enabled = Arc::new(AtomicBool::new(cfg.notification_sync));
         let audio_enabled = Arc::new(AtomicBool::new(cfg.audio_enabled));
         let volume = Arc::new(AtomicU16::new(cfg.volume));
+        // 生命周期状态：session 与 Handle 共享，阶段边界写入（docs/session-state-design.md）
+        let session_state = Arc::new(AtomicU8::new(SESSION_STATE_CONNECTING));
+        // 音频缓冲延迟（ms）：audio_task 写，Core tick 读推 UI
+        let audio_latency = Arc::new(AtomicU64::new(0));
 
         let mut sess = session::Session::new(
             adb,
@@ -656,6 +708,8 @@ impl Core {
             audio_enabled.clone(),
             volume.clone(),
             self.device_name_tx.clone(),
+            session_state.clone(),
+            audio_latency.clone(),
         );
 
         let task = tokio::spawn(async move { sess.run().await });
@@ -669,6 +723,8 @@ impl Core {
             notification_enabled,
             audio_enabled,
             volume,
+            session_state,
+            audio_latency,
         };
 
         let uuid = handle.device.uuid;

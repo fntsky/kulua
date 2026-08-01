@@ -26,11 +26,15 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    /// 绑定回环地址 + 随机端口，写入端口文件。
+    /// 绑定回环地址 + 随机端口，写入默认端口文件（`%TEMP%/sync-daemon.port`）。
     pub async fn bind() -> Result<Self, io::Error> {
+        Self::bind_with_port_file(std::env::temp_dir().join("sync-daemon.port")).await
+    }
+
+    /// 绑定回环地址 + 随机端口，写入指定端口文件（测试隔离用）。
+    pub(crate) async fn bind_with_port_file(port_file: PathBuf) -> Result<Self, io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let port_file = std::env::temp_dir().join("sync-daemon.port");
 
         tokio::fs::write(&port_file, port.to_string()).await?;
         println!("IPC 服务端监听 127.0.0.1:{}", port);
@@ -378,6 +382,27 @@ async fn dispatch_request(
             }
         }
 
+        // 重试 failed 墓碑 session（UI 重试按钮）
+        "session.retry" => {
+            let uuid = req
+                .params
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if uuid.is_empty() {
+                return make_error(req.id, -1, "缺少 uuid 参数");
+            }
+            match uuid.parse::<uuid::Uuid>() {
+                Ok(parsed) => {
+                    if cmd_tx.send(Command::Retry(parsed)).await.is_err() {
+                        return make_error(req.id, -1, "core 正在关闭");
+                    }
+                    make_result(req.id, serde_json::Value::Null)
+                }
+                Err(_) => make_error(req.id, -1, "无效 uuid 格式"),
+            }
+        }
+
         // 未知方法
         _ => make_error(req.id, -1, &format!("未知方法: {}", req.method)),
     }
@@ -414,10 +439,11 @@ mod tests {
 
     #[tokio::test]
     async fn port_file_lifecycle() {
-        let port_file = std::env::temp_dir().join("sync-daemon.port");
+        // 唯一端口文件，避免与其他并行测试的 bind 竞争同一路径
+        let port_file = std::env::temp_dir().join(format!("sync-daemon-test-{}.port", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&port_file);
 
-        let server = IpcServer::bind().await.unwrap();
+        let server = IpcServer::bind_with_port_file(port_file.clone()).await.unwrap();
         assert!(server.port > 0);
         assert!(port_file.exists(), "bind 后端口文件应存在");
 
@@ -437,6 +463,41 @@ mod tests {
             client.peer_addr().unwrap(),
             server_stream.local_addr().unwrap(),
         );
+    }
+
+    /// session.retry：合法 uuid → Command::Retry 入队 + result null；非法 uuid → error
+    #[tokio::test]
+    async fn dispatch_session_retry() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let pair_info = WirelessPairing::new();
+
+        let req = JsonRpcRequest {
+            id: 42,
+            method: "session.retry".into(),
+            params: serde_json::json!({"uuid": "11111111-2222-3333-4444-555555555555"}),
+        };
+        let resp = dispatch_request(&req, &cmd_tx, &device_watch, &pair_info).await;
+        assert!(resp.error.is_none(), "retry 应成功: {:?}", resp.error);
+        assert_eq!(resp.id, 42);
+
+        match cmd_rx.try_recv() {
+            Ok(Command::Retry(uuid)) => assert_eq!(
+                uuid,
+                uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()
+            ),
+            other => panic!("expected Command::Retry, got {:?}", other),
+        }
+
+        // 非法 uuid → error
+        let bad = JsonRpcRequest {
+            id: 43,
+            method: "session.retry".into(),
+            params: serde_json::json!({"uuid": "not-a-uuid"}),
+        };
+        let resp = dispatch_request(&bad, &cmd_tx, &device_watch, &pair_info).await;
+        assert!(resp.error.is_some(), "非法 uuid 应报错");
+        assert_eq!(resp.id, 43);
     }
 
     /// 发送一个正确的 JSON-RPC 请求帧，验证能收到 Response 帧
