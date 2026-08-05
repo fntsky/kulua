@@ -449,6 +449,8 @@ impl Core {
                 audio_sync,
                 volume,
             } => {
+                // 音频开关变更需要重启 session（redeploy scrcpy），待重启设备先记录
+                let mut restart_device = None;
                 // 更新配置
                 if let Some(entry) = self.devices.get_mut(&uuid) {
                     let prev_audio = entry.config.audio_enabled;
@@ -469,20 +471,16 @@ impl Core {
                             .store(notification_sync, Ordering::SeqCst);
                         // 音量实时生效（无需重启 session）
                         handle.volume.store(volume, Ordering::Relaxed);
+                        // 音频必须以旧值判断是否变化：若先 store 再比较，自比恒等，重启永不触发
                         if prev_audio != audio_sync {
                             handle.audio_enabled.store(audio_sync, Ordering::SeqCst);
+                            restart_device = Some(entry.device.clone());
                         }
                     }
                 }
 
-                // 音频开关变更需要重启 session
-                let need_restart = self.devices.get(&uuid).is_some_and(|entry| {
-                    entry.session.as_ref().is_some_and(|h| {
-                        h.audio_enabled.load(Ordering::SeqCst) != audio_sync
-                    })
-                });
-                if need_restart {
-                    let device = self.devices.get(&uuid).unwrap().device.clone();
+                // 音频开关变更 → 停旧 session，用新参数 redeploy（仅在有活跃 session 时）
+                if let Some(device) = restart_device {
                     if let Some(mut handle) = self.devices.get_mut(&uuid).unwrap().session.take() {
                         handle.stop(self.adb_cmd.as_ref()).await;
                     }
@@ -891,5 +889,143 @@ mod tests {
         core.try_connect_pending(&devices);
         // pending_serials 应被清空（设备已连上，地址匹配）
         assert!(core.pending_serials.is_empty());
+    }
+
+    /// 测试夹具：插入一台设备 + 一个“运行中”的音频 session（audio=true，port 用哨兵值 9999）。
+    /// 返回 (core, uuid, stop_rx, audio_enabled)，stop_rx 用于观察旧 session 是否被 stop。
+    fn core_with_running_audio_session(
+    ) -> (Core, Uuid, oneshot::Receiver<()>, Arc<AtomicBool>) {
+        let (phone_clip_tx, _) = mpsc::channel(256);
+        let (notif_tx, _) = mpsc::channel(64);
+        let (clip_tx, _) = broadcast::channel(64);
+        let (_device_tx, device_watch) = watch::channel(HashMap::new());
+        let (_mdns_tx, mdns_rx) = mpsc::channel(16);
+        let (_session_tx, session_watch) = watch::channel(Vec::new());
+        let (session_tx, _) = watch::channel(Vec::new());
+
+        let mut core = Core {
+            adb_cmd: Arc::new(crate::adb_cmd::mock::MockAdb::new()),
+            jar_path: "test".into(),
+            pair_info: wireless_pair::WirelessPairing::new(),
+            _mdns_handle: wireless_pair::MdnsHandle::empty(),
+            _refresh_handle: true,
+            mdns_rx,
+            device_watch,
+            clip_broadcast: clip_tx,
+            phone_clip_rx: mpsc::channel(256).1,
+            phone_clip_tx,
+            notif_rx: mpsc::channel(64).1,
+            notif_tx,
+            notif_broadcast: broadcast::channel(64).0,
+            cmd_tx: mpsc::channel(32).0,
+            cmd_rx: Some(mpsc::channel(32).1),
+            devices: HashMap::new(),
+            pending_serials: VecDeque::new(),
+            port_counter: 27183,
+            token: CancellationToken::new(),
+            device_name_rx: mpsc::channel::<(String, String)>(32).1,
+            device_name_tx: mpsc::channel::<(String, String)>(32).0,
+            session_tx,
+            clipboard_last_seen: None,
+            session_watch,
+            merged_tx: watch::channel(Vec::new()).0,
+            merged_watch: watch::channel(Vec::new()).1,
+            last_received_from_phone: None,
+            last_clipboard_error_print: Instant::now(),
+        };
+
+        let uuid = Uuid::new_v4();
+        let device = Device {
+            uuid,
+            id: "R58N1234567".into(),
+            serial: "192.168.1.100:5555".into(),
+            state: DeviceState::Device,
+            name: String::new(),
+            identity: DeviceIdentity::default(),
+        };
+        let audio_enabled = Arc::new(AtomicBool::new(true));
+        // stop_tx 留在假 handle 中：stop 被调用时会 send，测试通过 stop_rx 观察
+        let (stop_tx, stop_rx) = oneshot::channel();
+        core.devices.insert(
+            uuid,
+            DeviceEntry {
+                device: device.clone(),
+                session: Some(session::Handle {
+                    device,
+                    port: 9999, // 哨兵值：区别于 start_session 分配的 27183
+                    stop_tx: Some(stop_tx),
+                    task: tokio::spawn(async {}),
+                    clipboard_enabled: Arc::new(AtomicBool::new(true)),
+                    notification_enabled: Arc::new(AtomicBool::new(true)),
+                    audio_enabled: audio_enabled.clone(),
+                    volume: Arc::new(AtomicU16::new(80)),
+                    session_state: Arc::new(AtomicU8::new(
+                        crate::session::SESSION_STATE_RUNNING,
+                    )),
+                    audio_latency: Arc::new(AtomicU64::new(0)),
+                }),
+                config: session::SessionConfig {
+                    clipboard_sync: true,
+                    notification_sync: true,
+                    audio_enabled: true,
+                    volume: 80,
+                },
+            },
+        );
+        (core, uuid, stop_rx, audio_enabled)
+    }
+
+    #[tokio::test]
+    async fn test_update_config_audio_toggle_restarts_session() {
+        // 回归：音频开关变更必须 stop 旧 session 并 redeploy。
+        // 曾因 store 先于 need_restart 判断执行，重启永不触发（音频永远关不掉）。
+        let (mut core, uuid, mut stop_rx, _) = core_with_running_audio_session();
+
+        core.on_command(Command::UpdateConfig {
+            uuid,
+            clipboard_sync: true,
+            notification_sync: true,
+            audio_sync: false,
+            volume: 80,
+        })
+        .await;
+
+        // 旧 session 必须收到 stop 信号
+        assert!(stop_rx.try_recv().is_ok(), "音频关闭必须停止旧 session");
+        // 新 session 已部署（port = port_counter 分配），音频标志 = 新值
+        let entry = core.devices.get(&uuid).unwrap();
+        let new_handle = entry.session.as_ref().expect("重启后应有新 session");
+        assert_eq!(new_handle.port, 27183, "应重新部署 session");
+        assert!(!new_handle.audio_enabled.load(Ordering::SeqCst));
+        assert!(!entry.config.audio_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_update_config_audio_unchanged_keeps_session() {
+        // 对照：音频值未变 → 不得重启（否则音量/剪贴板调整都会误杀 session）
+        let (mut core, uuid, mut stop_rx, audio_enabled) = core_with_running_audio_session();
+
+        core.on_command(Command::UpdateConfig {
+            uuid,
+            clipboard_sync: false,
+            notification_sync: false,
+            audio_sync: true, // 与现有值相同
+            volume: 50,
+        })
+        .await;
+
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "音频值未变时不得重启 session"
+        );
+        let entry = core.devices.get(&uuid).unwrap();
+        let handle = entry.session.as_ref().unwrap();
+        assert_eq!(handle.port, 9999, "原 session 应保留");
+        // 同一个原子标志（handle 未被替换）
+        assert!(Arc::ptr_eq(&handle.audio_enabled, &audio_enabled));
+        // 配置照常更新（剪贴板/通知/音量变更仍生效）
+        assert!(!entry.config.clipboard_sync);
+        assert!(!entry.config.notification_sync);
+        assert_eq!(entry.config.volume, 50);
     }
 }

@@ -28,6 +28,29 @@ fn find_jar() -> Option<String> {
     }
     None
 }
+/// 查找并启动 sync-ui 桌面窗口（与 daemon.exe 同目录优先，调试构建回退到 target/debug）。
+fn launch_ui() {
+    let ui_name = if cfg!(target_os = "windows") {
+        "sync-ui.exe"
+    } else {
+        "sync-ui"
+    };
+    let ui_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(ui_name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(if cfg!(target_os = "windows") {
+                "../target/debug/sync-ui.exe"
+            } else {
+                "../target/debug/sync-ui"
+            })
+        });
+    match std::process::Command::new(&ui_path).spawn() {
+        Ok(_) => println!("sync-ui 已启动: {}", ui_path.display()),
+        Err(e) => eprintln!("启动 sync-ui 失败 ({}): {}", ui_path.display(), e),
+    }
+}
 fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
     use tray_icon::menu::{Menu, MenuItem, MenuEvent};
     use tray_icon::{TrayIconBuilder, Icon};
@@ -77,15 +100,7 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
                         if event.id() == quit_item.id() {
                             token.cancel();
                         } else if event.id() == open_item.id() {
-                            // Launch sync-ui window
-                            let ui_path = std::env::current_exe()
-                                .ok()
-                                .and_then(|p| p.parent().map(|d| d.join("sync-ui.exe")))
-                                .filter(|p| p.exists())
-                                .unwrap_or_else(|| {
-                                    std::path::PathBuf::from("../target/debug/sync-ui.exe")
-                                });
-                            let _ = std::process::Command::new(ui_path).spawn();
+                            launch_ui();
                         }
                     }
                 }
@@ -100,20 +115,7 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
                 if event.id() == quit_item.id() {
                     token.cancel();
                 } else if event.id() == open_item.id() {
-                    // Launch sync-ui window
-                    let ui_name = if cfg!(target_os = "windows") { "sync-ui.exe" } else { "sync-ui" };
-                    let ui_path = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|d| d.join(ui_name)))
-                        .filter(|p| p.exists())
-                        .unwrap_or_else(|| {
-                            std::path::PathBuf::from(if cfg!(target_os = "windows") {
-                                "../target/debug/sync-ui.exe"
-                            } else {
-                                "../target/debug/sync-ui"
-                            })
-                        });
-                    let _ = std::process::Command::new(ui_path).spawn();
+                    launch_ui();
                 }
             }
         }
@@ -157,6 +159,9 @@ async fn main() {
     })
     .expect("Error setting Ctrl+C handler");
     setup_tray_icon(token);
+
+    // 启动时自动打开 UI（UI 会轮询 %TEMP%/sync-daemon.port 等待 daemon 就绪）
+    launch_ui();
 
     core.run().await;
 }
