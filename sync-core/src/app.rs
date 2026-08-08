@@ -20,6 +20,8 @@ pub enum Command {
     Disconnect(String),
     /// 重试 failed 墓碑 session（UI 重试按钮）
     Retry(Uuid),
+    /// 点击 ADB 列表设备建立 session（无活跃 session 时；failed 墓碑视为可重建）
+    StartSession(String),
     UpdateConfig {
         uuid: Uuid,
         clipboard_sync: bool,
@@ -241,7 +243,7 @@ impl Core {
                     self.try_connect_pending(&online);
                     self.push_merged_devices();
                     self.check_dead_sessions();
-                    self.sync_sessions(&online).await;
+                    self.stop_disconnected_sessions(&online).await;
                     self.push_session_list();
                 }
             }
@@ -432,7 +434,7 @@ impl Core {
                     _ => return,
                 };
                 handle.stop(self.adb_cmd.as_ref()).await;
-                // 设备已不在 adb 列表 → 等重连后 sync_sessions 自动恢复
+                // 设备已不在 adb 列表 → 等重连后由用户点击 ADB 列表重建
                 let online = self
                     .device_watch
                     .borrow()
@@ -441,6 +443,62 @@ impl Core {
                 if online {
                     self.start_session(device).await;
                 }
+            }
+            Command::StartSession(serial) => {
+                // 设备条目缺失（daemon 刚启动、索引未建）→ 按 adb 原始列表补录
+                if !self.devices.values().any(|e| {
+                    e.device.serial == serial
+                        || e.device.id == serial
+                        || e.device.identity.contains_addr(&serial)
+                }) {
+                    let state = self
+                        .device_watch
+                        .borrow()
+                        .get(&serial)
+                        .map(|d| d.state.clone())
+                        .unwrap_or(DeviceState::Offline);
+                    if state != DeviceState::Device {
+                        return;
+                    }
+                    self.insert_device(&serial, state);
+                }
+
+                let uuid = match self.devices.values().find(|e| {
+                    e.device.serial == serial
+                        || e.device.id == serial
+                        || e.device.identity.contains_addr(&serial)
+                }) {
+                    Some(entry) => entry.device.uuid,
+                    None => return,
+                };
+
+                // 已有活跃 session（connecting/running）→ no-op，维持“一设备一 session”
+                let has_active = self
+                    .devices
+                    .get(&uuid)
+                    .and_then(|e| e.session.as_ref())
+                    .is_some_and(|h| !h.is_failed());
+                if has_active {
+                    return;
+                }
+
+                // 仅 Device 状态可建会话
+                let device = match self.devices.get(&uuid) {
+                    Some(entry) if entry.device.state == DeviceState::Device => {
+                        entry.device.clone()
+                    }
+                    _ => return,
+                };
+
+                // failed 墓碑 → 拔掉重建（等价 UI 重试按钮）
+                if let Some(mut handle) = self
+                    .devices
+                    .get_mut(&uuid)
+                    .and_then(|e| e.session.take())
+                {
+                    handle.stop(self.adb_cmd.as_ref()).await;
+                }
+                self.start_session(device).await;
             }
             Command::UpdateConfig {
                 uuid,
@@ -568,38 +626,11 @@ impl Core {
         }
     }
 
-    async fn sync_sessions(&mut self, adb_devices: &HashMap<String, Device>) {
-        // 检查每个 device，按地址优先级（USB > mDNS > IP:port）启动 session
-        let mut pending: Vec<Uuid> = self
-            .devices
-            .iter()
-            .filter(|(_, entry)| entry.session.is_none())
-            .map(|(uuid, _)| *uuid)
-            .collect();
-        pending.sort_by_key(|uuid| {
-            let entry = self.devices.get(uuid).expect("uuid from iteration");
-            std::cmp::Reverse(DeviceAddrKind::classify(&entry.device.serial).priority())
-        });
-
-        for uuid in pending {
-            let device = match self.devices.get(&uuid) {
-                Some(entry) => entry.device.clone(),
-                None => continue,
-            };
-
-            // 仅在 adb 设备列表中且状态为 Device 时启动
-            if !adb_devices.contains_key(&device.serial) {
-                continue;
-            }
-            if let Some(adb_dev) = adb_devices.get(&device.serial) {
-                if adb_dev.state != DeviceState::Device {
-                    continue;
-                }
-            }
-
-            self.start_session(device).await;
-        }
-
+    /// 停止已断开设备的 session（每 tick 调用）。
+    ///
+    /// session 的建立改为显式操作：UI 在 ADB 列表点击设备 → Command::StartSession。
+    /// 此处只负责设备从 adb 列表消失（拔线/离线）时收尾。
+    async fn stop_disconnected_sessions(&mut self, adb_devices: &HashMap<String, Device>) {
         // 停止已断开设备的 session
         let to_stop: Vec<Uuid> = self
             .devices
@@ -626,7 +657,7 @@ impl Core {
     /// 检测 session task 异常结束（server 崩溃/panic）→ 强制写 failed 墓碑。
     ///
     /// 墓碑占着 `entry.session` 位：push_session_list 推送继续包含它（UI 可见 failed + 重试按钮），
-    /// sync_sessions 因 `session.is_some()` 不自动重启（重启闸门，防崩溃风暴）。
+    /// 不再自动重启（重启闸门，防崩溃风暴）；用户点击 ADB 列表或重试按钮时重建。
     /// 正常停止由 Core 主动 take handle 触发，不会出现在这里；故 is_finished 且非 stopped 必为异常结束。
     fn check_dead_sessions(&mut self) {
         for (_, entry) in self.devices.iter_mut() {
@@ -1027,5 +1058,170 @@ mod tests {
         assert!(!entry.config.clipboard_sync);
         assert!(!entry.config.notification_sync);
         assert_eq!(entry.config.volume, 50);
+    }
+
+    /// 测试夹具：空 Core（MockAdb）+ 预插一台设备，返回 core。
+    fn core_with_device(device: Device) -> Core {
+        let (phone_clip_tx, _) = mpsc::channel(256);
+        let (notif_tx, _) = mpsc::channel(64);
+        let (clip_tx, _) = broadcast::channel(64);
+        let (_device_tx, device_watch) = watch::channel(HashMap::new());
+        let (_mdns_tx, mdns_rx) = mpsc::channel(16);
+        let (_session_tx, session_watch) = watch::channel(Vec::new());
+        let (session_tx, _) = watch::channel(Vec::new());
+
+        let mut core = Core {
+            adb_cmd: Arc::new(crate::adb_cmd::mock::MockAdb::new()),
+            jar_path: "test".into(),
+            pair_info: wireless_pair::WirelessPairing::new(),
+            _mdns_handle: wireless_pair::MdnsHandle::empty(),
+            _refresh_handle: true,
+            mdns_rx,
+            device_watch,
+            clip_broadcast: clip_tx,
+            phone_clip_rx: mpsc::channel(256).1,
+            phone_clip_tx,
+            notif_rx: mpsc::channel(64).1,
+            notif_tx,
+            notif_broadcast: broadcast::channel(64).0,
+            cmd_tx: mpsc::channel(32).0,
+            cmd_rx: Some(mpsc::channel(32).1),
+            devices: HashMap::new(),
+            pending_serials: VecDeque::new(),
+            port_counter: 27183,
+            token: CancellationToken::new(),
+            device_name_rx: mpsc::channel::<(String, String)>(32).1,
+            device_name_tx: mpsc::channel::<(String, String)>(32).0,
+            session_tx,
+            clipboard_last_seen: None,
+            session_watch,
+            merged_tx: watch::channel(Vec::new()).0,
+            merged_watch: watch::channel(Vec::new()).1,
+            last_received_from_phone: None,
+            last_clipboard_error_print: Instant::now(),
+        };
+        core.devices.insert(device.uuid, DeviceEntry::new(device));
+        core
+    }
+
+    /// 向设备的 DeviceEntry 塞入一个假 handle（哨兵 port 9999，state 可指定）。
+    fn inject_fake_session(
+        core: &mut Core,
+        device: &Device,
+        state: u8,
+    ) -> oneshot::Receiver<()> {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        core.devices.get_mut(&device.uuid).unwrap().session = Some(session::Handle {
+            device: device.clone(),
+            port: 9999, // 哨兵值：区别于 start_session 分配的 27183
+            stop_tx: Some(stop_tx),
+            task: tokio::spawn(async {}),
+            clipboard_enabled: Arc::new(AtomicBool::new(true)),
+            notification_enabled: Arc::new(AtomicBool::new(true)),
+            audio_enabled: Arc::new(AtomicBool::new(false)),
+            volume: Arc::new(AtomicU16::new(80)),
+            session_state: Arc::new(AtomicU8::new(state)),
+            audio_latency: Arc::new(AtomicU64::new(0)),
+        });
+        stop_rx
+    }
+
+    fn test_device(state: DeviceState) -> Device {
+        Device {
+            uuid: Uuid::new_v4(),
+            id: "R58N1234567".into(),
+            serial: "R58N1234567".into(),
+            state,
+            name: String::new(),
+            identity: DeviceIdentity::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_session_creates_when_no_active_session() {
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+
+        core.on_command(Command::StartSession(device.serial.clone()))
+            .await;
+
+        let entry = core.devices.get(&device.uuid).unwrap();
+        assert!(
+            entry.session.is_some(),
+            "无活跃 session 时点击应创建 session"
+        );
+        assert_eq!(entry.session.as_ref().unwrap().port, 27183);
+    }
+
+    #[tokio::test]
+    async fn test_start_session_keeps_single_session() {
+        // 不变量：一个设备至多一个 session；已有活跃 session 时点击必须 no-op
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+        let mut stop_rx = inject_fake_session(
+            &mut core,
+            &device,
+            crate::session::SESSION_STATE_RUNNING,
+        );
+
+        core.on_command(Command::StartSession(device.serial.clone()))
+            .await;
+
+        let entry = core.devices.get(&device.uuid).unwrap();
+        let handle = entry.session.as_ref().unwrap();
+        assert_eq!(handle.port, 9999, "已有活跃 session 时不得重建");
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "活跃 session 不得收到 stop 信号"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_session_rebuilds_failed_tombstone() {
+        // failed 墓碑不算活跃 session → 点击重建（等价重试按钮）
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+        let mut stop_rx = inject_fake_session(
+            &mut core,
+            &device,
+            crate::session::SESSION_STATE_FAILED,
+        );
+
+        core.on_command(Command::StartSession(device.serial.clone()))
+            .await;
+
+        assert!(stop_rx.try_recv().is_ok(), "墓碑应被 stop 后重建");
+        let entry = core.devices.get(&device.uuid).unwrap();
+        let handle = entry.session.as_ref().expect("应重建 session");
+        assert_eq!(handle.port, 27183, "应部署新 session");
+    }
+
+    #[tokio::test]
+    async fn test_start_session_ignores_non_device_state() {
+        // Offline/Unauthorized 设备不可建会话
+        let device = test_device(DeviceState::Offline);
+        let mut core = core_with_device(device.clone());
+
+        core.on_command(Command::StartSession(device.serial.clone()))
+            .await;
+
+        assert!(
+            core.devices.get(&device.uuid).unwrap().session.is_none(),
+            "非 Device 状态不得创建 session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_session_unknown_serial_is_noop() {
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+
+        core.on_command(Command::StartSession("unknown-serial".into()))
+            .await;
+
+        assert!(
+            core.devices.values().all(|e| e.session.is_none()),
+            "未知设备不得创建 session"
+        );
     }
 }

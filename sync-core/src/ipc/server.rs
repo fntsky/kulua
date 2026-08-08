@@ -436,6 +436,26 @@ async fn dispatch_request(
             }
         }
 
+        // 点击 ADB 列表设备建立 session（daemon 侧校验：无活跃 session 才创建）
+        "session.start" => {
+            let serial = req
+                .params
+                .get("serial")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if serial.is_empty() {
+                return make_error(req.id, -1, "缺少 serial 参数");
+            }
+            if cmd_tx
+                .send(Command::StartSession(serial.to_string()))
+                .await
+                .is_err()
+            {
+                return make_error(req.id, -1, "core 正在关闭");
+            }
+            make_result(req.id, serde_json::Value::Null)
+        }
+
         // 未知方法
         _ => make_error(req.id, -1, &format!("未知方法: {}", req.method)),
     }
@@ -532,6 +552,39 @@ mod tests {
         let resp = dispatch_request(&bad, &cmd_tx, &device_watch, &merged_watch, &pair_info).await;
         assert!(resp.error.is_some(), "非法 uuid 应报错");
         assert_eq!(resp.id, 43);
+    }
+
+    /// session.start：合法 serial → Command::StartSession 入队 + result null；空 serial → error
+    #[tokio::test]
+    async fn dispatch_session_start() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+
+        let req = JsonRpcRequest {
+            id: 52,
+            method: "session.start".into(),
+            params: serde_json::json!({"serial": "R58N1234567"}),
+        };
+        let resp = dispatch_request(&req, &cmd_tx, &device_watch, &merged_watch, &pair_info).await;
+        assert!(resp.error.is_none(), "start 应成功: {:?}", resp.error);
+        assert_eq!(resp.id, 52);
+
+        match cmd_rx.try_recv() {
+            Ok(Command::StartSession(serial)) => assert_eq!(serial, "R58N1234567"),
+            other => panic!("expected Command::StartSession, got {:?}", other),
+        }
+
+        // 空 serial → error
+        let bad = JsonRpcRequest {
+            id: 53,
+            method: "session.start".into(),
+            params: serde_json::json!({"serial": ""}),
+        };
+        let resp = dispatch_request(&bad, &cmd_tx, &device_watch, &merged_watch, &pair_info).await;
+        assert!(resp.error.is_some(), "空 serial 应报错");
+        assert_eq!(resp.id, 53);
     }
 
     /// 发送一个正确的 JSON-RPC 请求帧，验证能收到 Response 帧

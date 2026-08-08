@@ -121,6 +121,13 @@ async fn ipc_request(
         Ok(())
     }
 
+    /// 点击 ADB 列表设备建立 session（daemon 侧校验无活跃 session 才创建）
+    #[tauri::command]
+    async fn start_session(state: State<'_, AppState>, serial: String) -> Result<(), String> {
+        ipc_request(&state, "session.start", serde_json::json!({ "serial": serial })).await?;
+        Ok(())
+    }
+
     /// adb 原始设备列表（含 Offline/Unauthorized）
     #[tauri::command]
     async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo>, String> {
@@ -376,6 +383,7 @@ pub fn run() {
             get_pairing_info,
             update_session_config,
             retry_session,
+            start_session,
             get_adb_devices,
         ])
         .setup(|app| {

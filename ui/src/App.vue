@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import QRCode from "qrcode";
@@ -145,6 +145,33 @@ async function retrySession(uuid: string) {
     console.error("retrySession failed:", e);
   }
 }
+
+// ADB 行对应设备的 session 状态（经合并列表 uuid 关联，支持地址变更）
+function adbSessionState(serial: string): string | undefined {
+  const dev = devices.value.find((x) => x.serial === serial);
+  return dev ? sessionStates.value[dev.uuid] : undefined;
+}
+// ADB 行 session 状态文案（无会话 → 空串）
+function adbSessionStateText(serial: string): string {
+  const s = adbSessionState(serial);
+  return s ? sessionStateText[s] || s : "";
+}
+// 可建立会话：设备在线 且 无活跃（connecting/running）session；failed 墓碑允许重建
+function canStartAdbSession(serial: string, state: string): boolean {
+  if (state !== "Device") return false;
+  const s = adbSessionState(serial);
+  return s === undefined || s === "failed" || s === "stopped";
+}
+async function startAdbSession(serial: string, state: string) {
+  if (!canStartAdbSession(serial, state)) return;
+  try {
+    await invoke("start_session", { serial });
+  } catch (e) {
+    console.error("start_session failed:", e);
+  }
+}
+// 会话总数（含 failed 墓碑），tab 徽标用
+const sessionCount = computed(() => Object.keys(sessionStates.value).length);
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
   connected.value = conn;
   devices.value = devs;
@@ -240,8 +267,12 @@ onMounted(async () => {
     <div class="left-panel">
       <!-- device list -->
       <div class="tabs">
-        <span class="tab" :class="{ active: view === 'devices' }" @click="view = 'devices'">在线设备</span>
-        <span class="tab" :class="{ active: view === 'adb' }" @click="view = 'adb'">ADB 连接</span>
+        <span class="tab" :class="{ active: view === 'devices' }" @click="view = 'devices'">
+          在线设备 <span class="tab-badge">{{ sessionCount }}</span>
+        </span>
+        <span class="tab" :class="{ active: view === 'adb' }" @click="view = 'adb'">
+          ADB 连接 <span class="tab-badge">{{ adbDevices.length }}</span>
+        </span>
       </div>
       <div v-if="view === 'devices'" class="device-list">
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
@@ -261,6 +292,7 @@ onMounted(async () => {
               <span v-if="sessionStates[d.uuid]" class="session-state" :class="'session-' + sessionStates[d.uuid]">
                 {{ sessionStateText[sessionStates[d.uuid]] || sessionStates[d.uuid] }}
               </span>
+              <span v-else class="session-state session-none">未建立会话</span>
             </div>
           </div>
           <div class="device-toggles">
@@ -304,17 +336,27 @@ onMounted(async () => {
       <div v-else class="adb-list">
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
         <div v-else-if="adbDevices.length === 0" class="hint">无 ADB 设备</div>
-        <div
-          v-for="d in adbDevices"
-          :key="d.serial"
-          class="adb-row"
-        >
-          <div class="device-title">
-            <span class="device-name">{{ adbName(d.serial) || d.serial }}</span>
-            <span class="serial">{{ d.serial }}</span>
+        <template v-else>
+          <div class="adb-tip">点击在线设备建立会话（每台设备一个会话）</div>
+          <div
+            v-for="d in adbDevices"
+            :key="d.serial"
+            class="adb-row"
+            :class="{ clickable: canStartAdbSession(d.serial, d.state) }"
+            @click="startAdbSession(d.serial, d.state)"
+          >
+            <div class="device-title">
+              <span class="device-name">{{ adbName(d.serial) || d.serial }}</span>
+              <span class="serial">{{ d.serial }}</span>
+            </div>
+            <div class="adb-states">
+              <span v-if="adbSessionState(d.serial)" class="session-state" :class="'session-' + adbSessionState(d.serial)">
+                {{ adbSessionStateText(d.serial) }}
+              </span>
+              <span class="state" :class="stateClass(d.state)">{{ adbStateText(d.state) }}</span>
+            </div>
           </div>
-          <span class="state" :class="stateClass(d.state)">{{ adbStateText(d.state) }}</span>
-        </div>
+        </template>
       </div>
       <!-- error -->
       <div v-if="error" class="error">{{ error }}</div>
@@ -461,12 +503,32 @@ body {
   border: 1px solid var(--border);
 }
 .tab.active { color: var(--text); background: var(--border); }
+.tab-badge {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 5px;
+  margin-left: 4px;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  border-radius: 8px;
+  background: var(--toggle-bg);
+  color: var(--text);
+}
+.tab.active .tab-badge { background: var(--green); color: #fff; }
 .adb-list { display: flex; flex-direction: column; gap: 8px; }
+.adb-tip { font-size: 12px; color: var(--dim); text-align: center; }
 .adb-row {
   background: var(--card); border-radius: 10px;
   padding: 12px 16px;
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
+.adb-row.clickable { cursor: pointer; }
+.adb-row.clickable:hover { outline: 1px solid var(--green); }
+.adb-states {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+}
+.session-none { color: var(--dim); }
 .hint { color: var(--dim); font-size: 14px; text-align: center; padding: 30px 0; }
 .device-card {
   background: var(--card); border-radius: 10px;

@@ -60,6 +60,14 @@
 ← {"id": 3, "result": {}}
 ```
 
+### session.start
+点击 ADB 列表设备建立会话。daemon 侧校验：该设备无活跃 session（connecting/running）才创建；
+failed 墓碑视为可重建；非 Device 状态或已有活跃 session → no-op。
+```
+→ {"id": 4, "method": "session.start", "params": {"serial": "..."}}
+← {"id": 4, "result": {}}
+```
+
 ### clipboard.get
 ```
 → {"id": 4, "method": "clipboard.get", "params": {}}
