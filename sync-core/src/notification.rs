@@ -124,6 +124,82 @@ pub fn spawn_notification_poller(
     (handle, stop)
 }
 
+/// 与 [`spawn_notification_poller`] 相同，但允许外部传入同一个 stop 标志，
+/// 这样上层可以同时停止底层轮询线程和桥接任务，避免线程泄漏。
+fn spawn_notification_poller_with_stop(
+    adb: Arc<dyn AdbOps>,
+    device: Device,
+    notif_tx: std_mpsc::Sender<NotifInfo>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let thread_stop = stop.clone();
+
+    std::thread::Builder::new()
+        .name(format!("notif-poller-{}", device.serial))
+        .spawn(move || {
+            let serial = &device.serial;
+            let mut old_keys: HashSet<String> = HashSet::new();
+            let mut first_poll = true;
+
+            loop {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // 1) 拉取通知列表
+                let output = match adb.run(&["-s", serial, "shell", "cmd", "notification", "list"])
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("通知列表获取失败 ({}): {}", serial, e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let new_keys = parse_notification_list(&stdout);
+
+                // 2) 首次轮询：只初始化，不弹通知
+                if first_poll {
+                    old_keys = new_keys;
+                    first_poll = false;
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                // 3) 计算新增 key 并获取详情
+                let added: Vec<&str> = new_keys.difference(&old_keys).map(|s| s.as_str()).collect();
+
+                for key in &added {
+                    // 用单引号包裹 key，避免 shell 把 | 当成管道
+                    let shell_cmd =
+                        format!("cmd notification get '{}'", key.replace('\'', "'\\''"));
+                    let detail_output = match adb.run(&["-s", serial, "shell", &shell_cmd]) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            eprintln!("通知详情获取失败 ({}): {}", serial, e);
+                            continue;
+                        }
+                    };
+
+                    let detail_stdout = String::from_utf8_lossy(&detail_output.stdout);
+                    if let Some(info) = parse_notification_detail(&detail_stdout, key) {
+                        if notif_tx.send(info).is_err() {
+                            // receiver dropped（Core 退出了）
+                            break;
+                        }
+                    }
+                }
+
+                old_keys = new_keys;
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        })
+        .expect("spawn notification poller thread")
+}
+
+
 /// 桥接版本：启动 std 线程通知轮询器，通过 bridging 转发到 tokio mpsc channel
 ///
 /// `enabled` 控制是否将通知推送给 Core（false 时丢弃但仍保持轮询）
@@ -136,7 +212,8 @@ pub fn spawn_notification_poller_tokio(
 ) -> JoinHandle<()> {
     let serial = device.serial.clone();
     let (bridge_tx, bridge_rx) = std_mpsc::channel::<NotifInfo>();
-    let (poller_handle, _) = spawn_notification_poller(adb, device, bridge_tx);
+    let poller_stop = stop.clone();
+    let poller_handle = spawn_notification_poller_with_stop(adb, device, bridge_tx, poller_stop);
     // 后台转发：std mpsc → tokio mpsc，检查 enabled 标志
     tokio::task::spawn_blocking(move || {
         while !stop.load(Ordering::SeqCst) {

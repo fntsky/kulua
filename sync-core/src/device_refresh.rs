@@ -47,7 +47,7 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                     _ = token.cancelled() => break 'frame,
                     r = reader.read_exact(&mut len_buf) => r,
                 };
-                println!("Read length header: {:?}", std::str::from_utf8(&len_buf));
+
                 if let Err(e) = result {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
                         eprintln!("track-devices disconnected: {}", e);
@@ -92,14 +92,10 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                     eprintln!("track-devices read payload error: {}", e);
                     break;
                 }
-                println!(
-                    "Read payload ({} bytes): {:?}",
-                    len,
-                    std::str::from_utf8(&payload)
-                );
+
 
                 // 解析并推送（解析失败记录日志，避免静默停止更新）
-                println!("Parsing devices from payload...");
+
                 match crate::protocol::devices::parse_devices(&payload) {
                     Ok(devices) => {
                         // 推全量原始列表（含 Offline/Unauthorized/Unknown），

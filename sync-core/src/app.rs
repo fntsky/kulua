@@ -691,7 +691,9 @@ impl Core {
                 })
             })
             .collect();
-        let _ = self.session_tx.send(sessions);
+        if *self.session_watch.borrow() != sessions {
+            let _ = self.session_tx.send(sessions);
+        }
     }
 
     async fn start_session(&mut self, device: Device) {
@@ -795,7 +797,9 @@ impl Core {
     /// 推送合并后设备列表（IPC device.list / device.updated 事件用）
     fn push_merged_devices(&self) {
         let merged: Vec<Device> = self.devices.values().map(|e| e.device.clone()).collect();
-        let _ = self.merged_tx.send(merged);
+        if *self.merged_watch.borrow() != merged {
+            let _ = self.merged_tx.send(merged);
+        }
     }
 }
 impl Drop for Core {
