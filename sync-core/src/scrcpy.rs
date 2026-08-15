@@ -97,8 +97,8 @@ impl ScrcpyServer {
     }
 }
 
-/// 从 reader 中解析一个 scrcpy DeviceMessage 剪贴板事件。
-pub use crate::protocol::clipboard::parse_clipboard_event;
+
+
 
 /// 启动 clipboard 监听线程（Phone→PC）。
 ///

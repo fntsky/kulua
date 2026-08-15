@@ -11,6 +11,9 @@ pub const FRAME_TYPE_RESPONSE: u8 = 0x01;
 pub const FRAME_TYPE_EVENT: u8 = 0x02;
 pub const FRAME_TYPE_AUDIO: u8 = 0x03; // 预留
 
+/// 单帧最大字节数（payload 部分），防止异常/恶意客户端声明超大长度导致内存膨胀。
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 // ── FrameCodec ──
 
 /// 长度前缀 + 类型字节的帧编解码器。
@@ -29,6 +32,12 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
         let len = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame too large: {len} > {MAX_FRAME_SIZE}"),
+            ));
+        }
         let total = 5 + len;
         if src.len() < total {
             src.reserve(total - src.len());
@@ -98,7 +107,7 @@ pub enum Event {
     Notification { data: NotifData },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     /// UUID 主键
     pub uuid: Uuid,
@@ -235,4 +244,17 @@ mod tests {
         assert_eq!(buf[4], 0x00);
         assert_eq!(&buf[5..], b"hello");
     }
+
+    #[test]
+    fn decode_rejects_oversized_frame() {
+        let mut codec = FrameCodec;
+        let mut buf = BytesMut::new();
+
+        let oversized = (MAX_FRAME_SIZE as u32) + 1;
+        buf.extend_from_slice(&oversized.to_le_bytes());
+        buf.extend_from_slice(&[FRAME_TYPE_REQUEST]);
+
+        assert!(codec.decode(&mut buf).is_err(), "oversized frame should be rejected");
+    }
+
 }

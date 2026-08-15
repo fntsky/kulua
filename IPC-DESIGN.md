@@ -5,6 +5,10 @@
 为 daemon 新增 TCP-based IPC 服务，供 GUI 进程（Tauri v2）通过本地回环通信。单客户端独占模式。
 未来音频传输走同一条 TCP 连接的多路复用通道。
 
+> 协议状态：Request / Response / Event 的外层 payload 已改为 Protobuf 编码；
+> 内部 `params` / `result` / `data` 暂仍为 JSON 字节，后续逐步替换为强类型消息。
+
+
 ## Architecture
 
 ```

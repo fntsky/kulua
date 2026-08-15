@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
+use prost::Message;
+use sync_core::ipc::proto;
+
 
 /// 通过长连接发送的 IPC 请求，响应通过 oneshot 回传。
 struct IpcRequest {
