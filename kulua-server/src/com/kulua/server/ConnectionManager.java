@@ -57,7 +57,8 @@ public final class ConnectionManager {
                         new ControlChannel(socket, displayManager).run();
                         break;
                     case TYPE_AUDIO:
-                        Log.i(TAG, "audio connection (TODO: 阶段 3)");
+                        Log.i(TAG, "audio connection");
+                        handleAudioConnection(socket);
                         break;
                     case TYPE_VIDEO:
                         Log.i(TAG, "video connection");
@@ -77,6 +78,21 @@ public final class ConnectionManager {
                 }
             }
         }).start();
+    }
+
+    /** 音频连接：捕获系统播放声音并推流，直到连接断开。 */
+    private void handleAudioConnection(LocalSocket socket) throws IOException {
+        AudioCapture capture = new AudioCapture(socket);
+        try {
+            capture.start();
+            // 等待连接断开（客户端关闭时 read 返回 -1）
+            while (socket.getInputStream().read() >= 0) {
+                // drain
+            }
+        } finally {
+            Log.i(TAG, "audio connection closed");
+            capture.stop();
+        }
     }
 
     /**
