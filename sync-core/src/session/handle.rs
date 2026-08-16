@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::adb_cmd::AdbOps;
 use crate::types::Device;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 // ── session 生命周期状态 ──
 // 存储于 Handle 共享的 AtomicU8，session 在阶段边界写入，Core 每 tick 读取推送。
@@ -63,6 +63,11 @@ pub struct Handle {
     pub session_state: Arc<AtomicU8>,
     /// 音频缓冲延迟（ms）：audio_task 写，Core tick 读推 UI
     pub audio_latency: Arc<AtomicU64>,
+    /// 当前音频编码器（握手索引：0=raw 1=opus 2=aac 3=flac）。
+    /// Core 修改后发 audio_restart_tx，session 重连 audio 即热切换（不重启 session）
+    pub audio_codec: Arc<AtomicU8>,
+    /// Core → session 的音频重启信号（编码热切换时发送）
+    pub audio_restart_tx: mpsc::Sender<()>,
 }
 impl Handle {
     /// 当前生命周期状态

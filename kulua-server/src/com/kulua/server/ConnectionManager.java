@@ -80,9 +80,17 @@ public final class ConnectionManager {
         }).start();
     }
 
-    /** 音频连接：捕获系统播放声音并推流，直到连接断开。 */
+    /**
+     * 音频连接：捕获系统播放声音并推流，直到连接断开。
+     *
+     * 编码协商：客户端在类型字节后追加 1B codec 选择（0=raw 1=opus 2=aac 3=flac），
+     * 缺省（EOF/超时）用启动参数 audio_codec。这样改编码只需断开重连 audio
+     * 连接，无需重启 server/session（control/视频连接不受影响）。
+     */
     private void handleAudioConnection(LocalSocket socket) throws IOException {
-        AudioCapture capture = new AudioCapture(socket, options.audioCodec, options.audioBitRate);
+        String codec = readRequestedCodec(socket, options.audioCodec);
+        Log.i(TAG, "audio codec=" + codec);
+        AudioCapture capture = new AudioCapture(socket, codec, options.audioBitRate);
         try {
             capture.start();
             // 等待连接断开（客户端关闭时 read 返回 -1）
@@ -92,6 +100,36 @@ public final class ConnectionManager {
         } finally {
             Log.i(TAG, "audio connection closed");
             capture.stop();
+        }
+    }
+
+    /**
+     * 读客户端声明的音频编码（类型字节后的 1B）。
+     *
+     * 注意：不能阻塞等——旧客户端只发类型字节不发 codec 选择，读不到时
+     * 用 500ms 超时回退到启动参数（audio_codec）。读完必须恢复 soTimeout=0，
+     * 否则后续 while(read()) 会因超时抛异常误判连接断开。
+     */
+    private static String readRequestedCodec(LocalSocket socket, String fallback) {
+        try {
+            socket.setSoTimeout(500);
+            int code = socket.getInputStream().read();
+            switch (code) {
+                case 0: return "raw";
+                case 1: return "opus";
+                case 2: return "aac";
+                case 3: return "flac";
+                default: return fallback;
+            }
+        } catch (IOException e) {
+            // 旧客户端未发送 codec 选择（读超时/EOF）→ 用启动参数
+            return fallback;
+        } finally {
+            try {
+                socket.setSoTimeout(0);
+            } catch (IOException ignored) {
+                // ignore
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 /// 每个 session 的独立配置。
 pub struct SessionConfig {
     /// 剪贴板同步开关
@@ -9,6 +9,8 @@ pub struct SessionConfig {
     pub audio_enabled: bool,
     /// 音量百分比（0-100）
     pub volume: u16,
+    /// 音频编码器（raw/opus/aac/flac），热切换（改后 session 重连 audio）
+    pub audio_codec: String,
 }
 
 impl Default for SessionConfig {
@@ -18,6 +20,7 @@ impl Default for SessionConfig {
             notification_sync: true,
             audio_enabled: true,
             volume: 80,
+            audio_codec: crate::settings::DEFAULT_AUDIO_CODEC.to_string(),
         }
     }
 }

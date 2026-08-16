@@ -2,7 +2,7 @@ use crate::adb_cmd::{AdbCmd, AdbOps};
 use crate::ipc::types::SessionSummary;
 use crate::notification::{self, NotifInfo};
 use crate::session;
-use crate::session::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_STOPPED};
+use crate::session::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_RUNNING, SESSION_STATE_STOPPED};
 use crate::types::{Device, DeviceAddrKind, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::{HashMap, VecDeque};
@@ -493,11 +493,37 @@ impl Core {
                 }
             }
             Command::RestartAllSessions => {
-                // 全局 scrcpy 编码参数变更 → 重启所有会话（含 failed 墓碑，等价重试）使新参数生效。
-                // 注意：必须先收集设备列表再逐个停/启，避免在遍历 devices 时修改它。
-                let devices: Vec<Device> =
-                    self.devices.values().map(|e| e.device.clone()).collect();
-                for device in &devices {
+                // 全局 scrcpy 编码参数变更。
+                // 音频编码可热切换（不重启 session）：更新 session 的 codec 原子 +
+                // 发 audio 重启信号，session 重连 audio 连接即用新编码；
+                // control/剪贴板/通知不受影响。仅未运行的 session 才全量重建。
+                let new_codec_byte = crate::audio_player::AudioCodec::from_name(
+                    &crate::settings::read().audio_codec,
+                )
+                .handshake_byte();
+                let mut needs_restart: Vec<Device> = Vec::new();
+                for entry in self.devices.values_mut() {
+                    if let Some(handle) = &entry.session {
+                        if handle.state() != SESSION_STATE_RUNNING {
+                            // 未运行（connecting/failed）→ 全量重建
+                            needs_restart.push(entry.device.clone());
+                            continue;
+                        }
+                        // 运行中 → 热切换编码：更新原子 + 发重启信号
+                        handle.audio_codec.store(new_codec_byte, Ordering::SeqCst);
+                        let _ = handle.audio_restart_tx.try_send(());
+                        println!(
+                            "[hot-swap] {} audio codec -> {} (session 不重启)",
+                            entry.device.serial,
+                            crate::audio_player::AudioCodec::from_name(
+                                &crate::settings::read().audio_codec
+                            )
+                            .name()
+                        );
+                    }
+                }
+                // 未运行的 session 全量重建（含 failed 墓碑，等价重试）
+                for device in &needs_restart {
                     if let Some(mut handle) = self
                         .devices
                         .get_mut(&device.uuid)
@@ -506,13 +532,14 @@ impl Core {
                         handle.stop(self.adb_cmd.as_ref()).await;
                     }
                 }
-                println!(
-                    "Restarting {} device sessions after settings change",
-                    devices.len()
-                );
-                // start_session 内部会校验设备状态（仅 Device 状态重建），离线设备自动跳过
-                for device in devices {
-                    self.start_session(device).await;
+                if !needs_restart.is_empty() {
+                    println!(
+                        "Restarting {} device sessions after settings change",
+                        needs_restart.len()
+                    );
+                    for device in needs_restart {
+                        self.start_session(device).await;
+                    }
                 }
             }
             Command::StartSession(serial) => {
@@ -580,11 +607,14 @@ impl Core {
                 // 更新配置
                 if let Some(entry) = self.devices.get_mut(&uuid) {
                     let prev_audio = entry.config.audio_enabled;
+                    let prev_codec = entry.config.audio_codec.clone();
                     entry.config = session::SessionConfig {
                         clipboard_sync,
                         notification_sync,
                         audio_enabled: audio_sync,
                         volume,
+                        // UpdateConfig 不带编码参数，保持原值（编码由 RestartAllSessions 热切换）
+                        audio_codec: prev_codec,
                     };
 
                     // 剪贴板和通知可直接切换原子标志
@@ -910,7 +940,7 @@ impl Core {
         let cfg = self
             .devices
             .get(&device.uuid)
-            .map(|entry| entry.config)
+            .map(|entry| entry.config.clone())
             .unwrap_or_default();
         // 共享原子标志，Core 后续可随时切换
         let clipboard_enabled = Arc::new(AtomicBool::new(cfg.clipboard_sync));
@@ -921,6 +951,11 @@ impl Core {
         let session_state = Arc::new(AtomicU8::new(SESSION_STATE_CONNECTING));
         // 音频缓冲延迟（ms）：audio_task 写，Core tick 读推 UI
         let audio_latency = Arc::new(AtomicU64::new(0));
+        // 音频编码器索引（热切换：Core 改原子 + 发重启信号，session 重连 audio）
+        let audio_codec = Arc::new(AtomicU8::new(
+            crate::audio_player::AudioCodec::from_name(&cfg.audio_codec).handshake_byte(),
+        ));
+        let (audio_restart_tx, audio_restart_rx) = mpsc::channel::<()>(1);
 
         let mut sess = session::Session::new(
             adb,
@@ -938,6 +973,8 @@ impl Core {
             self.device_name_tx.clone(),
             session_state.clone(),
             audio_latency.clone(),
+            audio_codec.clone(),
+            audio_restart_rx,
             // 全局 scrcpy 编码参数（config 真源，新会话生效）
             crate::settings::ScrcpyParams::from(&crate::settings::read()),
         );
@@ -955,6 +992,8 @@ impl Core {
             volume,
             session_state,
             audio_latency,
+            audio_codec,
+            audio_restart_tx,
         };
 
         let uuid = handle.device.uuid;
@@ -1193,12 +1232,15 @@ mod tests {
                     volume: Arc::new(AtomicU16::new(80)),
                     session_state: Arc::new(AtomicU8::new(crate::session::SESSION_STATE_RUNNING)),
                     audio_latency: Arc::new(AtomicU64::new(0)),
+                    audio_codec: Arc::new(AtomicU8::new(2)), // aac
+                    audio_restart_tx: mpsc::channel::<()>(1).0,
                 }),
                 config: session::SessionConfig {
                     clipboard_sync: true,
                     notification_sync: true,
                     audio_enabled: true,
                     volume: 80,
+                    audio_codec: "aac".into(),
                 },
             },
         );
@@ -1318,6 +1360,8 @@ mod tests {
             volume: Arc::new(AtomicU16::new(80)),
             session_state: Arc::new(AtomicU8::new(state)),
             audio_latency: Arc::new(AtomicU64::new(0)),
+            audio_codec: Arc::new(AtomicU8::new(2)), // aac
+            audio_restart_tx: mpsc::channel::<()>(1).0,
         });
         stop_rx
     }
@@ -1416,16 +1460,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restart_all_sessions_stops_and_rebuilds() {
-        // scrcpy 编码参数变更 → 所有会话重启（停旧 → 用新配置重建）
+    async fn test_restart_all_sessions_hot_swaps_running_session() {
+        // 编码参数变更：RUNNING session 应热切换（更新 codec 原子 + 发重启信号），
+        // 不重启 session（stop 不触发，端口不变）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
         let mut stop_rx =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
+        let (restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
+
+        // 把假 handle 的 restart 通道换成可观察的
+        {
+            let handle = core.devices.get_mut(&device.uuid).unwrap().session.as_mut().unwrap();
+            handle.audio_restart_tx = restart_tx;
+        }
 
         core.on_command(Command::RestartAllSessions).await;
 
-        assert!(stop_rx.try_recv().is_ok(), "旧 session 应收到 stop 信号");
+        // 不应 stop（session 保持运行、端口不变）
+        assert!(stop_rx.try_recv().is_err(), "热切换不应 stop session");
+        let entry = core.devices.get(&device.uuid).unwrap();
+        let handle = entry.session.as_ref().expect("session 应保持存在");
+        assert_eq!(handle.port, 9999, "session 不应重建（端口不变）");
+        // 应收到 audio 重启信号（编码热切换）
+        assert!(restart_rx.try_recv().is_ok(), "应收到 audio 重启信号");
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_sessions_rebuilds_failed_session() {
+        // failed 墓碑 session：编码变更 → 全量重建（等价重试）
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+        let mut stop_rx =
+            inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_FAILED);
+
+        core.on_command(Command::RestartAllSessions).await;
+
+        assert!(stop_rx.try_recv().is_ok(), "failed 墓碑应被 stop 并重建");
         let entry = core.devices.get(&device.uuid).unwrap();
         let handle = entry.session.as_ref().expect("应重建 session");
         assert_eq!(handle.port, 27183, "应使用新端口部署 session");

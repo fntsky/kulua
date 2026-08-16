@@ -61,6 +61,26 @@ impl AudioCodec {
             Self::Raw => "raw",
         }
     }
+
+    /// 由配置名解析（无效名回退 raw，与 server 端白名单一致）。
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "opus" => Self::Opus,
+            "aac" => Self::Aac,
+            "flac" => Self::Flac,
+            _ => Self::Raw,
+        }
+    }
+
+    /// 音频连接握手指令中的 1B 编码索引（0=raw 1=opus 2=aac 3=flac）。
+    pub fn handshake_byte(self) -> u8 {
+        match self {
+            Self::Raw => 0,
+            Self::Opus => 1,
+            Self::Aac => 2,
+            Self::Flac => 3,
+        }
+    }
 }
 
 /// 解码器统一接口：把一帧编码数据解码为 f32 交错 PCM。
@@ -383,6 +403,20 @@ mod tests {
         );
         assert_eq!(AudioCodec::from_codec_id(0x00726177), Some(AudioCodec::Raw));
         assert_eq!(AudioCodec::from_codec_id(0x12345678), None);
+    }
+
+    #[test]
+    fn codec_from_name_and_handshake_byte() {
+        assert_eq!(AudioCodec::from_name("opus"), AudioCodec::Opus);
+        assert_eq!(AudioCodec::from_name("aac"), AudioCodec::Aac);
+        assert_eq!(AudioCodec::from_name("flac"), AudioCodec::Flac);
+        assert_eq!(AudioCodec::from_name("raw"), AudioCodec::Raw);
+        assert_eq!(AudioCodec::from_name("bogus"), AudioCodec::Raw, "无效名回退 raw");
+        // 握手索引与 server readRequestedCodec 一致
+        assert_eq!(AudioCodec::Raw.handshake_byte(), 0);
+        assert_eq!(AudioCodec::Opus.handshake_byte(), 1);
+        assert_eq!(AudioCodec::Aac.handshake_byte(), 2);
+        assert_eq!(AudioCodec::Flac.handshake_byte(), 3);
     }
 
     #[test]

@@ -21,6 +21,14 @@ pub enum ConnectionType {
     Audio = 0x02,
 }
 
+/// 剪贴板主循环的退出原因。
+enum ClipboardExit {
+    /// 编码热切换：外层重建 audio 连接（session 不重启）
+    RestartAudio,
+    /// session 停止
+    Stop,
+}
+
 /// 单个设备的完整 session。
 ///
 /// 包含部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询 + 音频播放的完整生命周期。
@@ -44,6 +52,11 @@ pub struct Session {
     session_state: Arc<AtomicU8>,
     /// 音频缓冲延迟（ms），audio_task 写，Core 读推 UI
     audio_latency: Arc<AtomicU64>,
+    /// 当前音频编码器（握手索引：0=raw 1=opus 2=aac 3=flac）。
+    /// Core 修改后发 restart 信号，session 重连 audio 即热切换编码（不重启 session）
+    audio_codec: Arc<AtomicU8>,
+    /// Core → session 的音频重启信号（编码变更时触发，重连 audio 连接）
+    audio_restart_rx: Option<mpsc::Receiver<()>>,
     device_name_tx: Option<mpsc::Sender<(String, String)>>,
     /// scrcpy 编码参数（部署 server 时使用，配置变更后新会话生效）
     scrcpy_params: crate::settings::ScrcpyParams,
@@ -65,6 +78,8 @@ impl Session {
         device_name_tx: mpsc::Sender<(String, String)>,
         session_state: Arc<AtomicU8>,
         audio_latency: Arc<AtomicU64>,
+        audio_codec: Arc<AtomicU8>,
+        audio_restart_rx: mpsc::Receiver<()>,
         scrcpy_params: crate::settings::ScrcpyParams,
     ) -> Self {
         session_state.store(SESSION_STATE_CONNECTING, Ordering::SeqCst);
@@ -83,6 +98,8 @@ impl Session {
             volume,
             session_state,
             audio_latency,
+            audio_codec,
+            audio_restart_rx: Some(audio_restart_rx),
             device_name_tx: Some(device_name_tx),
             scrcpy_params,
         }
@@ -173,11 +190,11 @@ impl Session {
             return;
         }
 
-        // ── 音频启用：双连接架构 ──
+        // ── 音频启用：双连接架构（audio 可热重连，编码切换不重启 session）──
 
-        // 先连 control socket，再连 audio socket（顺序无关，server 每连接独立线程）
+        // 先连 control socket（顺序无关，server 每连接独立线程）
         let (control_stream, _) = self
-            .connect_socket(port, &mut server, &mut stop_rx, ConnectionType::Control)
+            .connect_socket(port, &mut server, &mut stop_rx, ConnectionType::Control, None)
             .await;
         let Some(control_stream) = control_stream else {
             return;
@@ -186,47 +203,7 @@ impl Session {
         let _ = control_stream.set_nodelay(true);
         mark("control 连接（含重试）");
 
-        let (audio_stream, audio_codec_id) = self
-            .connect_socket(port, &mut server, &mut stop_rx, ConnectionType::Audio)
-            .await;
-        let Some(audio_stream) = audio_stream else {
-            return;
-        };
-        // 启用 TCP_NODELAY 及时检测断连
-        let _ = audio_stream.set_nodelay(true);
-        mark("audio 连接 + codec id");
-
-        // connect_socket 已读 codec ID（Audio 连接首 4 字节）
-        let Some(codec_id) = audio_codec_id else {
-            eprintln!(
-                "failed to read audio codec header from {}",
-                self.device.serial
-            );
-            self.session_state
-                .store(SESSION_STATE_FAILED, Ordering::SeqCst);
-            server.stop(self.adb.as_ref());
-            return;
-        };
-        if codec_id == 0 {
-            println!("Audio stream disabled by device, continuing without audio");
-        } else if codec_id == 1 {
-            eprintln!("Audio stream configuration error on {}", self.device.serial);
-            self.session_state
-                .store(SESSION_STATE_FAILED, Ordering::SeqCst);
-            server.stop(self.adb.as_ref());
-            return;
-        } else {
-            let codec_name = audio_codec_name(codec_id);
-            println!(
-                "Audio codec: {} (0x{:08x}) from {}",
-                codec_name, codec_id, self.device.serial
-            );
-        }
-        // 握手完成（双 socket + 设备名 + codec header）→ running
-        self.session_state
-            .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
-        mark("session RUNNING（总耗时）");
-        // 4. 启动通知轮询
+        // 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
         notification::spawn_notification_poller_tokio(
             self.adb.clone(),
@@ -236,152 +213,104 @@ impl Session {
             self.notification_enabled.clone(),
         );
 
-        let (mut audio_reader, audio_writer) = tokio::io::split(audio_stream);
         let (mut control_reader, mut control_writer) = tokio::io::split(control_stream);
 
-        // 6. 音频读取任务（独立于控制通道）
-        let audio_task = if codec_id == 0 {
-            // 设备禁用了音频流，无需读取
-            None
-        } else if crate::audio_player::AudioCodec::from_codec_id(codec_id).is_none() {
-            // 未知 codec → 只读取丢弃（无法播放）
-            Some(tokio::spawn(async move {
-                let mut header = [0u8; 12];
-                while audio_reader.read_exact(&mut header).await.is_ok() {
-                    let frame_size =
-                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
-                    if frame_size == 0 || frame_size > 10_000_000 {
-                        break;
-                    }
-                    let mut _frame = vec![0u8; frame_size];
-                    if audio_reader.read_exact(&mut _frame).await.is_err() {
-                        break;
-                    }
+        // audio 可重连循环：编码热切换（Core 发 restart 信号）或 audio 连接断开时
+        // 重建 audio 连接（带当前 codec 握手字节），control/剪贴板/通知不受影响。
+        // run_clipboard_io 同时监听 restart 信号，返回 Restart 指示外层重建。
+        let mut audio_restart_rx = self.audio_restart_rx.take().expect("restart rx");
+        let audio_codec = self.audio_codec.clone();
+        let mut audio_task: Option<tokio::task::JoinHandle<()>> = None;
+        loop {
+            // 重建 audio 连接（codec 索引来自共享原子，Core 热更新后重连即用新编码）
+            let codec_byte = audio_codec.load(Ordering::SeqCst);
+            let (audio_stream, audio_codec_id) = self
+                .connect_socket(
+                    port,
+                    &mut server,
+                    &mut stop_rx,
+                    ConnectionType::Audio,
+                    Some(codec_byte),
+                )
+                .await;
+            let Some(audio_stream) = audio_stream else {
+                break; // 连接失败（stop 或判死）
+            };
+            // 启用 TCP_NODELAY 及时检测断连
+            let _ = audio_stream.set_nodelay(true);
+            mark("audio 连接 + codec id");
+
+            // connect_socket 已读 codec ID（Audio 连接首 4 字节）
+            let Some(codec_id) = audio_codec_id else {
+                break;
+            };
+            if codec_id == 0 {
+                println!("Audio stream disabled by device, continuing without audio");
+                break;
+            } else if codec_id == 1 {
+                eprintln!("Audio stream configuration error on {}", self.device.serial);
+                break;
+            } else {
+                println!(
+                    "Audio codec: {} (0x{:08x}) from {}",
+                    audio_codec_name(codec_id),
+                    codec_id,
+                    self.device.serial
+                );
+            }
+
+            // 握手完成（双 socket + 设备名 + codec header）→ running
+            // （首次进入时置位；audio 重连循环内重复置位无害）
+            self.session_state
+                .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+
+            // 启动当前连接的音频读取任务（abort 旧任务释放旧连接）
+            if let Some(prev) = audio_task.take() {
+                prev.abort();
+            }
+            audio_task = Some(spawn_audio_task(
+                audio_stream,
+                codec_id,
+                self.device.serial.clone(),
+                self.volume.clone(),
+                self.audio_latency.clone(),
+            ));
+            mark("audio 读取任务已启动");
+
+            // 双向剪贴板 I/O：内部监听 stop / audio-restart 信号
+            match self
+                .run_clipboard_io(
+                    &mut control_reader,
+                    &mut control_writer,
+                    &mut stop_rx,
+                    &mut audio_restart_rx,
+                    self.device.serial.clone(),
+                )
+                .await
+            {
+                ClipboardExit::RestartAudio => {
+                    println!(
+                        "[{}] audio restart requested (codec hot-swap), reconnecting",
+                        self.device.serial
+                    );
+                    continue; // 重建 audio 连接
                 }
-            }))
-        } else {
-            // 已知 codec → 解码播放
-            let codec = crate::audio_player::AudioCodec::from_codec_id(codec_id).unwrap();
-            let serial = self.device.serial.clone();
-            let volume = self.volume.clone();
-            let latency = self.audio_latency.clone();
-            Some(tokio::spawn(async move {
-                // codec config 包（bit 62）：AAC 的 AudioSpecificConfig / FLAC 的 STREAMINFO，
-                // 必须先于首帧捕获；OPUS/RAW 无配置包
-                let mut codec_config: Option<Vec<u8>> = None;
-                let mut player: Option<crate::audio_player::AudioPlayer> = None;
-                let mut last_vol = volume.load(Ordering::Relaxed);
-                let mut log_timer = tokio::time::Instant::now();
-                loop {
-                    // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
-                    let mut header = [0u8; 12];
-                    if audio_reader.read_exact(&mut header).await.is_err() {
-                        break;
-                    }
-
-                    let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
-                    let frame_size =
-                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
-
-                    // 检查 session 元数据标记（bit 63）
-                    if (pts_raw >> 63) & 1 != 0 {
-                        continue;
-                    }
-
-                    // 安全检查
-                    if frame_size == 0 || frame_size > 10_000_000 {
-                        break;
-                    }
-
-                    let mut frame_data = vec![0u8; frame_size];
-                    if audio_reader.read_exact(&mut frame_data).await.is_err() {
-                        break;
-                    }
-
-                    // codec config 包（bit 62）：仅在解码器创建前捕获一次
-                    if (pts_raw >> 62) & 1 != 0 {
-                        if player.is_none() {
-                            codec_config = Some(frame_data);
-                        }
-                        continue;
-                    }
-
-                    // 首个正常音频帧 → 惰性创建解码器（此时 config 已就绪）
-                    if player.is_none() {
-                        let p = match crate::audio_player::AudioPlayer::new(
-                            codec,
-                            codec_config.as_deref(),
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!(
-                                    "[audio] failed to init {} player on {serial}: {e}",
-                                    codec.name()
-                                );
-                                return;
-                            }
-                        };
-                        // 初始音量
-                        p.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
-                        player = Some(p);
-                    }
-                    let player = player.as_mut().unwrap();
-
-                    // 同步音量变更
-                    let cur = volume.load(Ordering::Relaxed);
-                    if cur != last_vol {
-                        player.set_volume(cur as f32 / 100.0);
-                        last_vol = cur;
-                    }
-
-                    // 正常音频帧 → 解码播放
-                    // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
-                    if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
-                        eprintln!(
-                            "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
-                            player.buffer_ms()
-                        );
-                        player.clear();
-                    }
-                    if let Err(e) = player.feed_frame(&frame_data) {
-                        eprintln!("[audio] {} decode error on {serial}: {e}", codec.name());
-                    } else {
-                        // 上报播放队列积压（缓冲延迟，ms）
-                        latency.store(player.buffer_ms(), Ordering::Relaxed);
-                    }
-
-                    // 诊断打点：每 5s 打印一次缓冲延迟
-                    if log_timer.elapsed() >= Duration::from_secs(5) {
-                        eprintln!("[audio] {serial} buffer: {} ms", player.buffer_ms());
-                        log_timer = tokio::time::Instant::now();
-                    }
-                }
-            }))
-        };
-
-        // 7. 双向剪贴板 I/O（control channel）
-        self.run_clipboard_io(
-            &mut control_reader,
-            &mut control_writer,
-            stop_rx,
-            self.device.serial.clone(),
-        )
-        .await;
-
-        // 8. 清理（模仿官方关闭流程）
-        //    run_clipboard_io 返回 → control_reader/writer 已释放 → control socket 关闭
-        //    → server 侧 ControlChannel.recv() 收到 IOException
-
-        // (a) shutdown audio socket → server 侧 Streamer.writePacket() 收到 IO 错误
-        drop(audio_writer); // 释放我们的 WriteHalf 引用
+                ClipboardExit::Stop => break,
+            }
+        }
+        // 清理 audio 任务
         if let Some(task) = audio_task {
-            task.abort(); // 释放 ReadHalf → Arc 归零 → socket 关闭
+            task.abort();
         }
 
-        // (b) 停通知轮询
+        // 8. 清理（模仿官方关闭流程）
+        //    退出后 control_reader/writer 已释放 → control socket 关闭
+        //    → server 侧 ControlChannel.recv() 收到 IOException
+
+        // (a) 停通知轮询
         notif_stop.store(true, Ordering::SeqCst);
 
-        // (c) 1s 看门狗：给 server 时间检测 socket 断开 → 走 Java finally → 进程退出
+        // (b) 1s 看门狗：给 server 时间检测 socket 断开 → 走 Java finally → 进程退出
         let mut exited = server.try_wait();
         if exited.is_none() {
             // 等 1s，每 100ms 检查一次
@@ -394,7 +323,7 @@ impl Session {
             }
         }
 
-        // (d) 看门狗超时 → force kill（同官方 watchdog 超时后 kill(SIGKILL)）
+        // (c) 看门狗超时 → force kill（同官方 watchdog 超时后 kill(SIGKILL)）
         if exited.is_none() {
             eprintln!(
                 "server {} did not exit after socket shutdown, force killing",
@@ -408,7 +337,8 @@ impl Session {
 
     /// 连接到 kulua-server ADB forward 端口，完成类型握手 + 就绪验证。
     ///
-    /// 流程：连接 → 写 1B 连接类型（0x01=control / 0x02=audio）→
+    /// 流程：连接 → 写类型字节（0x01=control / 0x02=audio）→ audio 再写 1B
+    /// codec 索引（0=raw 1=opus 2=aac 3=flac，热切换编码用）→
     /// 读就绪数据（control 读 1B 就绪字节；audio 读 4B codec id）。
     ///
     /// 为什么必须读验证：adb forward 的 TCP 连接在 server 冷启动（app_process
@@ -423,20 +353,24 @@ impl Session {
         server: &mut scrcpy::ScrcpyServer,
         stop_rx: &mut oneshot::Receiver<()>,
         conn_type: ConnectionType,
+        audio_codec_byte: Option<u8>,
     ) -> (Option<TcpStream>, Option<u32>) {
         // 最多重试 20 次（500ms 间隔 = 10s），超时判死写 failed（docs/session-state-design.md §3.3）
         let mut attempts: u8 = 0;
         loop {
             match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
                 Ok(mut s) => {
-                    // 写握手字节
-                    let handshake = [conn_type as u8];
+                    // 写握手字节（audio 连接附 codec 索引：热切换编码不重启 session）
+                    let handshake: &[u8] = match audio_codec_byte {
+                        Some(codec_byte) => &[conn_type as u8, codec_byte],
+                        None => &[conn_type as u8],
+                    };
                     let write_result = tokio::select! {
                         _ = &mut *stop_rx => {
                             server.stop(self.adb.as_ref());
                             return (None, None);
                         }
-                        r = s.write_all(&handshake) => r,
+                        r = s.write_all(handshake) => r,
                     };
                     if write_result.is_err() {
                         drop(s);
@@ -491,14 +425,19 @@ impl Session {
         }
     }
 
-    /// 控制通道的剪贴板双向 I/O
+    /// 控制通道的剪贴板双向 I/O。
+    ///
+    /// 同时监听 `audio_restart_rx`：编码热切换时 Core 发重启信号，
+    /// 返回 `ClipboardExit::RestartAudio` 让外层重建 audio 连接
+    /// （session/control/剪贴板不重启）。
     async fn run_clipboard_io(
         &mut self,
         control_reader: &mut (impl AsyncReadExt + Unpin),
         control_writer: &mut (impl AsyncWriteExt + Unpin),
-        mut stop_rx: oneshot::Receiver<()>,
+        stop_rx: &mut oneshot::Receiver<()>,
+        audio_restart_rx: &mut mpsc::Receiver<()>,
         serial: String,
-    ) {
+    ) -> ClipboardExit {
         eprintln!("[{}] run_clipboard_io ENTER", serial);
         let clipboard_enabled = self.clipboard_enabled.clone();
         let phone_clip_tx = self.phone_clip_tx.clone();
@@ -506,9 +445,13 @@ impl Session {
         loop {
             tokio::select! {
                 biased;
-                _ = &mut stop_rx => {
+                _ = &mut *stop_rx => {
                     eprintln!("[{}] BREAK: stop_rx fired", serial);
-                    break;
+                    return ClipboardExit::Stop;
+                }
+                _ = audio_restart_rx.recv() => {
+                    eprintln!("[{}] BREAK: audio restart signal", serial);
+                    return ClipboardExit::RestartAudio;
                 }
                 result = self.clip_sub.recv() => {
                     match result {
@@ -516,7 +459,7 @@ impl Session {
                             let msg = build_clipboard_frame(&text);
                             if control_writer.write_all(&msg).await.is_err() {
                                 eprintln!("[{}] BREAK: write_all error", serial);
-                                break;
+                                return ClipboardExit::Stop;
                             }
                         }
                         Ok(_) => {
@@ -524,7 +467,7 @@ impl Session {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             eprintln!("[{}] BREAK: clip_sub Closed", serial);
-                            break;
+                            return ClipboardExit::Stop;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             eprintln!("[{}] clip_sub lagged by {}", serial, n);
@@ -538,20 +481,19 @@ impl Session {
                                 println!("Phone clipboard from {}: {}", serial, text);
                                 if phone_clip_tx.send(text).await.is_err() {
                                     eprintln!("[{}] BREAK: phone_clip_tx send error", serial);
-                                    break;
+                                    return ClipboardExit::Stop;
                                 }
                             }
                         }
                         Ok(None) => {}
                         Err(()) => {
                             eprintln!("[{}] BREAK: read_device_message error", serial);
-                            break;
+                            return ClipboardExit::Stop;
                         }
                     }
                 }
             }
         }
-        eprintln!("[{}] run_clipboard_io EXIT", serial);
     }
 
     /// 音频未启用时：单连接 control-only
@@ -562,7 +504,7 @@ impl Session {
     ) {
         // 只需要 1 个 socket（control）
         let (stream, _) = self
-            .connect_socket(self.port, server, &mut stop_rx, ConnectionType::Control)
+            .connect_socket(self.port, server, &mut stop_rx, ConnectionType::Control, None)
             .await;
         let Some(stream) = stream else {
             return;
@@ -581,10 +523,13 @@ impl Session {
             self.notification_enabled.clone(),
         );
         let (mut control_reader, mut control_writer) = tokio::io::split(stream);
+        // control-only 无音频，restart 信号不会到来（mpsc 无人发送，select 永不触发）
+        let (_restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
         self.run_clipboard_io(
             &mut control_reader,
             &mut control_writer,
-            stop_rx,
+            &mut stop_rx,
+            &mut restart_rx,
             self.device.serial.clone(),
         )
         .await;
@@ -592,4 +537,131 @@ impl Session {
         notif_stop.store(true, Ordering::SeqCst);
         server.stop(self.adb.as_ref());
     }
+}
+
+/// 启动音频读取任务（独立 tokio 任务，负责读帧 + 解码 + 播放）。
+///
+/// 与旧实现的内联逻辑一致：config 包（bit62）先捕获，首个音频帧后惰性创建
+/// 解码器；opus/aac/flac 走各自解码器，未知 codec 只读丢弃。
+/// 返回 JoinHandle，调用方在重连/退出时 abort。
+fn spawn_audio_task(
+    audio_stream: TcpStream,
+    codec_id: u32,
+    serial: String,
+    volume: Arc<AtomicU16>,
+    latency: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    let (mut audio_reader, _audio_writer) = tokio::io::split(audio_stream);
+    if crate::audio_player::AudioCodec::from_codec_id(codec_id).is_none() {
+        // 未知 codec → 只读取丢弃（无法播放）
+        return tokio::spawn(async move {
+            let mut header = [0u8; 12];
+            while audio_reader.read_exact(&mut header).await.is_ok() {
+                let frame_size =
+                    u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
+                if frame_size == 0 || frame_size > 10_000_000 {
+                    break;
+                }
+                let mut _frame = vec![0u8; frame_size];
+                if audio_reader.read_exact(&mut _frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // 已知 codec → 解码播放
+    let codec = crate::audio_player::AudioCodec::from_codec_id(codec_id).unwrap();
+    tokio::spawn(async move {
+        // codec config 包（bit 62）：AAC 的 AudioSpecificConfig / FLAC 的 STREAMINFO，
+        // 必须先于首帧捕获；OPUS/RAW 无配置包
+        let mut codec_config: Option<Vec<u8>> = None;
+        let mut player: Option<crate::audio_player::AudioPlayer> = None;
+        let mut last_vol = volume.load(Ordering::Relaxed);
+        let mut log_timer = tokio::time::Instant::now();
+        loop {
+            // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
+            let mut header = [0u8; 12];
+            if audio_reader.read_exact(&mut header).await.is_err() {
+                break;
+            }
+
+            let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
+            let frame_size =
+                u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
+
+            // 检查 session 元数据标记（bit 63）
+            if (pts_raw >> 63) & 1 != 0 {
+                continue;
+            }
+
+            // 安全检查
+            if frame_size == 0 || frame_size > 10_000_000 {
+                break;
+            }
+
+            let mut frame_data = vec![0u8; frame_size];
+            if audio_reader.read_exact(&mut frame_data).await.is_err() {
+                break;
+            }
+
+            // codec config 包（bit 62）：仅在解码器创建前捕获一次
+            if (pts_raw >> 62) & 1 != 0 {
+                if player.is_none() {
+                    codec_config = Some(frame_data);
+                }
+                continue;
+            }
+
+            // 首个正常音频帧 → 惰性创建解码器（此时 config 已就绪）
+            if player.is_none() {
+                let p = match crate::audio_player::AudioPlayer::new(
+                    codec,
+                    codec_config.as_deref(),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "[audio] failed to init {} player on {serial}: {e}",
+                            codec.name()
+                        );
+                        return;
+                    }
+                };
+                // 初始音量
+                p.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
+                player = Some(p);
+            }
+            let player = player.as_mut().unwrap();
+
+            // 同步音量变更
+            let cur = volume.load(Ordering::Relaxed);
+            if cur != last_vol {
+                player.set_volume(cur as f32 / 100.0);
+                last_vol = cur;
+            }
+
+            // 正常音频帧 → 解码播放
+            // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
+            if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
+                eprintln!(
+                    "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
+                    player.buffer_ms()
+                );
+                player.clear();
+            }
+            if let Err(e) = player.feed_frame(&frame_data) {
+                eprintln!("[audio] {} decode error on {serial}: {e}", codec.name());
+            } else {
+                // 上报播放队列积压（缓冲延迟，ms）
+                latency.store(player.buffer_ms(), Ordering::Relaxed);
+            }
+
+            // 诊断打点：每 5s 打印一次缓冲延迟
+            if log_timer.elapsed() >= Duration::from_secs(5) {
+                eprintln!("[audio] {serial} buffer: {} ms", player.buffer_ms());
+                log_timer = tokio::time::Instant::now();
+            }
+        }
+    })
 }
