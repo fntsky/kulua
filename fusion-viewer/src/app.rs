@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::args::Args;
 use crate::control::{self, POINTER_ID_MOUSE, key_action, touch_action};
 use crate::decoder::DecodedFrame;
-use crate::server::ServerSession;
+use crate::server::ViewerSession;
 use crate::video::VideoEvent;
 use crate::yuv::render_yuv420_to_rgbx;
 
@@ -37,7 +37,7 @@ const SCROLL_LINES_TO_PIXELS: f32 = 8.0;
 
 pub struct ViewerApp {
     args: Args,
-    session: ServerSession,
+    session: ViewerSession,
     video_rx: Receiver<VideoEvent>,
 
     // 窗口与渲染（Arc<Window> 让 softbuffer Context 无生命周期问题）
@@ -60,7 +60,7 @@ pub struct ViewerApp {
 }
 
 impl ViewerApp {
-    pub fn new(args: Args, session: ServerSession, video_rx: Receiver<VideoEvent>) -> Self {
+    pub fn new(args: Args, session: ViewerSession, video_rx: Receiver<VideoEvent>) -> Self {
         Self {
             args,
             session,
@@ -83,12 +83,11 @@ impl ViewerApp {
         while let Ok(event) = self.video_rx.try_recv() {
             match event {
                 VideoEvent::Frame(frame) => {
-                    // 收到首帧 → 虚拟显示器已创建，此时才发 START_APP
-                    // （server 侧 getStartAppDisplayId 只等 1s，过早发送会
-                    //   "No known display id"）
+                    // 收到首帧 → 虚拟显示器已真正就绪，此时才发 START_APP
                     if !self.started_app {
                         self.started_app = true;
-                        match crate::control::start_app(&self.args.package) {
+                        match crate::control::start_app(self.session.display_id, &self.args.package)
+                        {
                             Ok(msg) => {
                                 if let Err(e) = self.session.send(&msg) {
                                     eprintln!("[viewer] START_APP 发送失败: {}", e);
@@ -235,7 +234,18 @@ impl ViewerApp {
         if sw == 0 || sh == 0 {
             return;
         }
-        let msg = control::inject_touch(action, POINTER_ID_MOUSE, x, y, sw, sh, 1.0, 0, 0);
+        let msg = control::inject_touch(
+            self.session.display_id,
+            action,
+            POINTER_ID_MOUSE,
+            x,
+            y,
+            sw,
+            sh,
+            1.0,
+            0,
+            0,
+        );
         let _ = self.session.send(&msg);
     }
 
@@ -298,7 +308,16 @@ impl ViewerApp {
             }
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
         };
-        let msg = control::inject_scroll(x, y, sw, sh, hscroll, vscroll, 0);
+        let msg = control::inject_scroll(
+            self.session.display_id,
+            x,
+            y,
+            sw,
+            sh,
+            hscroll,
+            vscroll,
+            0,
+        );
         let _ = self.session.send(&msg);
     }
 }

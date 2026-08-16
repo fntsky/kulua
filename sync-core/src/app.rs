@@ -673,8 +673,9 @@ impl Core {
         }
     }
 
-    /// `app.open` 处理：校验设备/包名/Android 版本（虚拟显示器要求 SDK ≥ 29），
-    /// 然后拉起 scrcpy.exe 融合窗口。
+    /// `app.open` 处理：校验设备/包名/Android 版本（虚拟显示器要求 SDK ≥ 29）与
+    /// session 状态（viewer 连接模式需要 session 已部署 kulua-server），
+    /// 然后拉起 fusion-viewer 融合窗口。
     async fn handle_open_app(&mut self, uuid: Uuid, package_name: String) -> Result<u64, String> {
         let device = self
             .devices
@@ -685,6 +686,16 @@ impl Core {
         if !crate::apps::is_valid_package_name(&package_name) {
             return Err(format!("非法包名: {}", package_name));
         }
+
+        // viewer 不再自行部署 server：必须通过 session 的 ADB forward 端口连接
+        // 已部署的 kulua-server（单进程多显示器架构）。session 未运行则无法连接。
+        let port = self
+            .devices
+            .get(&uuid)
+            .and_then(|e| e.session.as_ref())
+            .filter(|s| s.state() == crate::session::SESSION_STATE_RUNNING)
+            .map(|s| s.port)
+            .ok_or_else(|| "设备会话未运行，请先开启会话".to_string())?;
 
         // 虚拟显示器是 Android 10+（API 29）能力，先校验再拉起，避免窗口秒退
         let sdk = self
@@ -715,12 +726,8 @@ impl Core {
             .and_then(|apps| apps.iter().find(|a| a.package_name == package_name))
             .map(|a| a.label.clone())
             .unwrap_or_default();
-        self.fusion.open_window(
-            device.serial.clone(),
-            package_name,
-            label,
-            self.jar_path.clone(),
-        )
+        self.fusion
+            .open_window(device.serial.clone(), package_name, label, port)
     }
 
     fn on_notification(&mut self, notif: NotifInfo) {

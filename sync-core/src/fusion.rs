@@ -108,18 +108,17 @@ impl FusionManager {
 
     /// 构建 fusion-viewer 命令行参数（纯函数，便于单测）。
     ///
-    /// 设计决策（见 docs/fusion-mode-plan.md §6.2 及自研方案）：
-    /// - viewer 内部自行部署 scrcpy-server（`new_display` 虚拟显示器 + `video=true`）
-    /// - 音频/剪贴板继续由 Kulua session 负责（server `audio=false` + `clipboard_autosync=false`）
-    /// - H264 + 8M：兼容性优先，后续可做设置项
-    pub fn build_args(serial: &str, package: &str, label: &str, jar: &str) -> Vec<String> {
+    /// 设计决策（见 docs/fusion-mode-plan.md 阶段 4 自研方案）：
+    /// - daemon session 统一部署 kulua-server（单进程多显示器），viewer 连接模式：
+    ///   `--connect <port>` 连接 session 的 ADB forward 端口，video 连接携带
+    ///   显示器创建参数，不重复部署 server
+    /// - 音频/剪贴板继续由 Kulua session 负责（viewer 只做视频 + 输入注入）
+    pub fn build_args(port: u16, package: &str, label: &str) -> Vec<String> {
         let mut args = vec![
-            "--serial".to_string(),
-            serial.to_string(),
+            "--connect".to_string(),
+            port.to_string(),
             "--package".to_string(),
             package.to_string(),
-            "--jar".to_string(),
-            jar.to_string(),
         ];
         if !label.is_empty() {
             args.push("--label".to_string());
@@ -129,17 +128,19 @@ impl FusionManager {
     }
 
     /// 为指定设备打开一个应用的融合窗口，返回窗口 id。
+    ///
+    /// `port` 为设备 session 的 ADB forward 端口（viewer 通过它连接 kulua-server）。
     pub fn open_window(
         &mut self,
         serial: String,
         package_name: String,
         label: String,
-        jar: String,
+        port: u16,
     ) -> Result<u64, String> {
         let exe = Self::find_viewer_exe().ok_or(
             "未找到 fusion-viewer.exe：请将其放入 daemon 同目录，或设置 FUSION_VIEWER_EXE 环境变量",
         )?;
-        self.open_window_with_exe(&exe, serial, package_name, label, jar)
+        self.open_window_with_exe(&exe, serial, package_name, label, port)
     }
 
     /// 使用指定 fusion-viewer 路径打开融合窗口（`open_window` 的内部实现，测试用）。
@@ -149,9 +150,9 @@ impl FusionManager {
         serial: String,
         package_name: String,
         label: String,
-        jar: String,
+        port: u16,
     ) -> Result<u64, String> {
-        let args = Self::build_args(&serial, &package_name, &label, &jar);
+        let args = Self::build_args(port, &package_name, &label);
         let child = std::process::Command::new(exe)
             .args(&args)
             .spawn()
@@ -278,50 +279,43 @@ mod tests {
 
     #[test]
     fn build_args_contains_viewer_flags() {
-        let args = FusionManager::build_args(
-            "192.168.1.5:5555",
-            "com.android.settings",
-            "设置",
-            "scrcpy-server",
-        );
+        let args = FusionManager::build_args(27183, "com.android.settings", "设置");
         assert_eq!(
             args,
             vec![
-                "--serial",
-                "192.168.1.5:5555",
+                "--connect",
+                "27183",
                 "--package",
                 "com.android.settings",
-                "--jar",
-                "scrcpy-server",
                 "--label",
                 "设置",
             ]
         );
         // 空 label 不传 --label
-        let no_label = FusionManager::build_args("s", "pkg", "", "jar");
+        let no_label = FusionManager::build_args(27183, "pkg", "");
         assert_eq!(
             no_label,
-            vec!["--serial", "s", "--package", "pkg", "--jar", "jar"]
+            vec!["--connect", "27183", "--package", "pkg"]
         );
     }
 
     #[test]
     fn window_ids_are_unique_and_incrementing() {
-        // 用立即退出的 dummy 进程验证 id 分配，不依赖测试环境有 scrcpy.exe
+        // 用立即退出的 dummy 进程验证 id 分配，不依赖测试环境有 fusion-viewer.exe
         let mut manager = FusionManager::new();
         let id1 = manager.open_window_with_exe(
             &dummy_exe(),
             "serial-1".into(),
             "com.android.settings".into(),
             "设置".into(),
-            "scrcpy-server".into(),
+            27183,
         );
         let id2 = manager.open_window_with_exe(
             &dummy_exe(),
             "serial-1".into(),
             "com.android.chrome".into(),
             "Chrome".into(),
-            "scrcpy-server".into(),
+            27183,
         );
         assert!(id1.is_ok(), "dummy exe 应能启动: {:?}", id1);
         assert!(id2.is_ok());
@@ -343,14 +337,14 @@ mod tests {
 
     #[test]
     fn open_window_fails_when_exe_missing() {
-        // 用不存在的 exe 路径确定性验证错误路径（不依赖测试环境是否有 scrcpy.exe）
+        // 用不存在的 exe 路径确定性验证错误路径（不依赖测试环境是否有 fusion-viewer.exe）
         let mut manager = FusionManager::new();
         let result = manager.open_window_with_exe(
             std::path::Path::new("/nonexistent/fusion-viewer.exe"),
             "serial".into(),
             "com.android.settings".into(),
             "设置".into(),
-            "scrcpy-server".into(),
+            27183,
         );
         assert!(result.is_err(), "exe 不存在应返回错误");
         assert!(manager.windows_info().is_empty());

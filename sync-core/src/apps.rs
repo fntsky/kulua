@@ -1,8 +1,9 @@
-//! 设备应用枚举（scrcpy server 一次性模式 `list_apps=true`）。
+//! 设备应用枚举（kulua-server 一次性模式 `list_apps=true`）。
 //!
 //! 不依赖 `scrcpy.exe --list-apps`（每次都要初始化 SDL + push jar，更重）：
 //! 直接复用已有的 adb + jar 部署逻辑，`adb shell` 启动 server 一次性模式
 //! 打印可启动应用列表后退出，结果带 60s TTL 缓存（按设备 UUID）。
+//! kulua-server 的 AppLister 输出格式与官方 scrcpy 一致（30 列补位）。
 
 use crate::adb_cmd::AdbOps;
 use crate::types::{AdbError, Device};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// 远程 jar 路径（与 session 部署共用，保证只 push 一次）。
-pub const REMOTE_JAR: &str = "/data/local/tmp/scrcpy-server.jar";
+pub const REMOTE_JAR: &str = "/data/local/tmp/kulua-server.jar";
 
 /// 应用列表缓存有效期。
 pub const APP_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -30,11 +31,11 @@ pub struct AppInfo {
     pub system: bool,
 }
 
-/// 解析 scrcpy server `list_apps=true` 的一次性输出。
+/// 解析 kulua-server `list_apps=true` 的一次性输出。
 ///
-/// 输出格式（LogUtils.buildAppListMessage，v4.0 源码核实）：
+/// 输出格式（AppLister.java，对照官方 LogUtils.buildAppListMessage）：
 /// ```text
-/// [server] INFO: List of apps:
+/// List of apps:
 ///  * Settings                             com.android.settings
 ///  - Google Chrome                        com.android.chrome
 /// ```
@@ -135,9 +136,9 @@ pub fn is_valid_package_name(pkg: &str) -> bool {
     })
 }
 
-/// 枚举设备可启动应用（server 一次性模式）。
+/// 枚举设备可启动应用（kulua-server 一次性模式）。
 ///
-/// 1. 确保 `/data/local/tmp/scrcpy-server.jar` 已部署（缺失才 push）
+/// 1. 确保 `/data/local/tmp/kulua-server.jar` 已部署（缺失才 push）
 /// 2. `adb shell` 运行 `list_apps=true`，合并 stdout/stderr
 /// 3. `timeout` 内未返回 → 超时错误
 ///
@@ -164,9 +165,7 @@ pub fn list_apps(
         &classpath,
         "app_process",
         "/",
-        "com.genymobile.scrcpy.Server",
-        "4.0",
-        "log_level=info",
+        "com.kulua.server.Server",
         "list_apps=true",
     ]
     .iter()

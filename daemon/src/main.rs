@@ -10,10 +10,11 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 fn find_jar() -> Option<String> {
+    // 自研 kulua-server.jar（阶段 4 起替代官方 scrcpy-server）
     let candidates = [
-        Path::new("scrcpy-server"),
-        Path::new("./scrcpy-server"),
-        Path::new("../scrcpy-server"),
+        Path::new("kulua-server.jar"),
+        Path::new("./kulua-server.jar"),
+        Path::new("../kulua-server.jar"),
     ];
     for p in &candidates {
         if p.exists() {
@@ -22,7 +23,7 @@ fn find_jar() -> Option<String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("../../scrcpy-server");
+            let p = dir.join("../../kulua-server.jar");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }

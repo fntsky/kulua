@@ -57,66 +57,46 @@ pub struct ScrcpyServer {
     pub port: u16,
 }
 
+/// 远程 jar 路径（自研 kulua-server，替代官方 scrcpy-server）。
+pub const REMOTE_JAR: &str = "/data/local/tmp/kulua-server.jar";
+
 impl ScrcpyServer {
+    /// 部署自研 kulua-server（单进程多显示器，连接驱动）。
+    ///
+    /// 与官方 scrcpy-server 的关键区别（docs/fusion-mode-plan.md 阶段 4）：
+    /// - 一个 server 进程管理多个虚拟显示器：video 连接携带创建参数（WxH/DPI）
+    /// - 每个连接首字节为类型握手（0x01=control / 0x02=audio / 0x03=video）
+    /// - server 参数只有 scid（会话隔离），无 video/audio/control 开关
     pub fn deploy_scrcpy(
         adb: &dyn AdbOps,
         device: &Device,
         local_jar: &str,
         port: u16,
-        audio_enabled: bool,
-        params: crate::settings::ScrcpyParams,
+        _audio_enabled: bool,
+        _params: crate::settings::ScrcpyParams,
     ) -> Result<Self, crate::types::AdbError> {
         // 仅清理同 scid 的陈旧进程（上次崩溃残留），不碰其它 scrcpy 实例（如融合窗口）
         kill_by_scid(adb, &device.serial, port);
 
-        let remote_jar = "/data/local/tmp/scrcpy-server.jar";
+        let remote_jar = REMOTE_JAR;
         let needs_push = adb
             .run(&["-s", &device.serial, "shell", "test", "-f", remote_jar])
             .is_err();
         if needs_push {
             adb.push(device, local_jar, remote_jar)?;
         } else {
-            println!("scrcpy-server.jar already exists on device, skipping push");
+            println!("kulua-server.jar already exists on device, skipping push");
         }
-        let audio_flag = if audio_enabled { "true" } else { "false" };
         let classpath = format!("CLASSPATH={}", remote_jar);
-        let audio_arg = format!("audio={}", audio_flag);
         let scid_arg = format!("scid={}", scid_hex(port));
-        // 编码参数：仅当用户显式配置（非 0 / 非默认）时追加，否则用 scrcpy 默认值
-        let mut extra_args: Vec<String> = Vec::new();
-        if params.video_bit_rate > 0 {
-            extra_args.push(format!("video_bit_rate={}", params.video_bit_rate));
-        }
-        if params.video_max_size > 0 {
-            extra_args.push(format!("max_size={}", params.video_max_size));
-        }
-        if params.video_max_fps > 0 {
-            extra_args.push(format!("max_fps={}", params.video_max_fps));
-        }
-        if params.audio_bit_rate > 0 {
-            extra_args.push(format!("audio_bit_rate={}", params.audio_bit_rate));
-        }
-        if !params.audio_codec.is_empty() {
-            extra_args.push(format!("audio_codec={}", params.audio_codec));
-        }
-        let mut args = vec![
+        let args = vec![
             &classpath,
             "app_process",
             "/",
-            "com.genymobile.scrcpy.Server",
-            "4.0",
-            "log_level=debug",
-            "tunnel_forward=true",
-            "video=false",
-            &audio_arg,
-            "control=true",
-            "cleanup=true",
-            "send_device_meta=true",
-            "send_dummy_byte=true",
+            "com.kulua.server.Server",
             &scid_arg,
         ];
-        args.extend(extra_args.iter().map(String::as_str));
-        // 隔离 socket：官方客户端默认连 `scrcpy`，带 scid 的 server 监听 `scrcpy_<hex>`
+        // 隔离 socket：客户端默认连 `scrcpy_<hex>`（scid 会话隔离）
         let forward_target = format!("scrcpy_{}", scid_hex(port));
         adb.forward(device, port, &forward_target)?;
         let mut process = adb.spawn_shell(device, &args)?;
@@ -126,7 +106,7 @@ impl ScrcpyServer {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     match line {
-                        Ok(l) => eprintln!("scrcpy-server[{}] stderr: {}", serial, l),
+                        Ok(l) => eprintln!("kulua-server[{}] stderr: {}", serial, l),
                         Err(_) => break,
                     }
                 }

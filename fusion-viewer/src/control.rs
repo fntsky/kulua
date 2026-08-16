@@ -1,8 +1,8 @@
-//! scrcpy 控制协议消息构建（client → server）。
+//! kulua-server 控制协议消息构建（client → server）。
 //!
-//! 字节布局对照 scrcpy v4.0 源码核实：
-//! - `app/src/control_msg.c`（序列化）
-//! - `server/.../control/ControlMessageReader.java`（服务端解析）
+//! 字节布局对照 kulua-server ControlChannel.java 核实（scrcpy v4.0 布局 +
+//! 自研多显示器扩展：touch/scroll/start_app/resize 均带 displayId u32be 前缀）：
+//! - `kulua-server/src/.../ControlChannel.java`（服务端解析）
 //! 所有多字节字段均为大端序。
 
 /// 控制消息类型（client → server）。
@@ -80,11 +80,13 @@ pub fn inject_text(text: &str) -> Vec<u8> {
     buf
 }
 
-/// 构建 INJECT_TOUCH_EVENT 消息（32 字节）。
+/// 构建 INJECT_TOUCH_EVENT 消息（36 字节，含 displayId u32be 前缀）。
 ///
+/// `display_id` 为 server 分配的虚拟显示器 id（video 握手时返回），
 /// `x`/`y` 为设备物理像素坐标（int32），`screen_w`/`screen_h` 为当前视频分辨率，
 /// `pressure` 0.0~1.0 转为 16 位定点。
 pub fn inject_touch(
+    display_id: u32,
     action: u8,
     pointer_id: u64,
     x: i32,
@@ -95,24 +97,26 @@ pub fn inject_touch(
     action_button: u32,
     buttons: u32,
 ) -> Vec<u8> {
-    let mut buf = vec![0u8; 32];
+    let mut buf = vec![0u8; 36];
     buf[0] = msg_type::INJECT_TOUCH_EVENT;
-    buf[1] = action;
-    buf[2..10].copy_from_slice(&pointer_id.to_be_bytes());
-    buf[10..14].copy_from_slice(&x.to_be_bytes());
-    buf[14..18].copy_from_slice(&y.to_be_bytes());
-    buf[18..20].copy_from_slice(&screen_w.to_be_bytes());
-    buf[20..22].copy_from_slice(&screen_h.to_be_bytes());
-    buf[22..24].copy_from_slice(&f32_to_u16fp(pressure).to_be_bytes());
-    buf[24..28].copy_from_slice(&action_button.to_be_bytes());
-    buf[28..32].copy_from_slice(&buttons.to_be_bytes());
+    buf[1..5].copy_from_slice(&display_id.to_be_bytes());
+    buf[5] = action;
+    buf[6..14].copy_from_slice(&pointer_id.to_be_bytes());
+    buf[14..18].copy_from_slice(&x.to_be_bytes());
+    buf[18..22].copy_from_slice(&y.to_be_bytes());
+    buf[22..24].copy_from_slice(&screen_w.to_be_bytes());
+    buf[24..26].copy_from_slice(&screen_h.to_be_bytes());
+    buf[26..28].copy_from_slice(&f32_to_u16fp(pressure).to_be_bytes());
+    buf[28..32].copy_from_slice(&action_button.to_be_bytes());
+    buf[32..36].copy_from_slice(&buttons.to_be_bytes());
     buf
 }
 
-/// 构建 INJECT_SCROLL_EVENT 消息（21 字节）。
+/// 构建 INJECT_SCROLL_EVENT 消息（25 字节，含 displayId u32be 前缀）。
 ///
 /// `hscroll`/`vscroll` 接受 [-16, 16] 范围（像素滚动量），归一化后转 16 位定点。
 pub fn inject_scroll(
+    display_id: u32,
     x: i32,
     y: i32,
     screen_w: u16,
@@ -121,15 +125,16 @@ pub fn inject_scroll(
     vscroll: f32,
     buttons: u32,
 ) -> Vec<u8> {
-    let mut buf = vec![0u8; 21];
+    let mut buf = vec![0u8; 25];
     buf[0] = msg_type::INJECT_SCROLL_EVENT;
-    buf[1..5].copy_from_slice(&x.to_be_bytes());
-    buf[5..9].copy_from_slice(&y.to_be_bytes());
-    buf[9..11].copy_from_slice(&screen_w.to_be_bytes());
-    buf[11..13].copy_from_slice(&screen_h.to_be_bytes());
-    buf[13..15].copy_from_slice(&f32_to_i16fp(hscroll / 16.0).to_be_bytes());
-    buf[15..17].copy_from_slice(&f32_to_i16fp(vscroll / 16.0).to_be_bytes());
-    buf[17..21].copy_from_slice(&buttons.to_be_bytes());
+    buf[1..5].copy_from_slice(&display_id.to_be_bytes());
+    buf[5..9].copy_from_slice(&x.to_be_bytes());
+    buf[9..13].copy_from_slice(&y.to_be_bytes());
+    buf[13..15].copy_from_slice(&screen_w.to_be_bytes());
+    buf[15..17].copy_from_slice(&screen_h.to_be_bytes());
+    buf[17..19].copy_from_slice(&f32_to_i16fp(hscroll / 16.0).to_be_bytes());
+    buf[19..21].copy_from_slice(&f32_to_i16fp(vscroll / 16.0).to_be_bytes());
+    buf[21..25].copy_from_slice(&buttons.to_be_bytes());
     buf
 }
 
@@ -138,25 +143,27 @@ pub fn back_or_screen_on(action: u8) -> Vec<u8> {
     vec![msg_type::BACK_OR_SCREEN_ON, action]
 }
 
-/// 构建 START_APP 消息（1 + 1 + len，包名最长 255 字节）。
-pub fn start_app(package: &str) -> Result<Vec<u8>, String> {
+/// 构建 START_APP 消息（5 + len，包名最长 255 字节，含 displayId u32be 前缀）。
+pub fn start_app(display_id: u32, package: &str) -> Result<Vec<u8>, String> {
     let bytes = package.as_bytes();
     if bytes.len() > 255 {
         return Err(format!("包名过长: {} 字节", bytes.len()));
     }
-    let mut buf = Vec::with_capacity(2 + bytes.len());
+    let mut buf = Vec::with_capacity(6 + bytes.len());
     buf.push(msg_type::START_APP);
+    buf.extend_from_slice(&display_id.to_be_bytes());
     buf.push(bytes.len() as u8);
     buf.extend_from_slice(bytes);
     Ok(buf)
 }
 
-/// 构建 RESIZE_DISPLAY 消息（5 字节；无 display_id，服务端只读宽高）。
-pub fn resize_display(width: u16, height: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 5];
+/// 构建 RESIZE_DISPLAY 消息（9 字节，含 displayId u32be 前缀）。
+pub fn resize_display(display_id: u32, width: u16, height: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 9];
     buf[0] = msg_type::RESIZE_DISPLAY;
-    buf[1..3].copy_from_slice(&width.to_be_bytes());
-    buf[3..5].copy_from_slice(&height.to_be_bytes());
+    buf[1..5].copy_from_slice(&display_id.to_be_bytes());
+    buf[5..7].copy_from_slice(&width.to_be_bytes());
+    buf[7..9].copy_from_slice(&height.to_be_bytes());
     buf
 }
 
@@ -197,9 +204,10 @@ mod tests {
 
     #[test]
     fn touch_message_layout() {
-        // 对照 scrcpy 序列化：type, action, pointerId(u64be), x/y(i32be),
-        // w/h(u16be), pressure(u16fp), actionButton, buttons
+        // 对照 kulua-server ControlChannel.java：type, displayId(u32be), action,
+        // pointerId(u64be), x/y(i32be), w/h(u16be), pressure(u16fp), actionButton, buttons
         let msg = inject_touch(
+            7,
             touch_action::DOWN,
             POINTER_ID_MOUSE,
             100,
@@ -210,26 +218,28 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(msg.len(), 32);
+        assert_eq!(msg.len(), 36);
         assert_eq!(msg[0], msg_type::INJECT_TOUCH_EVENT);
-        assert_eq!(msg[1], 0);
-        assert_eq!(&msg[2..10], &POINTER_ID_MOUSE.to_be_bytes());
-        assert_eq!(&msg[10..14], &100i32.to_be_bytes());
-        assert_eq!(&msg[14..18], &200i32.to_be_bytes());
-        assert_eq!(&msg[18..20], &1280u16.to_be_bytes());
-        assert_eq!(&msg[20..22], &960u16.to_be_bytes());
+        assert_eq!(&msg[1..5], &7u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(msg[5], 0);
+        assert_eq!(&msg[6..14], &POINTER_ID_MOUSE.to_be_bytes());
+        assert_eq!(&msg[14..18], &100i32.to_be_bytes());
+        assert_eq!(&msg[18..22], &200i32.to_be_bytes());
+        assert_eq!(&msg[22..24], &1280u16.to_be_bytes());
+        assert_eq!(&msg[24..26], &960u16.to_be_bytes());
         assert_eq!(
-            &msg[22..24],
+            &msg[26..28],
             &0xFFFFu16.to_be_bytes(),
             "pressure=1.0 → 0xFFFF"
         );
-        assert_eq!(&msg[24..28], &0u32.to_be_bytes());
         assert_eq!(&msg[28..32], &0u32.to_be_bytes());
+        assert_eq!(&msg[32..36], &0u32.to_be_bytes());
     }
 
     #[test]
     fn touch_pressure_zero() {
         let msg = inject_touch(
+            0,
             touch_action::MOVE,
             POINTER_ID_MOUSE,
             0,
@@ -240,30 +250,31 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(&msg[22..24], &0u16.to_be_bytes());
+        assert_eq!(&msg[26..28], &0u16.to_be_bytes());
     }
 
     #[test]
     fn scroll_message_layout() {
-        // 对照 scrcpy：position(12B) + hscroll i16fp + vscroll i16fp + buttons
-        let msg = inject_scroll(50, 60, 1280, 960, 0.0, -16.0, 0);
-        assert_eq!(msg.len(), 21);
+        // 对照 kulua-server：type, displayId(u32be), position(12B), hscroll/vscroll i16fp, buttons
+        let msg = inject_scroll(3, 50, 60, 1280, 960, 0.0, -16.0, 0);
+        assert_eq!(msg.len(), 25);
         assert_eq!(msg[0], msg_type::INJECT_SCROLL_EVENT);
-        assert_eq!(&msg[1..5], &50i32.to_be_bytes());
-        assert_eq!(&msg[5..9], &60i32.to_be_bytes());
-        assert_eq!(&msg[9..11], &1280u16.to_be_bytes());
-        assert_eq!(&msg[11..13], &960u16.to_be_bytes());
+        assert_eq!(&msg[1..5], &3u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(&msg[5..9], &50i32.to_be_bytes());
+        assert_eq!(&msg[9..13], &60i32.to_be_bytes());
+        assert_eq!(&msg[13..15], &1280u16.to_be_bytes());
+        assert_eq!(&msg[15..17], &960u16.to_be_bytes());
         // vscroll=-16 → 归一化 -1.0 → i16fp -0x8000
-        assert_eq!(&msg[15..17], &(-0x8000i16).to_be_bytes());
-        assert_eq!(&msg[13..15], &0i16.to_be_bytes(), "hscroll=0");
-        assert_eq!(&msg[17..21], &0u32.to_be_bytes());
+        assert_eq!(&msg[19..21], &(-0x8000i16).to_be_bytes());
+        assert_eq!(&msg[17..19], &0i16.to_be_bytes(), "hscroll=0");
+        assert_eq!(&msg[21..25], &0u32.to_be_bytes());
     }
 
     #[test]
     fn scroll_positive_half() {
         // vscroll=8 → 归一化 0.5 → 0x4000
-        let msg = inject_scroll(0, 0, 100, 100, 0.0, 8.0, 0);
-        assert_eq!(&msg[15..17], &0x4000i16.to_be_bytes());
+        let msg = inject_scroll(0, 0, 0, 100, 100, 0.0, 8.0, 0);
+        assert_eq!(&msg[19..21], &0x4000i16.to_be_bytes());
     }
 
     #[test]
@@ -271,20 +282,22 @@ mod tests {
         let back = back_or_screen_on(key_action::DOWN);
         assert_eq!(back, vec![msg_type::BACK_OR_SCREEN_ON, 0]);
 
-        let start = start_app("com.android.settings").unwrap();
+        let start = start_app(5, "com.android.settings").unwrap();
         assert_eq!(start[0], msg_type::START_APP);
-        assert_eq!(start[1], 20);
-        assert_eq!(&start[2..], b"com.android.settings");
+        assert_eq!(&start[1..5], &5u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(start[5], 20);
+        assert_eq!(&start[6..], b"com.android.settings");
 
-        assert!(start_app(&"a".repeat(300)).is_err());
+        assert!(start_app(0, &"a".repeat(300)).is_err());
     }
 
     #[test]
     fn resize_display_layout() {
-        let msg = resize_display(1920, 1080);
-        assert_eq!(msg.len(), 5);
+        let msg = resize_display(9, 1920, 1080);
+        assert_eq!(msg.len(), 9);
         assert_eq!(msg[0], msg_type::RESIZE_DISPLAY);
-        assert_eq!(&msg[1..3], &1920u16.to_be_bytes());
-        assert_eq!(&msg[3..5], &1080u16.to_be_bytes());
+        assert_eq!(&msg[1..5], &9u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(&msg[5..7], &1920u16.to_be_bytes());
+        assert_eq!(&msg[7..9], &1080u16.to_be_bytes());
     }
 }

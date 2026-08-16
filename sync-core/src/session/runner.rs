@@ -14,6 +14,13 @@ use super::handle::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STAT
 use super::proto::{audio_codec_name, build_clipboard_frame, read_device_message};
 use crate::audio_player::AUDIO_BUFFER_MAX_MS;
 
+/// 连接类型握手字节（与 kulua-server ConnectionManager 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionType {
+    Control = 0x01,
+    Audio = 0x02,
+}
+
 /// 单个设备的完整 session。
 ///
 /// 包含部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询 + 音频播放的完整生命周期。
@@ -121,9 +128,31 @@ impl Session {
             }
         };
         println!(
-            "scrcpy-server alive on {} (port {}, audio={})",
+            "kulua-server alive on {} (port {}, audio={})",
             self.device.serial, self.port, audio_enabled
         );
+
+        // 设备名：kulua-server 不发送设备元数据（官方 send_device_meta 已废弃），
+        // 改用 `getprop ro.product.model` 获取（一次 shell 往返，仅当 name 为空时）
+        if self.device.name.is_empty() {
+            let adb = self.adb.clone();
+            let serial = self.device.serial.clone();
+            let serial_for_closure = serial.clone();
+            let tx = self.device_name_tx.take();
+            if tx.is_some() {
+                let result = tokio::task::spawn_blocking(move || {
+                    adb.run(&["-s", &serial_for_closure, "shell", "getprop", "ro.product.model"])
+                })
+                .await;
+                if let Ok(Ok(output)) = result {
+                    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !name.is_empty() {
+                        println!("Device name: {} ({})", name, serial);
+                        let _ = tx.unwrap().send((serial, name)).await;
+                    }
+                }
+            }
+        }
 
         if !audio_enabled {
             // 音频未启用：单连接 control-only
@@ -134,18 +163,9 @@ impl Session {
 
         // ── 音频启用：双连接架构 ──
 
-        let audio_stream = self
-            .connect_socket(port, &mut server, &mut stop_rx, true)
-            .await;
-        if audio_stream.is_none() {
-            return;
-        }
-        let mut audio_stream = audio_stream.unwrap();
-        // 启用 TCP_NODELAY 及时检测断连
-        let _ = audio_stream.set_nodelay(true);
-        // 先连 control socket，让 server 的 open() 能 accept 完所有 socket 后返回
+        // 先连 control socket，再连 audio socket（顺序无关，server 每连接独立线程）
         let control_stream = self
-            .connect_socket(port, &mut server, &mut stop_rx, false)
+            .connect_socket(port, &mut server, &mut stop_rx, Some(ConnectionType::Control))
             .await;
         if control_stream.is_none() {
             return;
@@ -154,21 +174,17 @@ impl Session {
         // 控制通道禁用 Nagle（官方默认行为）
         let _ = control_stream.set_nodelay(true);
 
-        let mut name_buf = [0u8; 64];
-        // 读设备名称（64 字节，scrcpy 协议设备信息交换）
-        if audio_stream.read_exact(&mut name_buf).await.is_ok() {
-            let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
-            let device_name = String::from_utf8_lossy(&name_buf[..name_end]).to_string();
-            if !device_name.is_empty() {
-                println!("Device name: {} ({})", device_name, self.device.serial);
-                self.device.name = device_name.clone();
-                if let Some(tx) = self.device_name_tx.take() {
-                    let _ = tx.send((self.device.serial.clone(), device_name)).await;
-                }
-            }
+        let audio_stream = self
+            .connect_socket(port, &mut server, &mut stop_rx, Some(ConnectionType::Audio))
+            .await;
+        if audio_stream.is_none() {
+            return;
         }
+        let mut audio_stream = audio_stream.unwrap();
+        // 启用 TCP_NODELAY 及时检测断连
+        let _ = audio_stream.set_nodelay(true);
 
-        // 读 codec ID header（4 字节大端序）
+        // 读 codec ID header（4 字节大端序；kulua-server 音频连接首字节即 codec id）
         let mut codec_buf = [0u8; 4];
         if audio_stream.read_exact(&mut codec_buf).await.is_err() {
             eprintln!(
@@ -379,35 +395,34 @@ impl Session {
         println!("Session {} cleaned up", self.device.serial);
     }
 
-    /// 连接到 scrcpy ADB forward 端口。
+    /// 连接到 kulua-server ADB forward 端口，完成类型握手。
     ///
-    /// `read_dummy=true` 时连上后读一个 dummy byte（第一个 socket），
-    /// 读失败说明 server 未就绪，重试整个流程。
+    /// 连接后写 1 字节连接类型（0x01=control / 0x02=audio）。写失败说明
+    /// server 未就绪（app_process 冷启动中，adb 转发层断开连接），重试整个流程。
     async fn connect_socket(
         &self,
         port: u16,
         server: &mut scrcpy::ScrcpyServer,
         stop_rx: &mut oneshot::Receiver<()>,
-        read_dummy: bool,
+        conn_type: Option<ConnectionType>,
     ) -> Option<TcpStream> {
         // 最多重试 20 次（500ms 间隔 = 10s），超时判死写 failed（docs/session-state-design.md §3.3）
         let mut attempts: u8 = 0;
         loop {
             match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
                 Ok(mut s) => {
-                    if read_dummy {
-                        let mut dummy = [0u8; 1];
-                        // 异步读 dummy byte，server 在 DesktopConnection.accept() 后发送
-                        // 用 select! 同时监听 stop 信号，避免死等
-                        let read_result = tokio::select! {
+                    if let Some(conn_type) = conn_type {
+                        // 写握手字节；server 尚未监听时 adb 转发层直接断开 → 写失败重试
+                        let handshake = [conn_type as u8];
+                        let write_result = tokio::select! {
                             _ = &mut *stop_rx => {
                                 server.stop(self.adb.as_ref());
                                 return None;
                             }
-                            r = s.read_exact(&mut dummy) => r,
+                            r = s.write_all(&handshake) => r,
                         };
-                        if read_result.is_err() {
-                            // 读失败（极少见：server 在写完前就挂了），drop 重试
+                        if write_result.is_err() {
+                            // 写失败（server 未就绪），drop 重试
                             drop(s);
                         } else {
                             return Some(s);
@@ -429,7 +444,7 @@ impl Session {
                 server.stop(self.adb.as_ref());
                 return None;
             }
-            // 连接失败或 dummy 读失败，等 500ms 或 stop 信号
+            // 连接失败或握手写失败，等 500ms 或 stop 信号
             tokio::select! {
                 _ = &mut *stop_rx => {
                     server.stop(self.adb.as_ref());
@@ -510,30 +525,16 @@ impl Session {
         mut stop_rx: oneshot::Receiver<()>,
     ) {
         // 只需要 1 个 socket（control）
-        let mut stream = match self
-            .connect_socket(self.port, server, &mut stop_rx, true)
+        let stream = match self
+            .connect_socket(self.port, server, &mut stop_rx, Some(ConnectionType::Control))
             .await
         {
             Some(s) => s,
             None => return,
         };
-        // 握手成功（dummy byte 就绪）→ running
+        // 握手成功（control 类型字节已发送）→ running
         self.session_state
             .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
-
-        // 读设备名
-        let mut name_buf = [0u8; 64];
-        if stream.read_exact(&mut name_buf).await.is_ok() {
-            let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
-            let device_name = String::from_utf8_lossy(&name_buf[..name_end]).to_string();
-            if !device_name.is_empty() {
-                println!("Device name: {} ({})", device_name, self.device.serial);
-                self.device.name = device_name.clone();
-                if let Some(tx) = self.device_name_tx.take() {
-                    let _ = tx.send((self.device.serial.clone(), device_name)).await;
-                }
-            }
-        }
 
         // 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));

@@ -1,12 +1,11 @@
-//! 视频流读取线程：读 scrcpy 视频 socket → 解码 → 送渲染事件。
+//! 视频流读取线程：读 kulua-server 视频 socket → 解码 → 送渲染事件。
 //!
-//! 流格式（scrcpy v4.0 源码核实）：
-//! - 先读 4 字节 codec id（大端）
-//! - 然后循环读 12 字节帧头：
-//!   - bit63（SESSION 标志）：session 帧，后 8 字节为 width(u32be) + height(u32be)，
-//!     `header[3] & 1` = client_resized；无 payload
-//!   - 否则：8 字节 pts/flags（bit62=config，bit61=keyframe，pts = 低 61 位）
-//!     + 4 字节 payload 长度，随后是 payload
+//! 流格式（连接阶段已读完 displayId + codecId，此处直接进入帧循环）：
+//! 循环读 12 字节帧头：
+//! - bit63（SESSION 标志）：session 帧，后 8 字节为 width(u32be) + height(u32be)，
+//!   `header[3] & 1` = client_resized；无 payload
+//! - 否则：8 字节 pts/flags（bit62=config，bit61=keyframe，pts = 低 61 位）
+//!   + 4 字节 payload 长度，随后是 payload
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -36,32 +35,20 @@ pub enum VideoEvent {
 }
 
 /// 启动视频读取线程。每产生一帧都会通过 proxy 发送 user event 唤醒事件循环。
-pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: EventLoopProxy<()>) {
+pub fn spawn_video_thread(
+    video: TcpStream,
+    codec_id: u32,
+    tx: Sender<VideoEvent>,
+    proxy: EventLoopProxy<()>,
+) {
     std::thread::spawn(move || {
         let mut video = video;
         let _ = video.set_read_timeout(None);
 
-        // 1. 设备名（64 字节，send_device_meta 写入 video socket；dummy byte 已由部署阶段读取）
-        let mut name_buf = [0u8; 64];
-        if read_exact(&mut video, &mut name_buf).is_err() {
-            let _ = tx.send(VideoEvent::Error("读取设备名失败".into()));
-            return;
-        }
-        let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
-        let device_name = String::from_utf8_lossy(&name_buf[..name_end]);
-        println!("[viewer] 设备名: {}", device_name);
-
-        // 2. codec id（4 字节大端；v4.0 为 ASCII 名称如 "h264"/"h265"/"av1"）
-        let mut codec_buf = [0u8; 4];
-        if read_exact(&mut video, &mut codec_buf).is_err() {
-            let _ = tx.send(VideoEvent::Error("读取 codec id 失败".into()));
-            return;
-        }
-        let codec_id = u32::from_be_bytes(codec_buf);
         println!(
             "[viewer] codec id: {:#010x} ({})",
             codec_id,
-            String::from_utf8_lossy(&codec_buf)
+            String::from_utf8_lossy(&codec_id.to_be_bytes())
         );
         let mut decoder = match VideoDecoder::new(codec_id) {
             Ok(d) => d,
@@ -71,7 +58,7 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
             }
         };
 
-        // 3. 帧循环
+        // 帧循环
         loop {
             let mut header = [0u8; 12];
             if read_exact(&mut video, &mut header).is_err() {
