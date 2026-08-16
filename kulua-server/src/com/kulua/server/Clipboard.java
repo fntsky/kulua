@@ -52,6 +52,57 @@ public final class Clipboard {
         }
     }
 
+    /** 剪贴板变化时的订阅回调（ConnectionManager 注册）。 */
+    public interface ChangeListener {
+        void onClipboardChanged(String text);
+    }
+
+    private static final java.util.List<ChangeListener> listeners = new java.util.ArrayList<>();
+
+    /** 注册剪贴板变化监听（control 连接推送用）。 */
+    public static synchronized void addChangeListener(ChangeListener listener) {
+        listeners.add(listener);
+    }
+
+    /** 注销剪贴板变化监听（连接断开时）。 */
+    public static synchronized void removeChangeListener(ChangeListener listener) {
+        listeners.remove(listener);
+    }
+
+    /** 广播剪贴板变化（PC→手机写入后回环推送 + 手机本地变化）。 */
+    public static synchronized void broadcastChange(String text) {
+        for (ChangeListener listener : listeners) {
+            try {
+                listener.onClipboardChanged(text);
+            } catch (Exception ignored) {
+                // ignore
+            }
+        }
+    }
+
+    /** 启动系统剪贴板监听线程（手机→PC 方向推送）。 */
+    public static void startMonitor() {
+        Thread thread = new Thread(() -> {
+            String last = null;
+            while (true) {
+                try {
+                    Thread.sleep(300);
+                    String current = get();
+                    if (!current.isEmpty() && !current.equals(last)) {
+                        last = current;
+                        broadcastChange(current);
+                    }
+                } catch (InterruptedException e) {
+                    return;
+                } catch (Exception ignored) {
+                    // ignore
+                }
+            }
+        }, "clipboard-monitor");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
     public static String get() {
         try {
             ClipboardManager manager =

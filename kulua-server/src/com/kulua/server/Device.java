@@ -121,17 +121,26 @@ public final class Device {
         return ok;
     }
 
-    /** 启动应用：shell 权限下用 `am start` 命令（ActivityManager.startActivity 静态为隐藏 API）。 */
-    public static void startApp(String packageName) {
+    /** 启动应用到指定显示器（shell 权限下用 `am start --display <id>`）。 */
+    public static void startApp(String packageName, int displayId) {
         try {
-            Process process = new ProcessBuilder("am", "start",
-                    "-a", "android.intent.action.MAIN",
-                    "-c", "android.intent.category.LAUNCHER",
-                    "-p", packageName)
-                    .redirectErrorStream(true)
-                    .start();
+            java.util.List<String> command = new java.util.ArrayList<>();
+            command.add("am");
+            command.add("start");
+            command.add("-a");
+            command.add("android.intent.action.MAIN");
+            command.add("-c");
+            command.add("android.intent.category.LAUNCHER");
+            command.add("-p");
+            command.add(packageName);
+            if (displayId != 0) {
+                command.add("--display");
+                command.add(String.valueOf(displayId));
+            }
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
-            Log.i(TAG, "start app " + packageName + " exit=" + process.exitValue());
+            Log.i(TAG, "start app " + packageName + " on display " + displayId
+                    + " exit=" + process.exitValue());
         } catch (Exception e) {
             Log.e(TAG, "start app failed: " + packageName, e);
         }

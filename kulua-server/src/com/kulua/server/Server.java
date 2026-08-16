@@ -43,7 +43,15 @@ public final class Server {
         Options options = Options.parse(args);
         android.util.Log.i("kulua", "kulua-server " + options.scid);
 
+        // 一次性模式：枚举应用后退出（不监听 socket）
+        if (options.listApps) {
+            AppLister.runAndExit();
+            return;
+        }
+
         ConnectionManager manager = new ConnectionManager(options);
+        // 轮询系统剪贴板，变化时推送给所有 control 连接（手机 → PC 方向）
+        Clipboard.startMonitor();
         manager.loop();
     }
 }

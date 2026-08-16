@@ -25,7 +25,7 @@ import java.nio.charset.StandardCharsets;
  *                      hScroll i16fp, vScroll i16fp, buttons u32be
  * - 4  BACK_OR_SCREEN_ON: action u8
  * - 9  SET_CLIPBOARD:  sequence u64be, paste u8, len u32be + UTF-8
- * - 16 START_APP:      len u8 + package
+ * - 16 START_APP:      displayId u32be, len u8 + package（多显示器扩展）
  * - 21 RESIZE_DISPLAY: displayId u32be, w u16be, h u16be（多显示器扩展）
  * - 100 CREATE_DISPLAY: w u16be, h u16be, dpi u16be（扩展，阶段 2 生效）
  * - 101 DESTROY_DISPLAY: displayId u32be（扩展，阶段 2 生效）
@@ -56,19 +56,49 @@ public final class ControlChannel {
 
     public void run() throws IOException {
         DataInputStream input = new DataInputStream(socket.getInputStream());
-        while (true) {
-            int type;
-            try {
-                type = input.readUnsignedByte();
-            } catch (EOFException e) {
-                // 客户端断开，正常结束
-                break;
+        // 剪贴板变化推送（server → client）：注册监听，连接断开时注销
+        Clipboard.ChangeListener listener = this::pushClipboard;
+        Clipboard.addChangeListener(listener);
+        try {
+            while (true) {
+                int type;
+                try {
+                    type = input.readUnsignedByte();
+                } catch (EOFException e) {
+                    // 客户端断开，正常结束
+                    break;
+                }
+                if (!handleMessage(type, input)) {
+                    break;
+                }
             }
-            if (!handleMessage(type, input)) {
-                break;
-            }
+        } finally {
+            Clipboard.removeChangeListener(listener);
         }
         Log.i(TAG, "control channel closed");
+    }
+
+    /**
+     * 推送剪贴板变化：scrcpy 客户端事件格式 type 0x00 + len u32be + UTF-8。
+     * 仅在有内容且与当前值不同时推送（避免 setClipboard 回环时重复推送）。
+     */
+    private void pushClipboard(String text) {
+        try {
+            byte[] data = text.getBytes(StandardCharsets.UTF_8);
+            synchronized (socket) {
+                OutputStream out = socket.getOutputStream();
+                out.write(0x00);
+                out.write((data.length >>> 24) & 0xff);
+                out.write((data.length >>> 16) & 0xff);
+                out.write((data.length >>> 8) & 0xff);
+                out.write(data.length & 0xff);
+                out.write(data);
+                out.flush();
+            }
+        } catch (IOException e) {
+            // 连接可能已断开，忽略（run() 的读循环会处理断开）
+            Log.w(TAG, "clipboard push failed", e);
+        }
     }
 
     private boolean handleMessage(int type, DataInputStream input) throws IOException {
@@ -185,17 +215,20 @@ public final class ControlChannel {
         String text = new String(data, StandardCharsets.UTF_8);
         boolean ok = Clipboard.set(text);
         Log.i(TAG, "set clipboard (" + sequence + ") paste=" + paste + " ok=" + ok);
+        Clipboard.broadcastChange(text);
         if (paste) {
             Device.injectText(text);
         }
     }
 
     private void startApp(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int len = input.readUnsignedByte();
         byte[] data = new byte[len];
         input.readFully(data);
         String packageName = new String(data, StandardCharsets.UTF_8);
-        Device.startApp(packageName);
+        int systemDisplayId = displayManager.systemDisplayId(displayId);
+        Device.startApp(packageName, systemDisplayId);
     }
 
     private void resizeDisplay(DataInputStream input) throws IOException {

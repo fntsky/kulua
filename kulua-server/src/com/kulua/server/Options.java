@@ -9,6 +9,9 @@ public final class Options {
     /** scid（16 进制字符串），socket 名为 scrcpy_<scid> */
     public String scid = "4b4c0000";
 
+    /** 一次性模式：枚举可启动应用后退出（apps.rs 解析输出） */
+    public boolean listApps;
+
     private Options() {
         // use parse()
     }
@@ -26,6 +29,7 @@ public final class Options {
         if (scid != null) {
             options.scid = scid;
         }
+        options.listApps = "true".equals(map.get("list_apps"));
         return options;
     }
 }
