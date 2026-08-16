@@ -4,7 +4,7 @@
 
 ## How It Works
 
-利用 Android 系统自带的 ADB 调试功能，`adb push scrcpy-server.jar` 到设备后通过 `app_process` 启动，实现"零安装"的剪贴板读取和设备管理。
+利用 Android 系统自带的 ADB 调试功能，`adb push` 自研 `kulua-server.jar`（`kulua-server/` 目录的 Java 工程，`build.ps1` 构建）到设备后通过 `app_process` 启动，实现"零安装"的剪贴板读取、多窗口融合视频与音频回传。
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -25,7 +25,7 @@
 ├──────────────────────────────────────────────────────┤
 │                      Phone                            │
 │            ┌──────────────────────────┐               │
-│            │  scrcpy-server (via adb) │               │
+│            │  kulua-server (via adb)  │               │
 │            │  clipboard listener      │               │
 │            │  notification forward    │               │
 │            └──────────────────────────┘               │
@@ -63,7 +63,7 @@ Core (device mgmt + session orchestration)
 | `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`, `getprop`） |
 | `app` / `Core` | 设备发现、身份合并、连接调度、Session 编排 |
 | `session` | 单设备声明周期管理（scrcpy 部署、剪贴板 I/O、通知轮询、音频） |
-| `scrcpy` | scrcpy-server 部署/启停（scid 会话隔离 + 精准 kill）+ 剪贴板协议解析 |
+| `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 剪贴板协议解析 |
 | `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，60s 缓存） |
 | `fusion` | 融合窗口管理（fusion-viewer.exe 进程生命周期：启动 / 回收 / 优雅关闭） |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
@@ -175,12 +175,12 @@ npm install
 npm run tauri dev
 ```
 
-首次使用前需要将 `scrcpy-server` jar 文件放在项目根目录或 daemon 同级目录。
+首次使用前需要将 `kulua-server.jar`（`kulua-server/build.ps1` 构建产出）放在项目根目录或 daemon 同级目录。
 
 Windows 发布包（`build.ps1 -Release`）会自动打包自研融合窗口客户端
 （`fusion-viewer.exe` + `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`，
-来源为 `vendor/scrcpy-win64` 或 `$env:SCRCPY_HOME`，可用 `-FfmpegDir <目录>` 显式指定）。
-缺少 DLL 不影响基础功能，仅融合模式不可用。
+来源为 `vendor/scrcpy-win64` 或 `$env:SCRCPY_HOME`，可用 `-FfmpegDir <目录>` 显式指定），
+以及自研 `kulua-server.jar`。缺少 DLL 不影响基础功能，仅融合模式不可用。
 
 > fusion-viewer 构建注意事项：系统 PATH 中的 msys2/mingw64 会干扰 `ffmpeg-sys-next`
 > 的 C 头文件探测，构建请使用 `scripts\build-viewer.cmd`（内部净化 PATH）。
@@ -197,7 +197,7 @@ kulua/
 │   └── src/
 │       ├── app.rs       # 设备管理主循环 + insert_device
 │       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
-│       ├── scrcpy.rs    # scrcpy-server 交互（scid 会话隔离）
+│       ├── scrcpy.rs    # kulua-server 部署/启停（scid 会话隔离）
 │       ├── apps.rs      # 设备应用枚举（server 一次性模式 + 缓存）
 │       ├── fusion.rs    # 融合窗口管理（scrcpy.exe 进程）
 │       ├── adb_cmd.rs   # ADB CLI 封装
@@ -212,16 +212,17 @@ kulua/
 ├── vendor/scrcpy-win64/ # FFmpeg 7.1 运行时 DLL（融合窗口自研客户端用）
 ├── vendor/ffmpeg-7.1/   # FFmpeg 7.1 头文件 + 导入库（构建 fusion-viewer 用）
 ├── fusion-viewer/       # 自研融合窗口客户端（winit + FFmpeg + 自研控制协议）
+├── kulua-server/        # 自研设备端 server（Java：多虚拟显示器 + 剪贴板 + 音频回传）
+│   └── build.ps1        # javac + d8 + jar 构建脚本
 ├── build.sh             # 构建脚本 (Linux/macOS)
 ├── build.ps1            # 构建脚本 (Windows)
-├── scrcpy-server        # scrcpy server jar
 └── IPC-DESIGN.md        # IPC 协议设计文档
 ```
 
 ## Core Constraints
 
 - **手机上绝不安装任何 APK** — 所有功能通过 `adb push` + `adb shell app_process` 实现
-- 依赖 `scrcpy-server.jar`（scrcpy 官方的 server jar）
+- 依赖自研 `kulua-server.jar`（`kulua-server/build.ps1` 构建，替代官方 scrcpy-server）
 - 需要本地有 `adb` 可执行文件
 - 融合窗口由自研 `fusion-viewer.exe` 实现（winit 窗口 + FFmpeg 解码 + 自研控制协议），
   不依赖官方 scrcpy.exe；手机上仍不装任何 APK；
@@ -232,7 +233,7 @@ kulua/
 - ✅ mDNS 发现配对设备
 - ✅ QR 码配对
 - ✅ 自动配对 + 连接已发现的设备
-- ✅ Push scrcpy-server 到手机并启动
+- ✅ Push 自研 kulua-server.jar 到手机并启动（单进程多虚拟显示器 + 剪贴板 + 音频）
 - ✅ 剪贴板监听（手机↔PC 双向）
 - ✅ 通知转发与桌面展示
 - ✅ TCP IPC 服务（daemon ↔ GUI）

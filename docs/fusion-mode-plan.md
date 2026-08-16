@@ -10,6 +10,18 @@
 > daemon 的 `FusionManager` 拉起 `fusion-viewer.exe`（参数：serial/package/label/jar）。
 > 服务器侧不变（`new_display` 虚拟显示器 + scid 隔离）；`build.ps1` 打包
 > `fusion-viewer.exe` + FFmpeg DLL（avcodec-62/avutil-60/swresample-6），不再打包 scrcpy.exe。
+>
+> ⚠️ **方案变更（2026-08-16 晚）**：按用户要求，server 也**完全自研**（`kulua-server.jar`），
+> 不再依赖官方 `scrcpy-server.jar`。§2/§5 的"内置官方 4.0 jar"决策已废弃，替换为：
+> - 单 server 进程管理**多个虚拟显示器**：每个客户端 video 连接携带创建参数
+>   （WxH/DPI），server 回 displayId + codecId 后推流（连接驱动，无 CREATE_DISPLAY 消息）
+> - 每个连接首字节为类型握手：0x01=control / 0x02=audio / 0x03=video
+> - 控制消息 touch/scroll/start_app/resize 带 displayId u32be 前缀（多显示器扩展）
+> - 剪贴板：server 轮询系统剪贴板变化并推送（0x00 + len + UTF-8），control 连接
+>   每连接独立线程（daemon session 与多个 viewer 可同时连接同一 server）
+> - `list_apps=true` 一次性模式输出格式与官方一致，apps.rs 解析器复用
+> - daemon session 部署 `kulua-server.jar`（参数仅 `scid=<hex>`），viewer 用
+>   `--connect <port>` 连接 session 的 forward 端口，不再自部署 server
 
 ---
 
@@ -259,16 +271,12 @@ Tauri 新增：
 
 ### 6.6 打包与发布
 
-- 把官方 `scrcpy-win64-v4.0` 的以下文件放入发布目录：
-  - `scrcpy.exe`
-  - `SDL3.dll`
-  - `avcodec-62.dll`
-  - `avformat-62.dll`
-  - `avutil-60.dll`
-  - `swresample-6.dll`
-  - `libusb-1.0.dll`
-- `build.ps1` 增加 `-ScrcpyDir` 参数，自动从 `vendor/scrcpy-win64`、`$env:SCRCPY_HOME` 或 PATH 查找并打包
-- `daemon/src/main.rs` 路径解析补上 `current_exe().parent().join("scrcpy.exe")`
+- 自研 viewer 运行时（无官方 scrcpy.exe）：
+  - `fusion-viewer.exe`（winit 窗口 + FFmpeg 解码 + 自研控制协议）
+  - FFmpeg DLL：`avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`（vendor/scrcpy-win64）
+- 自研 server jar：`kulua-server.jar`（`kulua-server/build.ps1` 产出，替代官方 scrcpy-server）
+- `build.ps1` 自动打包 `fusion-viewer.exe` + FFmpeg DLL + `kulua-server.jar`
+- `daemon/src/main.rs` 的 `find_jar()` 查找 `kulua-server.jar`（项目根/上级/daemon 同级）
 - 更新 `README.md`、`IPC-DESIGN.md`、`AGENTS.md`
 
 ---
