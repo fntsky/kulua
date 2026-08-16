@@ -1,0 +1,13 @@
+[package]
+name = "fusion-viewer"
+version = "0.1.0"
+edition = "2024"
+
+# 自研 scrcpy 客户端：winit 窗口 + FFmpeg 软解 + 自研控制协议注入。
+# 不依赖官方 scrcpy.exe；运行时复用 dist 中的 avcodec-62.dll / avutil-60.dll。
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+# 仅 avcodec（avutil 为隐式依赖；YUV→RGB 手写转换，不需要 swscale）
+ffmpeg-sys-next = { version = "7", default-features = false, features = ["avcodec"] }

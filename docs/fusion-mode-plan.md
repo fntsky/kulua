@@ -3,6 +3,13 @@
 > 目标仓库：`E:\code\sync-workspace`（即 `/mnt/e/code/sync-workspace`）
 > 发布目录：`dist/sync-workspace`、`dist/kulua`
 > 状态：✅ 已实施（2026-08-16），实施顺序见 §7，代码与文档已同步更新
+>
+> ⚠️ **方案变更（2026-08-16 同日）**：按用户要求，融合模式客户端**完全自研**，
+> 不再使用官方 `scrcpy.exe`。§5/§6.2 的"复用官方 scrcpy.exe"决策已废弃，替换为：
+> 新增 `fusion-viewer` crate（winit 窗口 + FFmpeg 软解 + 自研控制协议注入），
+> daemon 的 `FusionManager` 拉起 `fusion-viewer.exe`（参数：serial/package/label/jar）。
+> 服务器侧不变（`new_display` 虚拟显示器 + scid 隔离）；`build.ps1` 打包
+> `fusion-viewer.exe` + FFmpeg DLL（avcodec-62/avutil-60/swresample-6），不再打包 scrcpy.exe。
 
 ---
 

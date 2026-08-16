@@ -1,19 +1,13 @@
-//! 融合窗口管理（scrcpy 4.0 融合模式）。
+//! 融合窗口管理（scrcpy 4.0 融合模式，完全自研客户端）。
 //!
-//! 复用官方 `scrcpy.exe` 作为独立窗口进程（`--new-display` + `-x` 弹性显示器 +
-//! `--start-app=<pkg>`），不在 Rust 中实现视频解码/渲染/输入注入。
-//! 每个应用一个 scrcpy 进程（官方客户端各自随机 scid，天然互不干扰），
-//! daemon 负责进程生命周期：启动、每 tick 回收已退出窗口、退出时优雅关闭。
+//! daemon 拉起自研 `fusion-viewer.exe`（winit 窗口 + FFmpeg 软解 + 自研控制协议注入），
+//! 不依赖官方 scrcpy.exe。viewer 内部自行部署 scrcpy-server（`new_display` 虚拟显示器）
+//! 并注入输入；每个应用一个 viewer 进程，daemon 负责进程生命周期：
+//! 启动、每 tick 回收已退出窗口、退出时优雅关闭。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-/// 融合窗口的本地端口段：现有 Kulua session 端口从 27183 递增，融合窗口避开该段。
-pub const FUSION_PORT_RANGE: &str = "27200:27299";
-
-/// 初始虚拟显示器尺寸/DPI（scrcpy `-x` 模式默认值，官方文档推荐）。
-pub const NEW_DISPLAY_SIZE: &str = "1280x960/160";
 
 /// 窗口状态（IPC 推送用文本）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,15 +61,15 @@ impl FusionManager {
         }
     }
 
-    /// 查找 scrcpy.exe：daemon 同目录 → `SCRCPY_EXE` 环境变量 → PATH。
-    pub fn find_scrcpy_exe() -> Option<PathBuf> {
+    /// 查找 fusion-viewer.exe：daemon 同目录 → `FUSION_VIEWER_EXE` 环境变量 → PATH。
+    pub fn find_viewer_exe() -> Option<PathBuf> {
         let exe_name = if cfg!(windows) {
-            "scrcpy.exe"
+            "fusion-viewer.exe"
         } else {
-            "scrcpy"
+            "fusion-viewer"
         };
 
-        // 1. daemon 同目录（发布包布局：daemon.exe + scrcpy.exe 平级）
+        // 1. daemon 同目录（发布包布局：daemon.exe + fusion-viewer.exe 平级）
         if let Ok(exe) = std::env::current_exe() {
             let candidate = exe
                 .parent()
@@ -86,8 +80,8 @@ impl FusionManager {
             }
         }
 
-        // 2. SCRCPY_EXE 环境变量（显式指定完整路径）
-        if let Ok(path) = std::env::var("SCRCPY_EXE") {
+        // 2. FUSION_VIEWER_EXE 环境变量（显式指定完整路径）
+        if let Ok(path) = std::env::var("FUSION_VIEWER_EXE") {
             let candidate = PathBuf::from(path);
             if candidate.exists() {
                 return Some(candidate);
@@ -107,34 +101,31 @@ impl FusionManager {
         None
     }
 
-    /// 是否可用（存在 scrcpy.exe 运行时）。
+    /// 是否可用（存在 fusion-viewer.exe 运行时）。
     pub fn is_supported(&self) -> bool {
-        Self::find_scrcpy_exe().is_some()
+        Self::find_viewer_exe().is_some()
     }
 
-    /// 构建融合窗口命令行参数（纯函数，便于单测）。
+    /// 构建 fusion-viewer 命令行参数（纯函数，便于单测）。
     ///
-    /// 设计决策（见 docs/fusion-mode-plan.md §6.2）：
-    /// - `--no-audio`：音频继续由 Kulua session 统一转发，避免双采集冲突
-    /// - `--no-clipboard-autosync`：剪贴板由 Kulua session 负责，避免多 server 回环同步
-    /// - `--port=<范围>`：避开 session 端口段（27183 起）
+    /// 设计决策（见 docs/fusion-mode-plan.md §6.2 及自研方案）：
+    /// - viewer 内部自行部署 scrcpy-server（`new_display` 虚拟显示器 + `video=true`）
+    /// - 音频/剪贴板继续由 Kulua session 负责（server `audio=false` + `clipboard_autosync=false`）
     /// - H264 + 8M：兼容性优先，后续可做设置项
-    pub fn build_args(serial: &str, package: &str, window_title: &str) -> Vec<String> {
-        vec![
-            "-s".to_string(),
+    pub fn build_args(serial: &str, package: &str, label: &str, jar: &str) -> Vec<String> {
+        let mut args = vec![
+            "--serial".to_string(),
             serial.to_string(),
-            format!("--new-display={}", NEW_DISPLAY_SIZE),
-            "-x".to_string(),
-            format!("--start-app={}", package),
-            format!("--window-title={}", window_title),
-            "--no-audio".to_string(),
-            "--no-clipboard-autosync".to_string(),
-            "--no-vd-system-decorations".to_string(),
-            "--keep-active".to_string(),
-            "--video-codec=h264".to_string(),
-            "--video-bit-rate=8M".to_string(),
-            format!("--port={}", FUSION_PORT_RANGE),
-        ]
+            "--package".to_string(),
+            package.to_string(),
+            "--jar".to_string(),
+            jar.to_string(),
+        ];
+        if !label.is_empty() {
+            args.push("--label".to_string());
+            args.push(label.to_string());
+        }
+        args
     }
 
     /// 为指定设备打开一个应用的融合窗口，返回窗口 id。
@@ -143,34 +134,28 @@ impl FusionManager {
         serial: String,
         package_name: String,
         label: String,
+        jar: String,
     ) -> Result<u64, String> {
-        let exe = Self::find_scrcpy_exe()
-            .ok_or("未找到 scrcpy.exe：请将 scrcpy-win64 运行时放入 daemon 同目录，或设置 SCRCPY_EXE 环境变量")?;
-        self.open_window_with_exe(&exe, serial, package_name, label)
+        let exe = Self::find_viewer_exe().ok_or(
+            "未找到 fusion-viewer.exe：请将其放入 daemon 同目录，或设置 FUSION_VIEWER_EXE 环境变量",
+        )?;
+        self.open_window_with_exe(&exe, serial, package_name, label, jar)
     }
 
-    /// 使用指定 scrcpy.exe 路径打开融合窗口（`open_window` 的内部实现，测试用）。
+    /// 使用指定 fusion-viewer 路径打开融合窗口（`open_window` 的内部实现，测试用）。
     fn open_window_with_exe(
         &mut self,
         exe: &std::path::Path,
         serial: String,
         package_name: String,
         label: String,
+        jar: String,
     ) -> Result<u64, String> {
-        let title = format!(
-            "{} — {}",
-            if label.is_empty() {
-                &package_name
-            } else {
-                &label
-            },
-            serial
-        );
-        let args = Self::build_args(&serial, &package_name, &title);
+        let args = Self::build_args(&serial, &package_name, &label, &jar);
         let child = std::process::Command::new(exe)
             .args(&args)
             .spawn()
-            .map_err(|e| format!("启动 scrcpy 失败: {}", e))?;
+            .map_err(|e| format!("启动 fusion-viewer 失败: {}", e))?;
 
         let id = self.next_id;
         self.next_id += 1;
@@ -292,22 +277,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_args_contains_fusion_flags() {
-        let args =
-            FusionManager::build_args("192.168.1.5:5555", "com.android.settings", "设置 — Pixel");
-        let joined = args.join(" ");
-        assert!(joined.contains("-s 192.168.1.5:5555"));
-        assert!(joined.contains("--new-display=1280x960/160"));
-        assert!(joined.contains("-x"));
-        assert!(joined.contains("--start-app=com.android.settings"));
-        assert!(joined.contains("--window-title=设置 — Pixel"));
-        assert!(joined.contains("--no-audio"));
-        assert!(joined.contains("--no-clipboard-autosync"));
-        assert!(joined.contains("--no-vd-system-decorations"));
-        assert!(joined.contains("--keep-active"));
-        assert!(joined.contains("--video-codec=h264"));
-        assert!(joined.contains("--video-bit-rate=8M"));
-        assert!(joined.contains("--port=27200:27299"));
+    fn build_args_contains_viewer_flags() {
+        let args = FusionManager::build_args(
+            "192.168.1.5:5555",
+            "com.android.settings",
+            "设置",
+            "scrcpy-server",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--serial",
+                "192.168.1.5:5555",
+                "--package",
+                "com.android.settings",
+                "--jar",
+                "scrcpy-server",
+                "--label",
+                "设置",
+            ]
+        );
+        // 空 label 不传 --label
+        let no_label = FusionManager::build_args("s", "pkg", "", "jar");
+        assert_eq!(
+            no_label,
+            vec!["--serial", "s", "--package", "pkg", "--jar", "jar"]
+        );
     }
 
     #[test]
@@ -319,12 +314,14 @@ mod tests {
             "serial-1".into(),
             "com.android.settings".into(),
             "设置".into(),
+            "scrcpy-server".into(),
         );
         let id2 = manager.open_window_with_exe(
             &dummy_exe(),
             "serial-1".into(),
             "com.android.chrome".into(),
             "Chrome".into(),
+            "scrcpy-server".into(),
         );
         assert!(id1.is_ok(), "dummy exe 应能启动: {:?}", id1);
         assert!(id2.is_ok());
@@ -349,10 +346,11 @@ mod tests {
         // 用不存在的 exe 路径确定性验证错误路径（不依赖测试环境是否有 scrcpy.exe）
         let mut manager = FusionManager::new();
         let result = manager.open_window_with_exe(
-            std::path::Path::new("/nonexistent/scrcpy.exe"),
+            std::path::Path::new("/nonexistent/fusion-viewer.exe"),
             "serial".into(),
             "com.android.settings".into(),
             "设置".into(),
+            "scrcpy-server".into(),
         );
         assert!(result.is_err(), "exe 不存在应返回错误");
         assert!(manager.windows_info().is_empty());

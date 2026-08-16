@@ -715,8 +715,12 @@ impl Core {
             .and_then(|apps| apps.iter().find(|a| a.package_name == package_name))
             .map(|a| a.label.clone())
             .unwrap_or_default();
-        self.fusion
-            .open_window(device.serial.clone(), package_name, label)
+        self.fusion.open_window(
+            device.serial.clone(),
+            package_name,
+            label,
+            self.jar_path.clone(),
+        )
     }
 
     fn on_notification(&mut self, notif: NotifInfo) {
