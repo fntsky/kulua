@@ -40,6 +40,14 @@ public final class DisplayEncoder {
     private MediaCodec codec;
     private Surface inputSurface;
     private VirtualDisplay virtualDisplay;
+    /**
+     * codec id 是否已写入 socket。
+     *
+     * 为什么需要：resize 会重启编码线程（encodeLoop 重跑），而 codec id 只应在
+     * 流开头写一次（客户端在握手时读取后直接进入帧循环，重复写入会错位解析）。
+     * resize 重启后只发新的 config 帧（SPS/PPS）+ 媒体帧，不再重复 codec id。
+     */
+    private boolean codecIdWritten;
 
     public DisplayEncoder(int id, LocalSocket socket, DisplayRegistry displayManager,
                           int width, int height, int dpi) {
@@ -123,9 +131,12 @@ public final class DisplayEncoder {
         try {
             OutputStream output = socket.getOutputStream();
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            // 先写 codec id（4B ASCII "h264"，v4.0 格式）
-            output.write(new byte[]{0x68, 0x32, 0x36, 0x34});
-            output.flush();
+            // 先写 codec id（4B ASCII "h264"，v4.0 格式）——仅首次，resize 重启不再写
+            if (!codecIdWritten) {
+                output.write(new byte[]{0x68, 0x32, 0x36, 0x34});
+                output.flush();
+                codecIdWritten = true;
+            }
 
             while (running) {
                 int index = codec.dequeueOutputBuffer(info, 10_000);
