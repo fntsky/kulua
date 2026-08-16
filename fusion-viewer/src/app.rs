@@ -36,6 +36,13 @@ mod meta {
 /// 滚轮每行对应的滚动像素（对照 scrcpy 默认手感）。
 const SCROLL_LINES_TO_PIXELS: f32 = 8.0;
 
+/// 窗口尺寸轮询间隔：拖动时内尺寸连续变化，500ms 粒度足够捕捉
+/// 最终尺寸，又不至于拖慢事件循环。
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 尺寸需连续稳定多少轮才发送 RESIZE_DISPLAY（500ms × 2 = 1s）。
+const RESIZE_STABLE_TICKS: u32 = 2;
+
 pub struct ViewerApp {
     args: Args,
     session: ViewerSession,
@@ -47,8 +54,12 @@ pub struct ViewerApp {
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     /// 窗口内容区尺寸（物理像素）
     window_size: (u32, u32),
-    /// 上次轮询窗口尺寸的时间（每 1s 轮询一次）
+    /// 上次轮询窗口尺寸的时间（每 500ms 轮询一次）
     last_resize_check: Instant,
+    /// 最近一轮轮询到的缩放后尺寸（防抖候选）
+    observed_size: (u32, u32),
+    /// 候选尺寸已连续稳定观察到的轮数（达到 RESIZE_STABLE_TICKS 才发送）
+    stable_ticks: u32,
     /// 上次发送给 server 的显示器尺寸（物理像素）。
     /// 轮询到窗口尺寸与它不同才发 RESIZE_DISPLAY，避免重复发送
     last_sent_size: (u32, u32),
@@ -74,6 +85,8 @@ impl ViewerApp {
             surface: None,
             window_size: (0, 0),
             last_resize_check: Instant::now(),
+            observed_size: (0, 0),
+            stable_ticks: 0,
             last_sent_size: (0, 0), // (0,0) 保证首次轮询必然发送
             latest_frame: None,
             mouse_down: false,
@@ -313,11 +326,18 @@ impl ViewerApp {
         let _ = self.session.send(&msg);
     }
 
-    /// 轮询窗口当前尺寸，与上次发送的显示器尺寸不同则发 RESIZE_DISPLAY。
+    /// 轮询窗口当前尺寸，稳定后发 RESIZE_DISPLAY。
     ///
     /// 为什么轮询而非依赖 Resized 事件：窗口拖动/系统缩放时 Resized 事件
     /// 可能不触发或触发不稳定（实测缩放后分辨率不跟随），轮询窗口实际
     /// 物理尺寸能稳定收敛。首帧前虚拟显示器未就绪，跳过。
+    ///
+    /// 为什么防抖（稳定 N 轮才发）：拖动窗口边缘时 inner_size 会连续变化，
+    /// 若每轮都立即发送，server 每次都要重建 MediaCodec（停线程→release→
+    /// 重建→重启，几百 ms 断流）且客户端要重建 FFmpeg 解码器——拖动期间
+    /// 连续重建导致画面闪烁/花屏（实测"分辨率不能稳定变换"）。要求尺寸
+    /// 连续稳定 RESIZE_STABLE_TICKS 轮（500ms × 2 = 1s）才发送：
+    /// 拖动中一次也不发，松手后只发最终尺寸一次，画面平稳切换。
     fn poll_window_size(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -338,11 +358,27 @@ impl ViewerApp {
             .clamp(1, u16::MAX as u32);
         let h = ((size.height as f32 * self.args.scale).round() as u32)
             .clamp(1, u16::MAX as u32);
-        if (w, h) == self.last_sent_size {
-            return; // 尺寸未变，不发
+        let current = (w, h);
+        if current == self.last_sent_size {
+            self.observed_size = current; // 与已发送一致，无操作
+            self.stable_ticks = 0;
+            return;
         }
-        self.last_sent_size = (w, h);
-        let _ = self.session.resize_display(w as u16, h as u16);
+        if current != self.observed_size {
+            // 尺寸又变了：拖动中，重新计时，不发送
+            self.observed_size = current;
+            self.stable_ticks = 0;
+            return;
+        }
+        self.stable_ticks += 1;
+        if self.stable_ticks < RESIZE_STABLE_TICKS {
+            return; // 稳定时间不足，继续等
+        }
+        // 尺寸已稳定：发送。成功才记录 last_sent（失败下轮重试）
+        self.stable_ticks = 0;
+        if self.session.resize_display(w as u16, h as u16).is_ok() {
+            self.last_sent_size = current;
+        }
     }
 }
 
@@ -477,8 +513,8 @@ impl ApplicationHandler for ViewerApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
-        // 每秒轮询窗口尺寸 → 弹性显示器 resize
-        if self.last_resize_check.elapsed() >= Duration::from_secs(1) {
+        // 每 500ms 轮询窗口尺寸 → 弹性显示器 resize（稳定 1s 才发，见 poll_window_size）
+        if self.last_resize_check.elapsed() >= RESIZE_POLL_INTERVAL {
             self.last_resize_check = Instant::now();
             self.poll_window_size();
         }
