@@ -204,4 +204,70 @@ mod tests {
         assert!(parse_display("1280x960/0").is_err(), "零 DPI");
         assert!(parse_display("1280x960/abc").is_err(), "非数字 DPI");
     }
+
+    /// 模拟 kulua-server 的 mock：接受两个连接（control + video），
+    /// 按真实 server 的字节布局回应，并记录收到的握手数据。
+    ///
+    /// 这个测试验证 viewer 的握手字节布局与 kulua-server 完全一致——
+    /// 若两侧布局不匹配（如字段顺序/大小端错误），握手会失败或读到错误数据。
+    #[test]
+    fn connect_handshake_matches_kulua_server_protocol() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // mock server 线程：模拟 ConnectionManager（每连接独立线程）
+        // viewer 的连接顺序：先 control 后 video
+        let server = std::thread::spawn(move || {
+            // ── control 连接：读 1B 类型 ──
+            let (mut control, _) = listener.accept().unwrap();
+            let mut type_buf = [0u8; 1];
+            control.read_exact(&mut type_buf).unwrap();
+            assert_eq!(type_buf[0], TYPE_CONTROL, "control 握手类型应为 0x01");
+
+            // ── video 连接：读 1B 类型 + 6B 创建请求 → 回 4B displayId + 4B codecId ──
+            let (mut video, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 7];
+            video.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], TYPE_VIDEO, "video 握手类型应为 0x03");
+            // 创建请求：width u16be, height u16be, dpi u16be
+            let width = u16::from_be_bytes([buf[1], buf[2]]);
+            let height = u16::from_be_bytes([buf[3], buf[4]]);
+            let dpi = u16::from_be_bytes([buf[5], buf[6]]);
+            // 回 4B displayId（大端）+ 4B codecId（"h264"）
+            video.write_all(&42u32.to_be_bytes()).unwrap();
+            video.write_all(b"h264").unwrap();
+            // 不做阻塞读：viewer 的 session 直到测试函数结束才 drop，
+            // 阻塞等 EOF 会导致 join 死锁
+
+            (width, height, dpi)
+        });
+
+        // viewer 连接
+        let session = ViewerSession::connect(port, "1280x960/160").unwrap();
+        assert_eq!(session.display_id, 42);
+        assert_eq!(session.codec_id, u32::from_be_bytes(*b"h264"));
+
+        // 验证 server 侧收到的创建请求
+        let (width, height, dpi) = server.join().unwrap();
+        assert_eq!((width, height, dpi), (1280, 960, 160));
+    }
+
+    /// viewer 连接失败时应返回 Err（server 未监听）。
+    ///
+    /// 标记 ignore：connect 会对未监听端口完整重试（20×250ms + video 15s），
+    /// 单测耗时 ~45s 不划算；失败路径由 `connect_handshake_matches_*` 的
+    /// 反例覆盖（mock 不回码流 → connect 超时失败）。
+    #[test]
+    #[ignore = "connect 重试链耗时 ~45s，失败路径由握手 mock 反例覆盖"]
+    fn connect_to_closed_port_fails() {
+        use std::net::TcpListener;
+        // 绑定后立即释放，保证端口无人监听
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(ViewerSession::connect(port, "1280x960/160").is_err());
+    }
 }

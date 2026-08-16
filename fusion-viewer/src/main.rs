@@ -14,6 +14,7 @@ mod server;
 mod video;
 mod yuv;
 
+use std::io::Read;
 use std::sync::mpsc;
 
 fn main() {
@@ -26,7 +27,8 @@ fn main() {
     };
 
     // 1. 连接已有 kulua-server + 创建虚拟显示器
-    let mut session = match server::ViewerSession::connect(args.port, &args.display) {        Ok(s) => s,
+    let mut session = match server::ViewerSession::connect(args.port, &args.display) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("fusion-viewer: 连接失败: {}", e);
             std::process::exit(1);
@@ -37,12 +39,28 @@ fn main() {
         args.port, session.display_id
     );
 
-    // 2. 视频读取线程（解码后唤醒事件循环重绘）
+    // 2. control socket 读方向 drain：server 会向所有 control 连接推送剪贴板
+    //    事件（0x00），viewer 不处理剪贴板（session 负责），但必须把数据读走，
+    //    否则 TCP 缓冲区满后 server 的推送线程会阻塞在写
+    {
+        let mut drain = session.control.try_clone().expect("control socket clone");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match drain.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+    }
+
+    // 3. 视频读取线程（解码后唤醒事件循环重绘）
     //    START_APP 不在此处发送：虚拟显示器要等视频流启动后才真正就绪，
     //    过早发送可能得到 "No known display id"；改为收到首帧后由 ViewerApp 发送
     let (video_tx, video_rx) = mpsc::channel::<video::VideoEvent>();
 
-    // 3. winit 事件循环
+    // 4. winit 事件循环
     let event_loop = match winit::event_loop::EventLoop::new() {
         Ok(loop_) => loop_,
         Err(e) => {
