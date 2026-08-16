@@ -15,11 +15,15 @@ pub struct DecodedFrame {
     pub height: usize,
 }
 
-/// H264 解码器封装。
+/// H264/H265 解码器封装（优先 D3D11VA 硬解，失败自动回退软解）。
 pub struct VideoDecoder {
     codec_ctx: *mut AVCodecContext,
     packet: *mut AVPacket,
     frame: *mut AVFrame,
+    /// 硬解帧转回系统内存用的目标帧（软解时闲置）
+    sw_frame: *mut AVFrame,
+    /// 硬件设备上下文（由 codec_ctx 持有引用，Drop 随 avcodec_free_context 释放）
+    hw_device_ctx: *mut AVBufferRef,
     opened: bool,
 }
 
@@ -51,7 +55,8 @@ impl VideoDecoder {
             }
             let packet = av_packet_alloc();
             let frame = av_frame_alloc();
-            if packet.is_null() || frame.is_null() {
+            let sw_frame = av_frame_alloc();
+            if packet.is_null() || frame.is_null() || sw_frame.is_null() {
                 avcodec_free_context(&mut codec_ctx.clone());
                 return Err("av_packet/av_frame 分配失败".into());
             }
@@ -59,6 +64,8 @@ impl VideoDecoder {
                 codec_ctx,
                 packet,
                 frame,
+                sw_frame,
+                hw_device_ctx: std::ptr::null_mut(),
                 opened: false,
             })
         }
@@ -89,11 +96,32 @@ impl VideoDecoder {
     }
 
     /// 打开解码器。
+    ///
+    /// 优先尝试 D3D11VA 硬件解码（把解码从 CPU 卸载到 GPU，缓解与音频解码的
+    /// CPU 竞争）；GPU/驱动不支持时自动回退软解。
     pub fn open(&mut self) -> Result<(), String> {
         if self.opened {
             return Ok(());
         }
         unsafe {
+            // 创建 D3D11VA 硬件设备上下文（d3d11va 解码器需要 codec_ctx.hw_device_ctx）
+            let mut hw_ctx: *mut AVBufferRef = std::ptr::null_mut();
+            let hw_ret = av_hwdevice_ctx_create(
+                &mut hw_ctx,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if hw_ret >= 0 {
+                (*self.codec_ctx).hw_device_ctx = hw_ctx;
+                self.hw_device_ctx = hw_ctx;
+                println!("[viewer] D3D11VA 硬解已启用");
+            } else {
+                // 无 GPU/驱动 → 回退软解（解码仍可用，仅 CPU 占用更高）
+                eprintln!("[viewer] D3D11VA 不可用（回退软解）: {}", err_str(hw_ret));
+            }
+
             let ret = avcodec_open2(self.codec_ctx, std::ptr::null(), std::ptr::null_mut());
             if ret < 0 {
                 return Err(format!("avcodec_open2 失败: {}", err_str(ret)));
@@ -131,7 +159,23 @@ impl VideoDecoder {
                 return Err(format!("avcodec_receive_frame 失败: {}", err_str(recv_ret)));
             }
 
-            let frame = copy_frame(self.frame)?;
+            // 硬件帧（D3D11 纹理）：先转回系统内存（NV12）再拷贝平面；
+            // 软解帧直接拷贝
+            let src = if !(*self.frame).hw_frames_ctx.is_null() {
+                av_frame_unref(self.sw_frame);
+                let transfer_ret = av_hwframe_transfer_data(self.sw_frame, self.frame, 0);
+                if transfer_ret < 0 {
+                    av_frame_unref(self.frame);
+                    return Err(format!(
+                        "av_hwframe_transfer_data 失败: {}",
+                        err_str(transfer_ret)
+                    ));
+                }
+                self.sw_frame
+            } else {
+                self.frame
+            };
+            let frame = copy_frame(src)?;
             av_frame_unref(self.frame);
             Ok(Some(frame))
         }
@@ -146,6 +190,9 @@ impl VideoDecoder {
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         unsafe {
+            if !self.sw_frame.is_null() {
+                av_frame_free(&mut self.sw_frame.clone());
+            }
             if !self.frame.is_null() {
                 av_frame_free(&mut self.frame.clone());
             }
@@ -153,6 +200,7 @@ impl Drop for VideoDecoder {
                 av_packet_free(&mut self.packet.clone());
             }
             if !self.codec_ctx.is_null() {
+                // hw_device_ctx 由 codec_ctx 持有引用，随 avcodec_free_context 释放
                 avcodec_free_context(&mut self.codec_ctx.clone());
             }
         }
