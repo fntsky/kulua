@@ -44,7 +44,22 @@ impl ServerSession {
         let scid_hex = format!("{:08x}", scid);
         let forward_target = format!("scrcpy_{}", scid_hex);
 
-        // 1. 总是 push 最新 jar：设备上可能残留旧版本（旧 jar 不识别 new_display
+        // 0. 检查设备在线（否则后续 forward/push 都只会得到含糊的超时）
+        let state = Command::new(adb)
+            .args(["-s", &args.serial, "get-state"])
+            .output()
+            .map_err(|e| format!("adb 不可用: {}", e))?;
+        let state_text = String::from_utf8_lossy(&state.stdout).trim().to_string();
+        if state_text != "device" {
+            return Err(format!("设备不在线（get-state: {}）", state_text));
+        }
+
+        // 1. 清理 viewer 残留的陈旧 server（scid 前缀 4b4d）。
+        //    为什么：viewer 的 control-recv 线程崩溃后，server 检测不到 socket
+        //    断连而永久残留（虚拟显示器泄漏，累积后新 server 无法创建显示器）。
+        kill_stale_servers(adb, &args.serial);
+
+        // 2. 总是 push 最新 jar：设备上可能残留旧版本（旧 jar 不识别 new_display
         //    等参数，会导致 server 启动失败），viewer 作为自包含客户端必须保证版本一致
         if !Path::new(&args.jar).exists() {
             return Err(format!("jar 不存在: {}", args.jar));
@@ -93,6 +108,7 @@ impl ServerSession {
             "send_device_meta=true",
             "send_dummy_byte=true",
             "clipboard_autosync=false",
+            "flex_display=true",
             &format!("scid={}", scid_hex),
             &format!("new_display={}", args.display),
             "video_codec=h264",
@@ -183,8 +199,16 @@ impl ServerSession {
 
 impl Drop for ServerSession {
     fn drop(&mut self) {
-        // 断开 socket → server 检测到 IO 错误 → cleanup 自动退出
+        // 断开 socket（正常路径下 server 检测 IO 错误退出）
         let _ = self.control.shutdown(std::net::Shutdown::Both);
+        // 主动按 scid 精准 kill server：control 线程崩溃后 server 检测不到断连，
+        // 不能只依赖优雅退出，否则虚拟显示器/进程永久残留
+        let script = build_scid_kill_script(&self.scid_hex);
+        let _ = Command::new(&self.adb)
+            .args(["-s", &self.serial, "shell", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         // 清理 ADB forward，避免残留（下次启动端口冲突 / 转发积累）
         let _ = Command::new(&self.adb)
             .args([
@@ -214,6 +238,39 @@ fn connect_video_with_dummy(port: u16) -> Result<TcpStream, String> {
         .map_err(|e| format!("读取 dummy byte 失败: {}", e))?;
     let _ = stream.set_read_timeout(None);
     Ok(stream)
+}
+
+/// 生成按 scid 前缀精准 kill 的 shell 脚本（只杀 viewer 家族的残留 server）。
+///
+/// 匹配参数含 `scid=4b4d`（viewer scid 前缀）的进程；跳过 `$$` 防止 shell 自杀；
+/// 以 `true` 结尾保证 exit 0。不碰 Kulua session（`4b4c` 前缀）与官方 scrcpy（随机 scid）。
+fn build_stale_kill_script() -> String {
+    "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
+     [ \"$p\" = \"$$\" ] && continue; \
+     if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid=4b4d' 2>/dev/null; then \
+     kill -9 \"$p\" 2>/dev/null; fi; done; true"
+        .to_string()
+}
+
+/// 生成按精确 scid 精准 kill 的 shell 脚本（Drop 时清理本会话 server）。
+fn build_scid_kill_script(scid_hex: &str) -> String {
+    format!(
+        "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
+         [ \"$p\" = \"$$\" ] && continue; \
+         if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid={}' 2>/dev/null; then \
+         kill -9 \"$p\" 2>/dev/null; fi; done; true",
+        scid_hex
+    )
+}
+
+/// 清理设备上 viewer 残留的陈旧 server 进程（scid 前缀 4b4d）。
+fn kill_stale_servers(adb: &str, serial: &str) {
+    let script = build_stale_kill_script();
+    let _ = Command::new(adb)
+        .args(["-s", serial, "shell", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// 生成随机 scid（高 16 位固定 0x4B4D，低 16 位随机）。
@@ -275,5 +332,22 @@ mod tests {
         assert!(port > 0);
         // 端口应是可用的（立即再 bind 同端口会失败）
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn stale_kill_script_targets_only_viewer_family() {
+        let script = build_stale_kill_script();
+        assert!(script.contains("scid=4b4d"), "应匹配 viewer 前缀 4b4d");
+        assert!(!script.contains("scid=4b4c"), "不得匹配 Kulua session 前缀");
+        assert!(script.contains("$$"), "应跳过脚本自身 shell 进程");
+        assert!(script.ends_with("true"), "应以 true 结尾保证 exit 0");
+    }
+
+    #[test]
+    fn scid_kill_script_matches_exact_scid() {
+        let script = build_scid_kill_script("4b4dabcd");
+        assert!(script.contains("scid=4b4dabcd"), "应匹配本会话 scid");
+        assert!(!script.contains("scid=4b4dabce"), "不得匹配其它 scid");
+        assert!(script.contains("'scid=4b4dabcd'"), "scid 应被单引号包裹");
     }
 }

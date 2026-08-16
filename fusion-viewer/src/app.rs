@@ -54,6 +54,8 @@ pub struct ViewerApp {
     mouse_pos: PhysicalPosition<f64>,
     /// 当前修饰键状态（ModifiersChanged 事件维护）
     modifiers: ModifiersState,
+    /// 是否已发送 START_APP（收到首帧后一次性发送）
+    started_app: bool,
     last_error: Option<String>,
 }
 
@@ -71,6 +73,7 @@ impl ViewerApp {
             mouse_down: false,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
+            started_app: false,
             last_error: None,
         }
     }
@@ -79,7 +82,25 @@ impl ViewerApp {
     fn drain_video_events(&mut self) {
         while let Ok(event) = self.video_rx.try_recv() {
             match event {
-                VideoEvent::Frame(frame) => self.latest_frame = Some(frame),
+                VideoEvent::Frame(frame) => {
+                    // 收到首帧 → 虚拟显示器已创建，此时才发 START_APP
+                    // （server 侧 getStartAppDisplayId 只等 1s，过早发送会
+                    //   "No known display id"）
+                    if !self.started_app {
+                        self.started_app = true;
+                        match crate::control::start_app(&self.args.package) {
+                            Ok(msg) => {
+                                if let Err(e) = self.session.send(&msg) {
+                                    eprintln!("[viewer] START_APP 发送失败: {}", e);
+                                } else {
+                                    println!("[viewer] 已请求启动 {}", self.args.package);
+                                }
+                            }
+                            Err(e) => eprintln!("[viewer] {}", e),
+                        }
+                    }
+                    self.latest_frame = Some(frame);
+                }
                 VideoEvent::Session {
                     width,
                     height,
@@ -320,8 +341,9 @@ impl ApplicationHandler for ViewerApp {
             }
             WindowEvent::Resized(size) => {
                 self.window_size = (size.width, size.height);
-                // 弹性显示器：窗口尺寸变化 → 调整虚拟显示器分辨率
-                if size.width > 0 && size.height > 0 {
+                // 弹性显示器：窗口尺寸变化 → 调整虚拟显示器分辨率。
+                // 首帧前虚拟显示器尚未创建，跳过（flex 模式 display 就绪后才可 resize）
+                if self.latest_frame.is_some() && size.width > 0 && size.height > 0 {
                     let _ = self.session.resize_display(
                         size.width.min(u16::MAX as u32) as u16,
                         size.height.min(u16::MAX as u32) as u16,

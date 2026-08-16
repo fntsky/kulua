@@ -38,22 +38,9 @@ fn main() {
         session.scid_hex, session.port
     );
 
-    // 2. 启动应用（START_APP 控制消息）
-    match control::start_app(&args.package) {
-        Ok(msg) => {
-            if let Err(e) = session.send(&msg) {
-                eprintln!("fusion-viewer: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("fusion-viewer: {}", e);
-            std::process::exit(2);
-        }
-    }
-    println!("[viewer] 已请求启动 {}", args.package);
-
-    // 3. 视频读取线程（解码后唤醒事件循环重绘）
+    // 2. 视频读取线程（解码后唤醒事件循环重绘）
+    //    START_APP 不在此处发送：虚拟显示器要等视频流启动后才创建，
+    //    过早发送会得到 "No known display id"；改为收到首帧后由 ViewerApp 发送
     let video = match session.take_video() {
         Some(v) => v,
         None => {
@@ -63,7 +50,7 @@ fn main() {
     };
     let (video_tx, video_rx) = mpsc::channel::<video::VideoEvent>();
 
-    // 4. winit 事件循环
+    // 3. winit 事件循环
     let event_loop = match winit::event_loop::EventLoop::new() {
         Ok(loop_) => loop_,
         Err(e) => {
