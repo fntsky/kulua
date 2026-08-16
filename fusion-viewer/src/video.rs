@@ -41,7 +41,17 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
         let mut video = video;
         let _ = video.set_read_timeout(None);
 
-        // 1. codec id（4 字节大端）
+        // 1. 设备名（64 字节，send_device_meta 写入 video socket；dummy byte 已由部署阶段读取）
+        let mut name_buf = [0u8; 64];
+        if read_exact(&mut video, &mut name_buf).is_err() {
+            let _ = tx.send(VideoEvent::Error("读取设备名失败".into()));
+            return;
+        }
+        let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
+        let device_name = String::from_utf8_lossy(&name_buf[..name_end]);
+        println!("[viewer] 设备名: {}", device_name);
+
+        // 2. codec id（4 字节大端）
         let mut codec_buf = [0u8; 4];
         if read_exact(&mut video, &mut codec_buf).is_err() {
             let _ = tx.send(VideoEvent::Error("读取 codec id 失败".into()));
@@ -56,7 +66,7 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
             }
         };
 
-        // 2. 帧循环
+        // 3. 帧循环
         loop {
             let mut header = [0u8; 12];
             if read_exact(&mut video, &mut header).is_err() {

@@ -21,6 +21,10 @@ const SCID_PREFIX: u32 = 0x4B4D_0000;
 pub struct ServerSession {
     /// adb shell 子进程（scrcpy-server 宿主）
     _shell: Child,
+    /// adb 可执行文件路径（Drop 时清理 forward 用）
+    adb: String,
+    /// 设备地址
+    serial: String,
     /// 本地 adb 转发端口
     pub port: u16,
     /// scid 十六进制（调试用）
@@ -40,27 +44,19 @@ impl ServerSession {
         let scid_hex = format!("{:08x}", scid);
         let forward_target = format!("scrcpy_{}", scid_hex);
 
-        // 1. 确保 jar 已部署（缺失才 push）
-        let test_ok = Command::new(adb)
-            .args(["-s", &args.serial, "shell", "test", "-f", REMOTE_JAR])
+        // 1. 总是 push 最新 jar：设备上可能残留旧版本（旧 jar 不识别 new_display
+        //    等参数，会导致 server 启动失败），viewer 作为自包含客户端必须保证版本一致
+        if !Path::new(&args.jar).exists() {
+            return Err(format!("jar 不存在: {}", args.jar));
+        }
+        let status = Command::new(adb)
+            .args(["-s", &args.serial, "push", &args.jar, REMOTE_JAR])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|e| format!("adb 不可用: {}", e))?
-            .success();
-        if !test_ok {
-            if !Path::new(&args.jar).exists() {
-                return Err(format!("jar 不存在: {}", args.jar));
-            }
-            let status = Command::new(adb)
-                .args(["-s", &args.serial, "push", &args.jar, REMOTE_JAR])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|e| format!("adb push 失败: {}", e))?;
-            if !status.success() {
-                return Err("adb push 失败".into());
-            }
+            .map_err(|e| format!("adb push 失败: {}", e))?;
+        if !status.success() {
+            return Err("adb push 失败".into());
         }
 
         // 2. 挑选空闲本地端口并建立 forward
@@ -106,22 +102,50 @@ impl ServerSession {
             .args(["-s", &args.serial, "shell"])
             .args(shell_args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("启动 scrcpy-server 失败: {}", e))?;
+        // 捕获 server stderr，便于排查启动失败（如 jar 版本过旧不认识 new_display）
+        if let Some(stderr) = shell.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for line in BufReader::new(stderr).lines() {
+                    match line {
+                        Ok(l) => eprintln!("[viewer:server] {}", l),
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         // 4. 连接 video socket（读 dummy byte 验证 server 就绪），再连 control socket
         //    server 的 accept 顺序：video → control（无 audio）
-        let mut video = connect_with_retry(port, 40).ok_or_else(|| {
-            let _ = shell.kill();
-            "连接视频通道超时（server 启动失败？）".to_string()
-        })?;
-        let mut dummy = [0u8; 1];
-        if video.read_exact(&mut dummy).is_err() {
-            let _ = shell.kill();
-            return Err("读取 dummy byte 失败".into());
-        }
-        let control = connect_with_retry(port, 10).ok_or_else(|| {
+        //
+        //    注意：adb forward 监听器一建立就能 accept 本地 TCP，但 server 冷启动
+        //    （app_process）需要 1~3 秒才监听 localabstract socket；此时连接会被
+        //    adb 转发层直接断开 → dummy 读失败。因此连接成功后 dummy 读失败要
+        //    重连整个流程（与 Kulua session 的 connect_socket 行为一致）。
+        let start = std::time::Instant::now();
+        let video = loop {
+            match connect_video_with_dummy(port) {
+                Ok(video) => break video,
+                Err(e) => {
+                    // server 可能已崩溃（stderr 会打印原因）；立即失败
+                    if shell.try_wait().ok().flatten().is_some() {
+                        let _ = shell.kill();
+                        return Err(format!("scrcpy-server 提前退出: {}", e));
+                    }
+                    // 总超时 30s（server 冷启动 + jar push 后的部署窗口）
+                    if start.elapsed() > std::time::Duration::from_secs(30) {
+                        let _ = shell.kill();
+                        return Err(format!("scrcpy-server 30s 内未就绪: {}", e));
+                    }
+                    eprintln!("[viewer] 连接视频通道失败（重试）: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        };
+        let control = connect_with_retry(port, 20).ok_or_else(|| {
             let _ = shell.kill();
             "连接控制通道超时".to_string()
         })?;
@@ -130,6 +154,8 @@ impl ServerSession {
 
         Ok(ServerSession {
             _shell: shell,
+            adb: adb.to_string(),
+            serial: args.serial.clone(),
             port,
             scid_hex,
             control,
@@ -157,10 +183,37 @@ impl ServerSession {
 
 impl Drop for ServerSession {
     fn drop(&mut self) {
-        // 断开 socket → server 检测到 IO 错误 → cleanup 自动退出；
-        // adb shell 子进程句柄释放后由 adb 侧回收
+        // 断开 socket → server 检测到 IO 错误 → cleanup 自动退出
         let _ = self.control.shutdown(std::net::Shutdown::Both);
+        // 清理 ADB forward，避免残留（下次启动端口冲突 / 转发积累）
+        let _ = Command::new(&self.adb)
+            .args([
+                "-s",
+                &self.serial,
+                "forward",
+                "--remove",
+                &format!("tcp:{}", self.port),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
+}
+
+/// 连接 video socket 并读取 dummy byte（server 就绪验证）。
+///
+/// 返回 Err 表示连接被断开（server 尚未监听 / 已崩溃），调用方应重试。
+fn connect_video_with_dummy(port: u16) -> Result<TcpStream, String> {
+    let mut stream =
+        connect_with_retry(port, 4).ok_or_else(|| format!("连接 127.0.0.1:{} 失败", port))?;
+    // dummy byte 应在 accept 后立即到达；3s 超时防止 server 半死不活时永久阻塞
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let mut dummy = [0u8; 1];
+    stream
+        .read_exact(&mut dummy)
+        .map_err(|e| format!("读取 dummy byte 失败: {}", e))?;
+    let _ = stream.set_read_timeout(None);
+    Ok(stream)
 }
 
 /// 生成随机 scid（高 16 位固定 0x4B4D，低 16 位随机）。
