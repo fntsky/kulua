@@ -9,3 +9,4 @@ node_modules
 .agents/
 AGENTS.md
 /.tools/
+kulua-server/build/
