@@ -1,8 +1,8 @@
 // Release 构建不显示控制台窗口
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use sync_core::cli;
 use sync_core::app;
+use sync_core::cli;
 use sync_core::wireless_pair;
 
 use std::path::Path;
@@ -52,8 +52,8 @@ fn launch_ui() {
     }
 }
 fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
-    use tray_icon::menu::{Menu, MenuItem, MenuEvent};
-    use tray_icon::{TrayIconBuilder, Icon};
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+    use tray_icon::{Icon, TrayIconBuilder};
 
     std::thread::spawn(move || {
         let open_item = MenuItem::new("打开", true, None);
@@ -68,8 +68,7 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
         let img = image::load_from_memory(logo_bytes).expect("decode logo.png");
         let rgba = img.to_rgba8();
         let (icon_w, icon_h) = rgba.dimensions();
-        let icon = Icon::from_rgba(rgba.into_raw(), icon_w, icon_h)
-            .expect("create tray icon");
+        let icon = Icon::from_rgba(rgba.into_raw(), icon_w, icon_h).expect("create tray icon");
 
         let _tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -81,10 +80,10 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
         // Windows: Win32 message loop required by tray-icon
         #[cfg(target_os = "windows")]
         {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetMessageW, TranslateMessage, DispatchMessageW,
-            };
             use std::ptr::null_mut;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, GetMessageW, TranslateMessage,
+            };
 
             unsafe {
                 let mut msg = std::mem::zeroed();
@@ -122,7 +121,6 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
     });
 }
 
-
 #[tokio::main]
 async fn main() {
     let jar_path = find_jar().unwrap_or_else(|| {
@@ -137,12 +135,19 @@ async fn main() {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Console::GetConsoleWindow;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-        unsafe { ShowWindow(GetConsoleWindow(), SW_HIDE); }
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+        unsafe {
+            ShowWindow(GetConsoleWindow(), SW_HIDE);
+        }
     }
 
     let mut core = app::Core::new(jar_path, wireless_pair_info);
     let token = core.get_token();
+
+    // 启动时自愈：让 HKCU Run 键与 config 里的自启动意图保持一致
+    if let Ok(exe) = std::env::current_exe() {
+        sync_core::autostart::reconcile(&exe);
+    }
 
     // Ctrl+C 触发停止信号
     let was_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

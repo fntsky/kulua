@@ -243,7 +243,8 @@ async fn on_frame(
                 eprintln!("IPC: Protobuf 请求解析失败: {}", e);
             })?;
 
-            let response = dispatch_request(&req, cmd_tx, device_watch, merged_watch, pair_info).await;
+            let response =
+                dispatch_request(&req, cmd_tx, device_watch, merged_watch, pair_info).await;
             let payload = response.encode_to_vec();
 
             framed
@@ -275,13 +276,27 @@ async fn dispatch_request(
 ) -> proto::Response {
     match req.method.as_str() {
         "device.list" => {
-            let devices = merged_watch.borrow().iter().map(proto::Device::from).collect();
-            make_result(req.id, response::Payload::DeviceList(response::DeviceList { devices }))
+            let devices = merged_watch
+                .borrow()
+                .iter()
+                .map(proto::Device::from)
+                .collect();
+            make_result(
+                req.id,
+                response::Payload::DeviceList(response::DeviceList { devices }),
+            )
         }
 
         "device.adb_list" => {
-            let devices = device_watch.borrow().values().map(proto::Device::from).collect();
-            make_result(req.id, response::Payload::AdbList(response::DeviceList { devices }))
+            let devices = device_watch
+                .borrow()
+                .values()
+                .map(proto::Device::from)
+                .collect();
+            make_result(
+                req.id,
+                response::Payload::AdbList(response::DeviceList { devices }),
+            )
         }
 
         "device.connect" => {
@@ -323,7 +338,10 @@ async fn dispatch_request(
                 Ok(t) => t,
                 Err(_) => String::new(),
             };
-            make_result(req.id, response::Payload::ClipboardGet(response::ClipboardGet { text }))
+            make_result(
+                req.id,
+                response::Payload::ClipboardGet(response::ClipboardGet { text }),
+            )
         }
 
         "pairing.info" => make_result(
@@ -401,6 +419,36 @@ async fn dispatch_request(
                 return make_error(req.id, ERROR_CODE, "core 正在关闭");
             }
             make_ok(req.id)
+        }
+
+        // ── 设置：开机自启动 ──
+        "settings.get" => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
+            let state = crate::autostart::current_state(&exe);
+            make_result(
+                req.id,
+                response::Payload::Settings(response::Settings {
+                    autostart_enabled: state.enabled,
+                    autostart_supported: state.supported,
+                }),
+            )
+        }
+
+        "settings.set_autostart" => {
+            let Some(request::Payload::SetAutostart(params)) = &req.params else {
+                return make_error(req.id, ERROR_CODE, "缺少 settings.set_autostart 参数");
+            };
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
+            match crate::autostart::set_enabled(&exe, params.enabled) {
+                Ok(state) => make_result(
+                    req.id,
+                    response::Payload::Settings(response::Settings {
+                        autostart_enabled: state.enabled,
+                        autostart_supported: state.supported,
+                    }),
+                ),
+                Err(e) => make_error(req.id, ERROR_CODE, &format!("设置自启动失败: {e}")),
+            }
         }
 
         _ => make_error(req.id, ERROR_CODE, &format!("未知方法: {}", req.method)),

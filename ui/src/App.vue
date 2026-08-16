@@ -31,9 +31,55 @@ watch(theme, (v) => {
 function toggleTheme() {
   theme.value = theme.value === "dark" ? "light" : "dark";
 }
+function setTheme(mode: "dark" | "light") {
+  theme.value = mode;
+}
 const devices = ref<DeviceInfo[]>([]);
-// 当前页面：设备卡片 / ADB 连接
-const view = ref<"devices" | "adb">("devices");
+// 当前页面：设备卡片 / ADB 连接 / 设置
+const view = ref<"devices" | "adb" | "settings">("devices");
+// 设置：开机自启动
+interface SettingsState {
+  autostartEnabled: boolean;
+  autostartSupported: boolean;
+}
+const settings = ref<SettingsState>({
+  autostartEnabled: false,
+  autostartSupported: false,
+});
+// 读取设置失败时的错误文案（不误显示“不支持”）
+const settingsError = ref("");
+async function loadSettings() {
+  try {
+    const s = await invoke<{ autostart_enabled: boolean; autostart_supported: boolean }>(
+      "get_settings",
+    );
+    settings.value = {
+      autostartEnabled: s.autostart_enabled,
+      autostartSupported: s.autostart_supported,
+    };
+    settingsError.value = "";
+  } catch (e) {
+    console.error("get_settings failed:", e);
+    settingsError.value = `读取设置失败：${String(e)}`;
+  }
+}
+async function toggleAutostart() {
+  const target = !settings.value.autostartEnabled;
+  try {
+    const s = await invoke<{ autostart_enabled: boolean; autostart_supported: boolean }>(
+      "set_autostart",
+      { enabled: target },
+    );
+    settings.value = {
+      autostartEnabled: s.autostart_enabled,
+      autostartSupported: s.autostart_supported,
+    };
+    settingsError.value = "";
+  } catch (e) {
+    console.error("set_autostart failed:", e);
+    settingsError.value = `设置自启动失败：${String(e)}`;
+  }
+}
 // adb 原始设备列表（含 Offline/Unauthorized）
 const adbDevices = ref<Array<{ serial: string; state: string }>>([]);
 const adbStateTextMap: Record<string, string> = {
@@ -222,6 +268,7 @@ onMounted(async () => {
   listen<boolean>("connection-changed", (e) => {
     if (e.payload) {
       invoke<DeviceInfo[]>("get_devices").then((d) => updateUI(true, d));
+      loadSettings();
     } else {
       updateUI(false, []);
     }
@@ -259,6 +306,7 @@ onMounted(async () => {
   if (existing) {
     renderQR(existing);
   }
+  loadSettings();
 });
 </script>
 
@@ -272,6 +320,9 @@ onMounted(async () => {
         </span>
         <span class="tab" :class="{ active: view === 'adb' }" @click="view = 'adb'">
           ADB 连接 <span class="tab-badge">{{ adbDevices.length }}</span>
+        </span>
+        <span class="tab" :class="{ active: view === 'settings' }" @click="view = 'settings'">
+          设置
         </span>
       </div>
       <div v-if="view === 'devices'" class="device-list">
@@ -333,7 +384,7 @@ onMounted(async () => {
         </div>
       </div>
       <!-- adb raw device list -->
-      <div v-else class="adb-list">
+      <div v-else-if="view === 'adb'" class="adb-list">
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
         <div v-else-if="adbDevices.length === 0" class="hint">无 ADB 设备</div>
         <template v-else>
@@ -354,6 +405,46 @@ onMounted(async () => {
                 {{ adbSessionStateText(d.serial) }}
               </span>
               <span class="state" :class="stateClass(d.state)">{{ adbStateText(d.state) }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
+      <!-- 设置 -->
+      <div v-else class="settings-panel">
+        <div class="section">外观</div>
+        <div class="settings-card">
+          <div class="toggle-row">
+            <span class="toggle-label">主题</span>
+            <div class="theme-segment">
+              <span
+                class="theme-option"
+                :class="{ active: theme === 'dark' }"
+                @click="setTheme('dark')"
+              >深色</span>
+              <span
+                class="theme-option"
+                :class="{ active: theme === 'light' }"
+                @click="setTheme('light')"
+              >浅色</span>
+            </div>
+          </div>
+        </div>
+        <div class="section">常规</div>
+        <div v-if="!connected" class="hint">正在连接 daemon…</div>
+        <template v-else>
+          <div v-if="settingsError" class="settings-error">{{ settingsError }}</div>
+          <div class="settings-card">
+            <div
+              class="toggle-row"
+              :class="{ disabled: !settings.autostartSupported }"
+              @click="toggleAutostart"
+            >
+              <div class="toggle-switch" :class="{ active: settings.autostartEnabled }" />
+              <span class="toggle-label">开机自启动</span>
+              <span v-if="!settings.autostartSupported" class="settings-note">当前平台不支持</span>
+            </div>
+            <div class="settings-help">
+              开启后，登录系统时自动在后台运行 daemon（托盘驻留），点击托盘“打开”再显示窗口。
             </div>
           </div>
         </template>
@@ -569,7 +660,36 @@ body {
   display: flex; align-items: center; gap: 8px; cursor: pointer;
   font-size: 12px; color: var(--dim);
 }
+.toggle-row.disabled { cursor: not-allowed; opacity: 0.5; }
 .toggle-label { user-select: none; }
+.settings-panel { display: flex; flex-direction: column; gap: 10px; }
+.settings-card {
+  background: var(--card); border-radius: 10px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.theme-segment {
+  display: inline-flex; gap: 4px; margin-left: auto;
+  padding: 3px; border-radius: 8px; background: var(--toggle-bg);
+}
+.theme-option {
+  font-size: 12px; padding: 3px 14px; border-radius: 6px;
+  color: var(--dim); cursor: pointer; user-select: none;
+}
+.theme-option.active {
+  color: #fff; background: var(--green);
+}
+.settings-help {
+  font-size: 11px; color: var(--dim); line-height: 1.6;
+  border-top: 1px solid var(--border); padding-top: 10px;
+}
+.settings-note {
+  font-size: 11px; color: var(--red); margin-left: auto;
+}
+.settings-error {
+  font-size: 12px; color: var(--red); padding: 8px 12px;
+  background: var(--error-bg); border-radius: 8px;
+}
 .toggle-switch {
   position: relative; width: 36px; height: 20px;
   background: var(--toggle-bg); border-radius: 10px; transition: 0.2s; cursor: pointer;

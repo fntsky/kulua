@@ -5,8 +5,8 @@
 
 use prost::Message;
 
-use crate::types::{Device as CoreDevice, DeviceIdentity as CoreDeviceIdentity};
 use crate::ipc::types::SessionSummary as CoreSessionSummary;
+use crate::types::{Device as CoreDevice, DeviceIdentity as CoreDeviceIdentity};
 
 // ── 外层信封 ──
 
@@ -20,7 +20,7 @@ pub struct Request {
     pub id: u64,
     #[prost(string, tag = "2")]
     pub method: String,
-    #[prost(oneof = "request::Payload", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "request::Payload", tags = "10, 11, 12, 13, 14, 15")]
     pub params: Option<request::Payload>,
 }
 
@@ -31,7 +31,7 @@ pub struct Request {
 pub struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "response::Payload", tags = "10, 11, 12, 13")]
+    #[prost(oneof = "response::Payload", tags = "10, 11, 12, 13, 14")]
     pub result: Option<response::Payload>,
     #[prost(message, optional, tag = "3")]
     pub error: Option<RpcError>,
@@ -228,6 +228,13 @@ pub mod request {
         pub volume: Option<u32>,
     }
 
+    /// `settings.set_autostart` 参数：目标开关状态。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SetAutostart {
+        #[prost(bool, tag = "1")]
+        pub enabled: bool,
+    }
+
     /// 按方法区分的请求参数 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -246,6 +253,9 @@ pub mod request {
         /// `session.start`
         #[prost(message, tag = "14")]
         SessionStart(DeviceSerial),
+        /// `settings.set_autostart`
+        #[prost(message, tag = "15")]
+        SetAutostart(SetAutostart),
     }
 }
 
@@ -279,6 +289,17 @@ pub mod response {
         pub wifi_string: String,
     }
 
+    /// `settings.get` / `settings.set_autostart` 的结果。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Settings {
+        /// 是否开启自启动（config 真源值）
+        #[prost(bool, tag = "1")]
+        pub autostart_enabled: bool,
+        /// 当前平台是否支持自启动
+        #[prost(bool, tag = "2")]
+        pub autostart_supported: bool,
+    }
+
     /// 按方法区分的结果 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -294,14 +315,15 @@ pub mod response {
         /// `pairing.info`
         #[prost(message, tag = "13")]
         PairingInfo(PairingInfo),
+        /// `settings.get` / `settings.set_autostart`
+        #[prost(message, tag = "14")]
+        Settings(Settings),
     }
 }
 
 // ── 事件数据 ──
 
 pub mod event {
-    use super::*;
-
     /// daemon 主动推送的事件数据 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -367,5 +389,35 @@ mod tests {
         let bytes = event.encode_to_vec();
         let decoded = Event::decode(&bytes[..]).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn response_settings_roundtrip() {
+        // 回归：Response.result oneof 必须声明 tag=14，settings.get/set_autostart 才能编码/解码
+        let resp = Response {
+            id: 7,
+            result: Some(response::Payload::Settings(response::Settings {
+                autostart_enabled: true,
+                autostart_supported: true,
+            })),
+            error: None,
+        };
+        let bytes = resp.encode_to_vec();
+        let decoded = Response::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn request_set_autostart_roundtrip() {
+        let req = Request {
+            id: 8,
+            method: "settings.set_autostart".into(),
+            params: Some(request::Payload::SetAutostart(request::SetAutostart {
+                enabled: true,
+            })),
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = Request::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, req);
     }
 }

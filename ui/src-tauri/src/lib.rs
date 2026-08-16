@@ -47,6 +47,13 @@ struct AdbDeviceInfo {
     state: String,
 }
 
+/// 应用设置（自上而下经 daemon 的 `settings.*` RPC）。
+#[derive(Clone, serde::Serialize)]
+struct SettingsInfo {
+    autostart_enabled: bool,
+    autostart_supported: bool,
+}
+
 /// 发送给前端的会话列表事件载荷。
 #[derive(Clone, serde::Serialize)]
 struct SessionInfo {
@@ -225,6 +232,35 @@ async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo
             Ok(list.devices.iter().map(device_to_adb_info).collect())
         }
         _ => Err("daemon 返回了意外的 device.adb_list 结果".into()),
+    }
+}
+
+/// 读取应用设置（含开机自启动状态）。
+#[tauri::command]
+async fn get_settings(state: State<'_, AppState>) -> Result<SettingsInfo, String> {
+    let resp = ipc_request(&state, "settings.get", None).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::Settings(s)) => Ok(SettingsInfo {
+            autostart_enabled: s.autostart_enabled,
+            autostart_supported: s.autostart_supported,
+        }),
+        _ => Err("daemon 返回了意外的 settings.get 结果".into()),
+    }
+}
+
+/// 设置是否开机自启动（写 config 真源 + 同步 HKCU Run 键）。
+#[tauri::command]
+async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<SettingsInfo, String> {
+    let params = request::Payload::SetAutostart(request::SetAutostart { enabled });
+    let resp = ipc_request(&state, "settings.set_autostart", Some(params)).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::Settings(s)) => Ok(SettingsInfo {
+            autostart_enabled: s.autostart_enabled,
+            autostart_supported: s.autostart_supported,
+        }),
+        _ => Err("daemon 返回了意外的 settings.set_autostart 结果".into()),
     }
 }
 
@@ -436,6 +472,8 @@ pub fn run() {
             retry_session,
             start_session,
             get_adb_devices,
+            get_settings,
+            set_autostart,
         ])
         .setup(|app| {
             let h = app.handle().clone();
