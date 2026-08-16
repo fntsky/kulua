@@ -71,34 +71,12 @@ impl VideoDecoder {
         }
     }
 
-    /// 设置解码器 extradata（scrcpy 视频流的 config 帧，含 SPS/PPS）。
-    /// 必须在 `open` 之前调用。
-    pub fn set_extradata(&mut self, data: &[u8]) -> Result<(), String> {
-        if self.opened {
-            return Err("解码器已打开，不能设置 extradata".into());
-        }
-        unsafe {
-            if !(*self.codec_ctx).extradata.is_null() {
-                av_free((*self.codec_ctx).extradata as *mut _);
-            }
-            // 需要 AV_INPUT_BUFFER_PADDING_SIZE 填充（解码器可能越界读）
-            let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
-            let buf = av_malloc(data.len() + padding) as *mut u8;
-            if buf.is_null() {
-                return Err("av_malloc 失败".into());
-            }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
-            std::ptr::write_bytes(buf.add(data.len()), 0, padding);
-            (*self.codec_ctx).extradata = buf;
-            (*self.codec_ctx).extradata_size = data.len() as i32;
-        }
-        Ok(())
-    }
-
     /// 打开解码器。
     ///
     /// 优先尝试 D3D11VA 硬件解码（把解码从 CPU 卸载到 GPU，缓解与音频解码的
     /// CPU 竞争）；GPU/驱动不支持时自动回退软解。
+    /// 注意：不设置 extradata——媒体帧是 Annex-B（每个 IDR 自带 SPS/PPS），
+    /// 与官方客户端一致（config 帧直接丢弃）。
     pub fn open(&mut self) -> Result<(), String> {
         if self.opened {
             return Ok(());

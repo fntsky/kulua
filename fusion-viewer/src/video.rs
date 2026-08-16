@@ -114,18 +114,20 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
             let keyframe = pts_flags & (1 << 61) != 0;
             let pts = (pts_flags & ((1 << 61) - 1)) as i64;
 
-            if config {
-                // config 帧（SPS/PPS 等）：作为 extradata 喂给解码器后打开
-                if !decoder.is_open() {
-                    if let Err(e) = decoder.set_extradata(&payload) {
-                        let _ = tx.send(VideoEvent::Error(format!("设置 extradata 失败: {}", e)));
-                        return;
-                    }
-                    if let Err(e) = decoder.open() {
-                        let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {}", e)));
-                        return;
-                    }
+            // 确保解码器已打开（无 extradata；SPS/PPS 由每个 IDR 帧自带）
+            if !decoder.is_open() {
+                if let Err(e) = decoder.open() {
+                    let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {}", e)));
+                    return;
                 }
+            }
+
+            if config {
+                // ★ 对照官方客户端（decoder.c）：config 帧直接丢弃，不设 extradata。
+                //   config 帧 payload 是 MediaCodec 的 csd（avcC 格式），设为 extradata
+                //   会迫使解码器进入 length-prefixed 模式，而媒体帧是 Annex-B（start
+                //   code），导致 'error while decoding MB' + 大规模 conceal 错位。
+                //   Android MediaCodec 编码器每个 IDR 帧自带 SPS/PPS，丢弃无碍。
                 continue;
             }
 
