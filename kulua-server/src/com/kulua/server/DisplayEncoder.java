@@ -72,14 +72,7 @@ public final class DisplayEncoder {
         widthField = newWidth;
         heightField = newHeight;
         running = false;
-        if (thread != null) {
-            try {
-                thread.join(2000);
-            } catch (InterruptedException ignored) {
-                // ignore
-            }
-        }
-        releaseCodec();
+        stopEncoderThread();
         try {
             createCodec();
             running = true;
@@ -174,8 +167,16 @@ public final class DisplayEncoder {
                     break;
                 }
             }
+        } catch (IllegalStateException e) {
+            // 正常关闭路径：resize/stop 时 codec.stop() 会唤醒阻塞的
+            // dequeueOutputBuffer 并抛 IllegalStateException。这不是错误——
+            // 若在此崩溃（未捕获异常），Android 会杀掉整个 server 进程，
+            // 导致所有显示器/音频/剪贴板连接一起断（实测 resize 即崩）。
+            Log.i(TAG, "display #" + id + " codec stopped: " + e.getMessage());
         } catch (IOException e) {
             Log.i(TAG, "display #" + id + " stream ended: " + e.getMessage());
+        } catch (RuntimeException e) {
+            Log.i(TAG, "display #" + id + " encode loop error: " + e.getMessage());
         } finally {
             Log.i(TAG, "display #" + id + " encode loop exited");
         }
@@ -207,13 +208,38 @@ public final class DisplayEncoder {
     /** 停止编码器与推流。 */
     public void stop() {
         running = false;
-        if (thread != null) {
-            try {
-                thread.join(2000);
-            } catch (InterruptedException ignored) {
-                // ignore
-            }
+        stopEncoderThread();
+    }
+
+    /**
+     * 停掉编码线程并释放 codec（resize / stop 共用）。
+     *
+     * 顺序很重要：先 codec.stop() 唤醒阻塞在 dequeueOutputBuffer 的编码线程
+     * （stop 会让它抛 IllegalStateException，encodeLoop 已捕获并正常退出），
+     * 再 join 等线程真正结束，最后 release。若反过来直接 release，线程会
+     * 因"Pending dequeue output buffer request cancelled"崩溃并拖垮进程。
+     */
+    private void stopEncoderThread() {
+        if (thread == null) {
+            releaseCodec();
+            return;
         }
+        // 1. stop codec 唤醒 dequeue（幂等：codec 可能已在异常路径释放）
+        try {
+            if (codec != null) {
+                codec.stop();
+            }
+        } catch (Exception ignored) {
+            // ignore
+        }
+        // 2. 等编码线程退出（stop 唤醒后应很快返回；2s 兜底）
+        try {
+            thread.join(2000);
+        } catch (InterruptedException ignored) {
+            // ignore
+        }
+        thread = null;
+        // 3. 释放资源
         releaseCodec();
     }
 
