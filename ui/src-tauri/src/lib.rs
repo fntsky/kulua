@@ -1,17 +1,16 @@
 use parking_lot::Mutex;
+use prost::Message;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use sync_core::ipc::proto::{self, event, request, response};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
-use prost::Message;
-use sync_core::ipc::proto;
-
 
 /// 通过长连接发送的 IPC 请求，响应通过 oneshot 回传。
 struct IpcRequest {
     id: u64,
     frame: (u8, Vec<u8>),
-    response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
+    response_tx: oneshot::Sender<Result<proto::Response, String>>,
 }
 
 // ── State ──
@@ -22,7 +21,7 @@ struct AppState {
     pairing_info: Mutex<Option<PairingInfo>>,
     /// 长连接的 IPC 发送端
     ipc_tx: Mutex<Option<mpsc::Sender<IpcRequest>>>,
-    /// 自增请求 ID
+    /// 自增请求 ID（1、2 保留给连接建立后的初始握手）
     next_id: AtomicU64,
 }
 
@@ -48,6 +47,89 @@ struct AdbDeviceInfo {
     state: String,
 }
 
+/// 发送给前端的会话列表事件载荷。
+#[derive(Clone, serde::Serialize)]
+struct SessionInfo {
+    uuid: String,
+    id: String,
+    serial: String,
+    name: String,
+    state: String,
+    session_state: String,
+    audio_buffer_ms: u64,
+    clipboard_sync: bool,
+    notification_sync: bool,
+    audio_enabled: bool,
+    volume: u32,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SessionListInfo {
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ClipboardInfo {
+    text: String,
+    serial: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct NotificationInfo {
+    serial: String,
+    title: String,
+    text: String,
+    app: String,
+}
+
+// ── 转换辅助 ──
+
+fn device_to_info(device: &proto::Device) -> DeviceInfo {
+    DeviceInfo {
+        uuid: device.uuid.clone(),
+        serial: device.serial.clone(),
+        state: device.state.clone(),
+        name: device.name.clone(),
+    }
+}
+
+fn device_to_adb_info(device: &proto::Device) -> AdbDeviceInfo {
+    AdbDeviceInfo {
+        serial: device.serial.clone(),
+        state: device.state.clone(),
+    }
+}
+
+fn session_to_info(session: &proto::SessionSummary) -> SessionInfo {
+    SessionInfo {
+        uuid: session.uuid.clone(),
+        id: session.id.clone(),
+        serial: session.serial.clone(),
+        name: session.name.clone(),
+        state: session.state.clone(),
+        session_state: session.session_state.clone(),
+        audio_buffer_ms: session.audio_buffer_ms,
+        clipboard_sync: session.clipboard_sync,
+        notification_sync: session.notification_sync,
+        audio_enabled: session.audio_enabled,
+        volume: session.volume,
+    }
+}
+
+fn check_response(resp: &proto::Response) -> Result<(), String> {
+    match &resp.error {
+        Some(err) => Err(format!("{} (code {})", err.message, err.code)),
+        None => Ok(()),
+    }
+}
+
+fn update_device_cache(app: &AppHandle, infos: Vec<DeviceInfo>) {
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.devices.lock() = infos.clone();
+    }
+    let _ = app.emit("devices-updated", &infos);
+}
+
 // ── Commands ──
 
 #[tauri::command]
@@ -65,27 +147,26 @@ fn get_pairing_info(state: State<'_, AppState>) -> Option<PairingInfo> {
     state.pairing_info.lock().clone()
 }
 
-/// 通过长连接向 daemon 发送 JSON-RPC 请求并等待响应。
+/// 通过长连接向 daemon 发送 Protobuf 请求并等待响应。
 async fn ipc_request(
     state: &State<'_, AppState>,
     method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+    params: Option<request::Payload>,
+) -> Result<proto::Response, String> {
     use sync_core::ipc::types::FRAME_TYPE_REQUEST;
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel();
 
-    let req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
+    let req = proto::Request {
+        id,
+        method: method.to_string(),
+        params,
+    };
 
     let ipc_req = IpcRequest {
         id,
-        frame: (FRAME_TYPE_REQUEST, serde_json::to_vec(&req).unwrap()),
+        frame: (FRAME_TYPE_REQUEST, req.encode_to_vec()),
         response_tx: tx,
     };
 
@@ -94,57 +175,59 @@ async fn ipc_request(
 
     rx.await.map_err(|_| "daemon 已断开")?
 }
-    #[tauri::command]
-    async fn update_session_config(
-        state: State<'_, AppState>,
-        uuid: String,
-        clipboard_sync: bool,
-        notification_sync: bool,
-        audio_sync: bool,
-        volume: u16,
-    ) -> Result<(), String> {
-        ipc_request(
-            &state,
-            "session.update",
-            serde_json::json!({
-                "uuid": uuid,
-                "clipboard_sync": clipboard_sync,
-                "notification_sync": notification_sync,
-                "audio_sync": audio_sync,
-                "volume": volume,
-            }),
-        ).await?;
-        Ok(())
-    }
 
-    /// 重试 failed 墓碑 session
-    #[tauri::command]
-    async fn retry_session(state: State<'_, AppState>, uuid: String) -> Result<(), String> {
-        ipc_request(&state, "session.retry", serde_json::json!({ "uuid": uuid })).await?;
-        Ok(())
-    }
+#[tauri::command]
+async fn update_session_config(
+    state: State<'_, AppState>,
+    uuid: String,
+    clipboard_sync: bool,
+    notification_sync: bool,
+    audio_sync: bool,
+    volume: u16,
+) -> Result<(), String> {
+    let params = request::Payload::SessionUpdate(request::SessionUpdate {
+        uuid,
+        clipboard_sync: Some(clipboard_sync),
+        notification_sync: Some(notification_sync),
+        audio_sync: Some(audio_sync),
+        volume: Some(u32::from(volume)),
+    });
+    let resp = ipc_request(&state, "session.update", Some(params)).await?;
+    check_response(&resp)?;
+    Ok(())
+}
 
-    /// 点击 ADB 列表设备建立 session（daemon 侧校验无活跃 session 才创建）
-    #[tauri::command]
-    async fn start_session(state: State<'_, AppState>, serial: String) -> Result<(), String> {
-        ipc_request(&state, "session.start", serde_json::json!({ "serial": serial })).await?;
-        Ok(())
-    }
+/// 重试 failed 墓碑 session
+#[tauri::command]
+async fn retry_session(state: State<'_, AppState>, uuid: String) -> Result<(), String> {
+    let params = request::Payload::SessionRetry(request::UuidParam { uuid });
+    let resp = ipc_request(&state, "session.retry", Some(params)).await?;
+    check_response(&resp)?;
+    Ok(())
+}
 
-    /// adb 原始设备列表（含 Offline/Unauthorized）
-    #[tauri::command]
-    async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo>, String> {
-        let result = ipc_request(&state, "device.adb_list", serde_json::json!({})).await?;
-        let devices: Vec<sync_core::types::Device> =
-            serde_json::from_value(result).map_err(|e| e.to_string())?;
-        Ok(devices
-            .iter()
-            .map(|d| AdbDeviceInfo {
-                serial: d.serial.clone(),
-                state: format!("{:?}", d.state),
-            })
-            .collect())
+/// 点击 ADB 列表设备建立 session（daemon 侧校验无活跃 session 才创建）
+#[tauri::command]
+async fn start_session(state: State<'_, AppState>, serial: String) -> Result<(), String> {
+    let params = request::Payload::SessionStart(request::DeviceSerial { serial });
+    let resp = ipc_request(&state, "session.start", Some(params)).await?;
+    check_response(&resp)?;
+    Ok(())
+}
+
+/// adb 原始设备列表（含 Offline/Unauthorized）
+#[tauri::command]
+async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo>, String> {
+    let resp = ipc_request(&state, "device.adb_list", None).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::AdbList(list)) => {
+            Ok(list.devices.iter().map(device_to_adb_info).collect())
+        }
+        _ => Err("daemon 返回了意外的 device.adb_list 结果".into()),
     }
+}
+
 // ── IPC Client ──
 
 async fn connect_daemon(app: AppHandle) {
@@ -190,20 +273,25 @@ async fn connect_daemon(app: AppHandle) {
     use sync_core::ipc::types::{
         FrameCodec, FRAME_TYPE_EVENT, FRAME_TYPE_REQUEST, FRAME_TYPE_RESPONSE,
     };
-    use sync_core::ipc::types::JsonRpcResponse;
     use tokio_stream::StreamExt;
     use tokio_util::codec::Framed;
 
     let mut framed = Framed::new(stream, FrameCodec);
-    let mut pending: HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>> = HashMap::new();
+    let mut pending: HashMap<u64, oneshot::Sender<Result<proto::Response, String>>> =
+        HashMap::new();
 
     // ── 初始握手：device.list + pairing.info ──
-    for (id, method, params) in [
-        (1u64, "device.list", serde_json::json!({})),
-        (2u64, "pairing.info", serde_json::json!({})),
-    ] {
-        let req = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if framed.send((FRAME_TYPE_REQUEST, serde_json::to_vec(&req).unwrap())).await.is_err() {
+    for (id, method) in [(1u64, "device.list"), (2u64, "pairing.info")] {
+        let req = proto::Request {
+            id,
+            method: method.to_string(),
+            params: None,
+        };
+        if framed
+            .send((FRAME_TYPE_REQUEST, req.encode_to_vec()))
+            .await
+            .is_err()
+        {
             set_conn(&app, false);
             return;
         }
@@ -216,111 +304,70 @@ async fn connect_daemon(app: AppHandle) {
             frame = framed.next() => {
                 match frame {
                     Some(Ok((FRAME_TYPE_EVENT, data))) => {
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            let event_name = val.get("event").and_then(|v| v.as_str());
-                            match event_name {
-                                Some("device.updated") => {
-                                    if let Some(devices_val) = val.get("data") {
-                                        if let Ok(devices) =
-                                            serde_json::from_value::<Vec<sync_core::types::Device>>(
-                                                devices_val.clone(),
-                                            )
-                                        {
-                                            let infos: Vec<DeviceInfo> = devices
-                                                .iter()
-                                                .map(|d| DeviceInfo {
-                                                    uuid: d.uuid.to_string(),
-                                                    serial: d.serial.clone(),
-                                                    state: format!("{:?}", d.state),
-                                                    name: d.name.clone(),
-                                                })
-                                                .collect();
-                                            if let Some(st) = app.try_state::<AppState>() {
-                                                *st.devices.lock() = infos.clone();
-                                            }
-                                            let _ = app.emit("devices-updated", &infos);
-                                        }
-                                    }
+                        if let Ok(event) = proto::Event::decode(&data[..]) {
+                            match event.data {
+                                Some(event::Payload::DeviceUpdated(list)) => {
+                                    let infos: Vec<DeviceInfo> =
+                                        list.devices.iter().map(device_to_info).collect();
+                                    update_device_cache(&app, infos);
                                 }
-                                Some("adb.updated") => {
-                                    if let Some(devices_val) = val.get("data") {
-                                        if let Ok(devices) =
-                                            serde_json::from_value::<Vec<sync_core::types::Device>>(
-                                                devices_val.clone(),
-                                            )
-                                        {
-                                            let infos: Vec<AdbDeviceInfo> = devices
-                                                .iter()
-                                                .map(|d| AdbDeviceInfo {
-                                                    serial: d.serial.clone(),
-                                                    state: format!("{:?}", d.state),
-                                                })
-                                                .collect();
-                                            let _ = app.emit("adb-updated", &infos);
-                                        }
-                                    }
+                                Some(event::Payload::AdbUpdated(list)) => {
+                                    let infos: Vec<AdbDeviceInfo> =
+                                        list.devices.iter().map(device_to_adb_info).collect();
+                                    let _ = app.emit("adb-updated", &infos);
                                 }
-                                Some("session.updated") => {
-                                    if let Some(sessions_val) = val.get("data") {
-                                        if let Ok(session_data) = serde_json::from_value::<sync_core::ipc::types::SessionListData>(
-                                            sessions_val.clone(),
-                                        ) {
-                                            let _ = app.emit("sessions-updated", &session_data);
-                                        }
-                                    }
+                                Some(event::Payload::SessionUpdated(list)) => {
+                                    let data = SessionListInfo {
+                                        sessions: list.sessions.iter().map(session_to_info).collect(),
+                                    };
+                                    let _ = app.emit("sessions-updated", &data);
                                 }
-                                Some("clipboard.changed") => {
-                                    let _ = app.emit("clipboard-changed", &data);
+                                Some(event::Payload::ClipboardChanged(data)) => {
+                                    let payload = ClipboardInfo {
+                                        text: data.text,
+                                        serial: data.serial,
+                                    };
+                                    let _ = app.emit("clipboard-changed", &payload);
                                 }
-                                Some("notification") => {
-                                    let _ = app.emit("notification-received", &data);
+                                Some(event::Payload::Notification(data)) => {
+                                    let payload = NotificationInfo {
+                                        serial: data.serial,
+                                        title: data.title,
+                                        text: data.text,
+                                        app: data.app,
+                                    };
+                                    let _ = app.emit("notification-received", &payload);
                                 }
-                                _ => {}
+                                None => {}
                             }
                         }
                     }
 
-                    // 响应帧：路由到 pending oneshot，或处理初始握手遗留响应
+                    // 响应帧：路由到 pending oneshot，或处理初始握手响应
                     Some(Ok((FRAME_TYPE_RESPONSE, data))) => {
-                        if let Ok(resp) = serde_json::from_slice::<JsonRpcResponse>(&data) {
+                        if let Ok(resp) = proto::Response::decode(&data[..]) {
                             if let Some(tx) = pending.remove(&resp.id) {
-                                let result = match (resp.result, resp.error) {
-                                    (Some(r), _) => Ok(r),
-                                    (_, Some(e)) => Err(format!("{} (code {})", e.message, e.code)),
-                                    _ => Ok(serde_json::Value::Null),
-                                };
-                                let _ = tx.send(result);
-                            } else if let Some(result) = resp.result {
-                                // 初始握手响应（id=1 或 id=2）
-                                match resp.id {
-                                    1 => {
-                                        if let Ok(devices) =
-                                            serde_json::from_value::<Vec<sync_core::types::Device>>(result)
-                                        {
-                                            let infos: Vec<DeviceInfo> = devices
-                                                .iter()
-                                                .map(|d| DeviceInfo {
-                                                    uuid: d.uuid.to_string(),
-                                                    serial: d.serial.clone(),
-                                                    state: format!("{:?}", d.state),
-                                                    name: d.name.clone(),
-                                                })
-                                                .collect();
-                                            if let Some(st) = app.try_state::<AppState>() {
-                                                *st.devices.lock() = infos.clone();
-                                            }
-                                            let _ = app.emit("devices-updated", &infos);
-                                        }
+                                let _ = tx.send(Ok(resp));
+                            } else {
+                                match (resp.id, resp.result, resp.error) {
+                                    (1, Some(response::Payload::DeviceList(list)), None) => {
+                                        let infos: Vec<DeviceInfo> =
+                                            list.devices.iter().map(device_to_info).collect();
+                                        update_device_cache(&app, infos);
                                     }
-                                    2 => {
-                                        if let Ok(info) =
-                                            serde_json::from_value::<PairingInfo>(result)
-                                        {
-                                            if let Some(st) = app.try_state::<AppState>() {
-                                                *st.pairing_info.lock() = Some(info.clone());
-                                            }
-                                            let _ = app.emit("pairing-info-updated", &info);
+                                    (2, Some(response::Payload::PairingInfo(info)), None) => {
+                                        let pairing_info = PairingInfo {
+                                            dns_id: info.dns_id,
+                                            psk: info.psk,
+                                            wifi_string: info.wifi_string,
+                                        };
+                                        if let Some(st) = app.try_state::<AppState>() {
+                                            *st.pairing_info.lock() = Some(pairing_info.clone());
                                         }
+                                        let _ = app.emit("pairing-info-updated", &pairing_info);
+                                    }
+                                    (_, _, Some(err)) => {
+                                        eprintln!("IPC 握手失败: {} (code {})", err.message, err.code);
                                     }
                                     _ => {}
                                 }
@@ -378,7 +425,8 @@ pub fn run() {
             connected: Mutex::new(false),
             pairing_info: Mutex::new(None),
             ipc_tx: Mutex::new(None),
-            next_id: AtomicU64::new(1),
+            // 1/2 保留给启动握手的 device.list / pairing.info
+            next_id: AtomicU64::new(3),
         })
         .invoke_handler(tauri::generate_handler![
             get_devices,

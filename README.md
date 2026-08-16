@@ -11,7 +11,7 @@
 │                      Desktop                          │
 │  ┌──────────┐   TCP IPC    ┌────────────┐            │
 │  │  GUI      │◄───────────►│   daemon   │            │
-│  │ (Tauri)   │ JSON-RPC    │  (Rust)    │            │
+│  │ (Tauri)   │ Protobuf    │  (Rust)    │            │
 │  └──────────┘              └──────┬─────┘            │
 │                                    │                  │
 │                           ┌────────┴────────┐        │
@@ -51,7 +51,7 @@ Core (device mgmt + session orchestration)
     ├─ AdbCmd (adb cli wrapper)
     ├─ Session (per-device lifecycle)
     │    └─ ScrcpyServer (push & run jar, clipboard listener)
-    ├─ IpcServer (TCP JSON-RPC for GUI)
+    ├─ IpcServer (TCP Protobuf IPC for GUI)
     └─ cli (QR terminal output)
 ```
 
@@ -62,7 +62,7 @@ Core (device mgmt + session orchestration)
 | `session` | 单设备声明周期管理（scrcpy 部署、剪贴板 I/O、通知轮询、音频） |
 | `scrcpy` | scrcpy-server 部署/启停 + 剪贴板协议解析 |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
-| `ipc` | TCP JSON-RPC 服务（GUI 通信） |
+| `ipc` | TCP Protobuf IPC 服务（GUI 通信） |
 | `cli` | 终端交互界面 |
 | `types` | 共享类型定义（`Device`, `DeviceEntry`, `PendingEntry`） |
 | `device_refresh` | 后台 adb track-devices 长连接，推送设备状态变更 |
@@ -95,7 +95,7 @@ DeviceEntry { device, session?, config }
 
 ### IPC Protocol
 
-GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
+GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 
 ```
 ┌────────────────┬──────┬─────────────────────┐
@@ -104,8 +104,8 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 └────────────────┴──────┴─────────────────────┘
 ```
 
-- 单客户端独占模式
-- 支持 Request / Response / Event / Audio 四种帧类型
+- GUI 侧按单客户端使用
+- Request / Response / Event / Audio 四种帧类型，RPC 载荷为 Protobuf 强类型消息
 - 端口号写入 `%TEMP%/sync-daemon.port`
 
 #### RPC 方法
@@ -116,6 +116,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 | `device.adb_list` | Request | 获取 adb 原始设备列表（含 Offline/Unauthorized） |
 | `device.connect` | Request | 发起 adb connect |
 | `device.disconnect` | Request | 断开设备连接 |
+| `session.start` | Request | 点击 ADB 设备建立 session（daemon 侧幂等校验） |
 | `session.update` | Request | 更新 session 配置（按 uuid 标识设备） |
 | `session.retry` | Request | 重试 failed 状态的 session（按 uuid 标识设备） |
 | `clipboard.get` | Request | 读取 PC 端剪贴板 |
@@ -127,7 +128,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + JSON-RPC** 通信：
 |-------|---------|-------------|
 | `device.updated` | `Vec<Device>` | 合并后设备列表变更（实时推送） |
 | `adb.updated` | `Vec<Device>` | adb 原始设备列表变更（含 Offline/Unauthorized） |
-| `session.updated` | `SessionListData` | Session 状态/配置变更（含 uuid / session_state / clipboard_sync / notification_sync / audio_enabled / audio_buffer_ms） |
+| `session.updated` | `SessionListData`（Protobuf） | Session 状态/配置变更（含 uuid / session_state / clipboard_sync / notification_sync / audio_enabled / audio_buffer_ms） |
 | `clipboard.changed` | `ClipboardData` | 剪贴板变更 |
 | `notification` | `NotifData` | 手机通知推送 |
 
@@ -178,14 +179,14 @@ sync-workspace/
 │       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
 │       ├── scrcpy.rs    # scrcpy-server 交互
 │       ├── adb_cmd.rs   # ADB CLI 封装
-│       ├── ipc/         # TCP JSON-RPC 服务
+│       ├── ipc/         # TCP Protobuf IPC 服务
 │       ├── wireless_pair.rs
 │       ├── device_refresh.rs
 │       ├── audio_player.rs
 │       └── notification.rs
 ├── ui/                  # 桌面 GUI (Tauri v2 + Vue 3)
 │   ├── src/             # Vue 3 前端（App.vue）
-│   └── src-tauri/       # Tauri Rust 后端
+│   └── src-tauri/       # Tauri Rust 后端（复用 sync-core IPC 消息）
 ├── build.sh             # 构建脚本 (Linux/macOS)
 ├── build.ps1            # 构建脚本 (Windows)
 ├── scrcpy-server        # scrcpy server jar

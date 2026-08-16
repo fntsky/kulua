@@ -192,9 +192,9 @@ impl Core {
             .cmd_rx
             .take()
             .expect("Core::run can only be called once");
-        if let Ok(server) = crate::ipc::server_proto::IpcServer::bind().await {
+        if let Ok(server) = crate::ipc::server::IpcServer::bind().await {
             let token = self.token.clone();
-            crate::ipc::server_proto::serve(
+            crate::ipc::server::serve(
                 server,
                 token,
                 self.cmd_tx.clone(),

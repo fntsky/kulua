@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
 
-
 // ── 帧类型常量 ──
 
 pub const FRAME_TYPE_REQUEST: u8 = 0x00;
@@ -62,50 +61,7 @@ impl Encoder<(u8, Vec<u8>)> for FrameCodec {
     }
 }
 
-// ── JSON-RPC ──
-
-/// 来自 GUI 的 JSON-RPC 请求。
-#[derive(Debug, Deserialize)]
-pub struct JsonRpcRequest {
-    pub id: u64,
-    pub method: String,
-    pub params: serde_json::Value,
-}
-
-/// 发往 GUI 的 JSON-RPC 响应。
-#[derive(Debug, Serialize, Deserialize)]
-pub struct JsonRpcResponse {
-    pub id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-}
-
-/// JSON-RPC 错误对象。
-#[derive(Debug, Serialize, Deserialize)]
-pub struct JsonRpcError {
-    pub code: i32,
-    pub message: String,
-}
-
-// ── 事件（daemon → GUI）──
-
-/// daemon 主动推送的事件，`#[serde(tag = "event")]` 生成 `{"event": "...", "data": ...}`。
-#[derive(Debug, Serialize)]
-#[serde(tag = "event")]
-pub enum Event {
-    #[serde(rename = "device.updated")]
-    DeviceUpdated { data: Vec<crate::types::Device> },
-    #[serde(rename = "adb.updated")]
-    AdbUpdated { data: Vec<crate::types::Device> },
-    #[serde(rename = "session.updated")]
-    SessionUpdated { data: SessionListData },
-    #[serde(rename = "clipboard.changed")]
-    ClipboardChanged { data: ClipboardData },
-    #[serde(rename = "notification")]
-    Notification { data: NotifData },
-}
+// ── 会话状态（Core 内部 watch，也用于 IPC 编码转换） ──
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -131,45 +87,6 @@ pub struct SessionSummary {
     pub volume: u16,
     /// 音频播放队列缓冲延迟（ms），0 = 无音频/未播放
     pub audio_buffer_ms: u64,
-}
-
-/// `session.updated` 事件的载荷。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionListData {
-    pub sessions: Vec<SessionSummary>,
-}
-
-/// `clipboard.changed` 事件的载荷。
-#[derive(Debug, Serialize)]
-pub struct ClipboardData {
-    pub text: String,
-    pub serial: String,
-}
-
-/// `notification` 事件的载荷。
-#[derive(Debug, Serialize)]
-pub struct NotifData {
-    pub serial: String,
-    pub title: String,
-    pub text: String,
-    pub app: String,
-}
-
-// ── IPC 错误 ──
-
-/// IPC 层错误，涵盖 I/O、序列化、协议等方法
-#[derive(Debug, thiserror::Error)]
-pub enum IpcError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
-    #[error("unknown frame type: {0}")]
-    UnknownFrameType(u8),
-    #[error("method not found: {0}")]
-    MethodNotFound(String),
-    #[error("invalid params: {0}")]
-    InvalidParams(String),
 }
 
 // ── 测试 ──
@@ -256,5 +173,4 @@ mod tests {
 
         assert!(codec.decode(&mut buf).is_err(), "oversized frame should be rejected");
     }
-
 }

@@ -55,72 +55,7 @@ pub fn spawn_notification_poller(
     notif_tx: std_mpsc::Sender<NotifInfo>,
 ) -> (JoinHandle<()>, Arc<AtomicBool>) {
     let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop.clone();
-
-    let handle = std::thread::Builder::new()
-        .name(format!("notif-poller-{}", device.serial))
-        .spawn(move || {
-            let serial = &device.serial;
-            let mut old_keys: HashSet<String> = HashSet::new();
-            let mut first_poll = true;
-
-            loop {
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                // 1) 拉取通知列表
-                let output = match adb.run(&["-s", serial, "shell", "cmd", "notification", "list"])
-                {
-                    Ok(out) => out,
-                    Err(e) => {
-                        eprintln!("通知列表获取失败 ({}): {}", serial, e);
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                };
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let new_keys = parse_notification_list(&stdout);
-
-                // 2) 首次轮询：只初始化，不弹通知
-                if first_poll {
-                    old_keys = new_keys;
-                    first_poll = false;
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-
-                // 3) 计算新增 key 并获取详情
-                let added: Vec<&str> = new_keys.difference(&old_keys).map(|s| s.as_str()).collect();
-
-                for key in &added {
-                    // 用单引号包裹 key，避免 shell 把 | 当成管道
-                    let shell_cmd =
-                        format!("cmd notification get '{}'", key.replace('\'', "'\\''"));
-                    let detail_output = match adb.run(&["-s", serial, "shell", &shell_cmd]) {
-                        Ok(out) => out,
-                        Err(e) => {
-                            eprintln!("通知详情获取失败 ({}): {}", serial, e);
-                            continue;
-                        }
-                    };
-
-                    let detail_stdout = String::from_utf8_lossy(&detail_output.stdout);
-                    if let Some(info) = parse_notification_detail(&detail_stdout, key) {
-                        if notif_tx.send(info).is_err() {
-                            // receiver dropped（Core 退出了）
-                            break;
-                        }
-                    }
-                }
-
-                old_keys = new_keys;
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        })
-        .expect("spawn notification poller thread");
-
+    let handle = spawn_notification_poller_with_stop(adb, device, notif_tx, stop.clone());
     (handle, stop)
 }
 
