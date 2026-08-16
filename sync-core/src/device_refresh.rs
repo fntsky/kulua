@@ -93,7 +93,6 @@ pub fn spawn(device_tx: watch::Sender<HashMap<String, Device>>, token: Cancellat
                     break;
                 }
 
-
                 // 解析并推送（解析失败记录日志，避免静默停止更新）
 
                 match crate::protocol::devices::parse_devices(&payload) {

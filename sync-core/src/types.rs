@@ -5,7 +5,6 @@ use uuid::Uuid;
 /// 来自 `adb get-serialno` 的规范设备 ID（主键）
 pub type DeviceId = String;
 
-
 /// 设备地址形式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceAddrKind {
@@ -181,17 +180,31 @@ mod tests {
 
     #[test]
     fn test_display_adb_not_found() {
-        let err = AdbError::AdbNotFound { tried: "/usr/bin/adb".into() };
+        let err = AdbError::AdbNotFound {
+            tried: "/usr/bin/adb".into(),
+        };
         let output = err.to_string();
-        assert!(output.contains("adb not found"), "expected 'adb not found' in display, got: {}", output);
+        assert!(
+            output.contains("adb not found"),
+            "expected 'adb not found' in display, got: {}",
+            output
+        );
     }
 
     #[test]
     fn test_display_command_failed() {
         let err = AdbError::CommandFailed("something went wrong".into());
         let output = err.to_string();
-        assert!(output.contains("adb command failed"), "expected 'adb command failed' in display, got: {}", output);
-        assert!(output.contains("something went wrong"), "expected message in display, got: {}", output);
+        assert!(
+            output.contains("adb command failed"),
+            "expected 'adb command failed' in display, got: {}",
+            output
+        );
+        assert!(
+            output.contains("something went wrong"),
+            "expected message in display, got: {}",
+            output
+        );
     }
 
     #[test]
@@ -199,16 +212,26 @@ mod tests {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
         let err = AdbError::Io(io_err);
         let output = err.to_string();
-        assert!(output.contains("I/O error"), "expected 'I/O error' in display, got: {}", output);
+        assert!(
+            output.contains("I/O error"),
+            "expected 'I/O error' in display, got: {}",
+            output
+        );
     }
 
     #[test]
     fn test_partial_eq_adb_not_found() {
-        let a = AdbError::AdbNotFound { tried: "/path/a".into() };
-        let b = AdbError::AdbNotFound { tried: "/path/a".into() };
+        let a = AdbError::AdbNotFound {
+            tried: "/path/a".into(),
+        };
+        let b = AdbError::AdbNotFound {
+            tried: "/path/a".into(),
+        };
         assert_eq!(a, b, "same tried path should be equal");
 
-        let c = AdbError::AdbNotFound { tried: "/path/b".into() };
+        let c = AdbError::AdbNotFound {
+            tried: "/path/b".into(),
+        };
         assert_ne!(a, c, "different tried paths should not be equal");
     }
 
@@ -224,9 +247,14 @@ mod tests {
 
     #[test]
     fn test_partial_eq_different_variants() {
-        let not_found = AdbError::AdbNotFound { tried: "adb".into() };
+        let not_found = AdbError::AdbNotFound {
+            tried: "adb".into(),
+        };
         let cmd_failed = AdbError::CommandFailed("adb".into());
-        assert_ne!(not_found, cmd_failed, "different variants should not be equal");
+        assert_ne!(
+            not_found, cmd_failed,
+            "different variants should not be equal"
+        );
     }
 
     #[test]
@@ -254,4 +282,3 @@ mod tests {
         assert!(source.is_none(), "Other variant should not have a source");
     }
 }
-

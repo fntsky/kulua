@@ -1,9 +1,9 @@
 use crate::adb_cmd::AdbOps;
 use crate::types::Device;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ pub struct NotifInfo {
     pub serial: String,
 }
 
-pub use crate::protocol::notification::{parse_notification_list, parse_notification_detail};
+pub use crate::protocol::notification::{parse_notification_detail, parse_notification_list};
 
 /// 在 Windows 上显示桌面通知。
 pub fn show_desktop_notification(info: &NotifInfo) {
@@ -134,7 +134,6 @@ fn spawn_notification_poller_with_stop(
         .expect("spawn notification poller thread")
 }
 
-
 /// 桥接版本：启动 std 线程通知轮询器，通过 bridging 转发到 tokio mpsc channel
 ///
 /// `enabled` 控制是否将通知推送给 Core（false 时丢弃但仍保持轮询）
@@ -168,4 +167,3 @@ pub fn spawn_notification_poller_tokio(
     });
     poller_handle
 }
-

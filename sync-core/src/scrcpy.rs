@@ -97,9 +97,6 @@ impl ScrcpyServer {
     }
 }
 
-
-
-
 /// 启动 clipboard 监听线程（Phone→PC）。
 ///
 /// 在一个 TcpStream 上同时处理双向通信：

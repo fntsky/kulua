@@ -52,7 +52,6 @@ mod tests {
         assert_eq!(d.state, expected_state, "device state mismatch");
     }
 
-
     #[test]
     fn test_parse_devices_normal() {
         let stdout = b"List of devices attached\ndevice1\tdevice\n";

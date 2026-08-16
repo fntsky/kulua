@@ -54,11 +54,9 @@ impl AdbOps for AdbCmd {
         cmd.arg("version");
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let output = cmd
-            .output()
-            .map_err(|_| AdbError::AdbNotFound {
-                tried: self.adb_path.display().to_string(),
-            })?;
+        let output = cmd.output().map_err(|_| AdbError::AdbNotFound {
+            tried: self.adb_path.display().to_string(),
+        })?;
         if !output.status.success() {
             return Err(AdbError::AdbNotFound {
                 tried: self.adb_path.display().to_string(),
@@ -110,14 +108,12 @@ impl AdbOps for AdbCmd {
         cmd.args(["-s", serial, "push", local, remote]);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let output = cmd
-            .output()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
-                    tried: self.adb_path.display().to_string(),
-                },
-                _ => AdbError::Io(e),
-            })?;
+        let output = cmd.output().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
+                tried: self.adb_path.display().to_string(),
+            },
+            _ => AdbError::Io(e),
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -198,15 +194,13 @@ impl AdbOps for AdbCmd {
         cmd.args(args);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let output = cmd
-            .output()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
-                    tried: self.adb_path.display().to_string(),
-                },
+        let output = cmd.output().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AdbError::AdbNotFound {
+                tried: self.adb_path.display().to_string(),
+            },
 
-                _ => AdbError::Io(e),
-            })?;
+            _ => AdbError::Io(e),
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -254,7 +248,6 @@ impl AdbCmd {
         crate::protocol::devices::parse_devices(stdout)
     }
 }
-
 
 #[cfg(test)]
 pub mod mock {
@@ -307,8 +300,7 @@ pub mod mock {
                 },
                 serialno_result: String::new(),
             }
-    }
-
+        }
     }
 
     impl AdbOps for MockAdb {

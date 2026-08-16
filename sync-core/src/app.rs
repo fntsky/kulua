@@ -7,7 +7,7 @@ use crate::types::{Device, DeviceAddrKind, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -417,19 +417,22 @@ impl Core {
                 // 清理 pending_serials 中的对应地址
                 self.pending_serials.retain(|e| e.addr != serial);
                 // 放弃 Disconnect 中对 session_configs 的清理（config 随 DeviceEntry 保留）
-                }
+            }
             Command::Retry(uuid) => {
                 // 仅 failed 墓碑可重试；活跃 session / 无墓碑 → no-op
-                let has_tombstone = self.devices.get(&uuid).is_some_and(|entry| {
-                    entry.session.as_ref().is_some_and(|h| h.is_failed())
-                });
+                let has_tombstone = self
+                    .devices
+                    .get(&uuid)
+                    .is_some_and(|entry| entry.session.as_ref().is_some_and(|h| h.is_failed()));
                 if !has_tombstone {
                     return;
                 }
                 // 拔墓碑（task 已结束，stop 立即返回并清理 adb forward）
-                let (mut handle, device) = match self.devices.get_mut(&uuid).map(|entry| {
-                    (entry.session.take(), entry.device.clone())
-                }) {
+                let (mut handle, device) = match self
+                    .devices
+                    .get_mut(&uuid)
+                    .map(|entry| (entry.session.take(), entry.device.clone()))
+                {
                     Some((Some(h), d)) => (h, d),
                     _ => return,
                 };
@@ -491,10 +494,7 @@ impl Core {
                 };
 
                 // failed 墓碑 → 拔掉重建（等价 UI 重试按钮）
-                if let Some(mut handle) = self
-                    .devices
-                    .get_mut(&uuid)
-                    .and_then(|e| e.session.take())
+                if let Some(mut handle) = self.devices.get_mut(&uuid).and_then(|e| e.session.take())
                 {
                     handle.stop(self.adb_cmd.as_ref()).await;
                 }
@@ -774,7 +774,6 @@ impl Core {
         }
     }
 
-
     async fn stop_all(&mut self) {
         self.token.cancel();
         println!("Stopping all sessions...");
@@ -928,8 +927,7 @@ mod tests {
 
     /// 测试夹具：插入一台设备 + 一个“运行中”的音频 session（audio=true，port 用哨兵值 9999）。
     /// 返回 (core, uuid, stop_rx, audio_enabled)，stop_rx 用于观察旧 session 是否被 stop。
-    fn core_with_running_audio_session(
-    ) -> (Core, Uuid, oneshot::Receiver<()>, Arc<AtomicBool>) {
+    fn core_with_running_audio_session() -> (Core, Uuid, oneshot::Receiver<()>, Arc<AtomicBool>) {
         let (phone_clip_tx, _) = mpsc::channel(256);
         let (notif_tx, _) = mpsc::channel(64);
         let (clip_tx, _) = broadcast::channel(64);
@@ -994,9 +992,7 @@ mod tests {
                     notification_enabled: Arc::new(AtomicBool::new(true)),
                     audio_enabled: audio_enabled.clone(),
                     volume: Arc::new(AtomicU16::new(80)),
-                    session_state: Arc::new(AtomicU8::new(
-                        crate::session::SESSION_STATE_RUNNING,
-                    )),
+                    session_state: Arc::new(AtomicU8::new(crate::session::SESSION_STATE_RUNNING)),
                     audio_latency: Arc::new(AtomicU64::new(0)),
                 }),
                 config: session::SessionConfig {
@@ -1049,10 +1045,7 @@ mod tests {
         })
         .await;
 
-        assert!(
-            stop_rx.try_recv().is_err(),
-            "音频值未变时不得重启 session"
-        );
+        assert!(stop_rx.try_recv().is_err(), "音频值未变时不得重启 session");
         let entry = core.devices.get(&uuid).unwrap();
         let handle = entry.session.as_ref().unwrap();
         assert_eq!(handle.port, 9999, "原 session 应保留");
@@ -1109,11 +1102,7 @@ mod tests {
     }
 
     /// 向设备的 DeviceEntry 塞入一个假 handle（哨兵 port 9999，state 可指定）。
-    fn inject_fake_session(
-        core: &mut Core,
-        device: &Device,
-        state: u8,
-    ) -> oneshot::Receiver<()> {
+    fn inject_fake_session(core: &mut Core, device: &Device, state: u8) -> oneshot::Receiver<()> {
         let (stop_tx, stop_rx) = oneshot::channel();
         core.devices.get_mut(&device.uuid).unwrap().session = Some(session::Handle {
             device: device.clone(),
@@ -1162,11 +1151,8 @@ mod tests {
         // 不变量：一个设备至多一个 session；已有活跃 session 时点击必须 no-op
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx = inject_fake_session(
-            &mut core,
-            &device,
-            crate::session::SESSION_STATE_RUNNING,
-        );
+        let mut stop_rx =
+            inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
 
         core.on_command(Command::StartSession(device.serial.clone()))
             .await;
@@ -1185,11 +1171,8 @@ mod tests {
         // failed 墓碑不算活跃 session → 点击重建（等价重试按钮）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx = inject_fake_session(
-            &mut core,
-            &device,
-            crate::session::SESSION_STATE_FAILED,
-        );
+        let mut stop_rx =
+            inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_FAILED);
 
         core.on_command(Command::StartSession(device.serial.clone()))
             .await;

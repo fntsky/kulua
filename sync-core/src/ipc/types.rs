@@ -171,6 +171,9 @@ mod tests {
         buf.extend_from_slice(&oversized.to_le_bytes());
         buf.extend_from_slice(&[FRAME_TYPE_REQUEST]);
 
-        assert!(codec.decode(&mut buf).is_err(), "oversized frame should be rejected");
+        assert!(
+            codec.decode(&mut buf).is_err(),
+            "oversized frame should be rejected"
+        );
     }
 }

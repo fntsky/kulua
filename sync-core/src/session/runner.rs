@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -103,12 +103,14 @@ impl Session {
             Ok(Err(e)) => {
                 eprintln!("scrcpy deploy failed for {}: {:?}", self.device.serial, e);
                 // 判死：不再降级 notification-only（见 docs/session-state-design.md）
-                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                self.session_state
+                    .store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 return;
             }
             Err(e) => {
                 eprintln!("spawn_blocking panic: {}", e);
-                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                self.session_state
+                    .store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 return;
             }
         };
@@ -167,7 +169,8 @@ impl Session {
                 "failed to read audio codec header from {}",
                 self.device.serial
             );
-            self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+            self.session_state
+                .store(SESSION_STATE_FAILED, Ordering::SeqCst);
             server.stop(self.adb.as_ref());
             return;
         }
@@ -176,7 +179,8 @@ impl Session {
             println!("Audio stream disabled by device, continuing without audio");
         } else if codec_id == 1 {
             eprintln!("Audio stream configuration error on {}", self.device.serial);
-            self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+            self.session_state
+                .store(SESSION_STATE_FAILED, Ordering::SeqCst);
             server.stop(self.adb.as_ref());
             return;
         } else {
@@ -187,7 +191,8 @@ impl Session {
             );
         }
         // 握手完成（双 socket + 设备名 + codec header）→ running
-        self.session_state.store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+        self.session_state
+            .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
         // 4. 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
         notification::spawn_notification_poller_tokio(
@@ -253,11 +258,9 @@ impl Session {
                         break;
                     }
 
-                    let pts_raw =
-                        u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
+                    let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
                     let frame_size =
-                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap())
-                            as usize;
+                        u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
 
                     // 检查 session 元数据标记（bit 63）
                     if (pts_raw >> 63) & 1 != 0 {
@@ -302,17 +305,22 @@ impl Session {
         };
 
         // 7. 双向剪贴板 I/O（control channel）
-        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx, self.device.serial.clone())
-            .await;
+        self.run_clipboard_io(
+            &mut control_reader,
+            &mut control_writer,
+            stop_rx,
+            self.device.serial.clone(),
+        )
+        .await;
 
         // 8. 清理（模仿官方关闭流程）
         //    run_clipboard_io 返回 → control_reader/writer 已释放 → control socket 关闭
         //    → server 侧 ControlChannel.recv() 收到 IOException
 
         // (a) shutdown audio socket → server 侧 Streamer.writePacket() 收到 IO 错误
-        drop(audio_writer);   // 释放我们的 WriteHalf 引用
+        drop(audio_writer); // 释放我们的 WriteHalf 引用
         if let Some(task) = audio_task {
-            task.abort();     // 释放 ReadHalf → Arc 归零 → socket 关闭
+            task.abort(); // 释放 ReadHalf → Arc 归零 → socket 关闭
         }
 
         // (b) 停通知轮询
@@ -333,7 +341,10 @@ impl Session {
 
         // (d) 看门狗超时 → force kill（同官方 watchdog 超时后 kill(SIGKILL)）
         if exited.is_none() {
-            eprintln!("server {} did not exit after socket shutdown, force killing", self.device.serial);
+            eprintln!(
+                "server {} did not exit after socket shutdown, force killing",
+                self.device.serial
+            );
             server.stop(self.adb.as_ref());
         }
 
@@ -385,7 +396,8 @@ impl Session {
                     "[{}] connect timeout after {} attempts (10s), giving up",
                     self.device.serial, attempts
                 );
-                self.session_state.store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                self.session_state
+                    .store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 server.stop(self.adb.as_ref());
                 return None;
             }
@@ -478,7 +490,8 @@ impl Session {
             None => return,
         };
         // 握手成功（dummy byte 就绪）→ running
-        self.session_state.store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+        self.session_state
+            .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
 
         // 读设备名
         let mut name_buf = [0u8; 64];
@@ -504,8 +517,13 @@ impl Session {
             self.notification_enabled.clone(),
         );
         let (mut control_reader, mut control_writer) = tokio::io::split(stream);
-        self.run_clipboard_io(&mut control_reader, &mut control_writer, stop_rx, self.device.serial.clone())
-            .await;
+        self.run_clipboard_io(
+            &mut control_reader,
+            &mut control_writer,
+            stop_rx,
+            self.device.serial.clone(),
+        )
+        .await;
 
         notif_stop.store(true, Ordering::SeqCst);
         server.stop(self.adb.as_ref());

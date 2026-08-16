@@ -150,7 +150,12 @@ impl AudioPlayer {
             pcm_f32.push(s as f32 / 32768.0);
         }
 
-        let source = PcmSource::new(pcm_f32, self.channels, self.sample_rate, self.played_samples.clone());
+        let source = PcmSource::new(
+            pcm_f32,
+            self.channels,
+            self.sample_rate,
+            self.played_samples.clone(),
+        );
         self.fed_samples.fetch_add(total as u64, Ordering::Relaxed);
         self.player.append(source);
         Ok(())
