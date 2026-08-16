@@ -15,10 +15,11 @@
 │  └──────────┘              └──────┬─────┘            │
 │                                    │                  │
 │                           ┌────────┴────────┐        │
-│                           │  adb / scrcpy    │        │
-│                           │  clipboard sync   │        │
-│                           │  notification sync│        │
-│                           │  device mgmt      │        │
+│                           │ adb / kulua-     │        │
+│                           │ server           │        │
+│                           │ clipboard sync   │        │
+│                           │ notification sync│        │
+│                           │ device mgmt      │        │
 │                           └────────┬────────┘        │
 │                                    │                  │
 │                          Wi-Fi / USB                  │
@@ -40,10 +41,11 @@
 - **通知转发** — 手机通知实时推送到桌面
 - **Session 配置** — 每设备独立开关（剪贴板同步 / 通知同步 / 音频开关）
 - **跨平台 GUI** — Tauri v2 + Vue 3 原生桌面界面
-- **音频转发** — 预留 scrcpy 音频协议支持（实验性）
-- **融合模式** — session 运行中可从 GUI 选择手机应用，以 scrcpy 4.0 虚拟显示器
-  （`new_display`）打开独立原生窗口，可同时开多个、独立关闭；
-  客户端完全自研（winit 窗口 + FFmpeg 软解 + 自研控制协议注入），不依赖官方 scrcpy.exe
+- **音频转发** — 手机系统声音回传 PC 播放（Opus / AAC / FLAC / RAW，可热切换）
+- **融合模式** — session 运行中可从 GUI 选择手机应用，在自研虚拟显示器上
+  打开独立原生窗口（可同时开多个、独立关闭）；完全自研：设备端
+  `kulua-server.jar` 创建虚拟显示器 + H.264 编码，客户端 `fusion-viewer.exe`
+  （winit 窗口 + FFmpeg 软解 + 自研控制协议注入），不依赖官方 scrcpy
 
 ## Architecture
 
@@ -62,8 +64,8 @@ Core (device mgmt + session orchestration)
 |--------|---------------|
 | `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`, `getprop`） |
 | `app` / `Core` | 设备发现、身份合并、连接调度、Session 编排 |
-| `session` | 单设备声明周期管理（scrcpy 部署、剪贴板 I/O、通知轮询、音频） |
-| `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 剪贴板协议解析 |
+| `session` | 单设备声明周期管理（kulua-server 部署、剪贴板 I/O、通知轮询、音频） |
+| `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 协议解析（模块名沿用历史） |
 | `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，60s 缓存） |
 | `fusion` | 融合窗口管理（fusion-viewer.exe 进程生命周期：启动 / 回收 / 优雅关闭） |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
@@ -150,8 +152,9 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 - [adb](https://developer.android.com/tools/adb)（`PATH` 中或项目目录下的 `adb.exe`）
 - Node.js 18+（构建 GUI）
 - Android 设备（Android 11+ 推荐无线调试）
-- FFmpeg 7.1 运行时 DLL（融合模式需要；`vendor/scrcpy-win64` 已内置
-  `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`，自研客户端复用）
+- FFmpeg 7.1 运行时 DLL（融合模式需要；`vendor/scrcpy-win64` 目录已内置
+  `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`，目录名沿用历史，
+  自研 `fusion-viewer.exe` 复用）
 
 ### Build & Run
 
@@ -199,7 +202,7 @@ kulua/
 │       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
 │       ├── scrcpy.rs    # kulua-server 部署/启停（scid 会话隔离）
 │       ├── apps.rs      # 设备应用枚举（server 一次性模式 + 缓存）
-│       ├── fusion.rs    # 融合窗口管理（scrcpy.exe 进程）
+│       ├── fusion.rs    # 融合窗口管理（fusion-viewer.exe 进程）
 │       ├── adb_cmd.rs   # ADB CLI 封装
 │       ├── ipc/         # TCP Protobuf IPC 服务
 │       ├── wireless_pair.rs
@@ -209,7 +212,7 @@ kulua/
 ├── ui/                  # 桌面 GUI (Tauri v2 + Vue 3)
 │   ├── src/             # Vue 3 前端（App.vue）
 │   └── src-tauri/       # Tauri Rust 后端（复用 sync-core IPC 消息）
-├── vendor/scrcpy-win64/ # FFmpeg 7.1 运行时 DLL（融合窗口自研客户端用）
+├── vendor/scrcpy-win64/ # FFmpeg 7.1 运行时 DLL（目录名沿用历史，融合窗口自研客户端用）
 ├── vendor/ffmpeg-7.1/   # FFmpeg 7.1 头文件 + 导入库（构建 fusion-viewer 用）
 ├── fusion-viewer/       # 自研融合窗口客户端（winit + FFmpeg + 自研控制协议）
 ├── kulua-server/        # 自研设备端 server（Java：多虚拟显示器 + 剪贴板 + 音频回传）
@@ -225,8 +228,8 @@ kulua/
 - 依赖自研 `kulua-server.jar`（`kulua-server/build.ps1` 构建，替代官方 scrcpy-server）
 - 需要本地有 `adb` 可执行文件
 - 融合窗口由自研 `fusion-viewer.exe` 实现（winit 窗口 + FFmpeg 解码 + 自研控制协议），
-  不依赖官方 scrcpy.exe；手机上仍不装任何 APK；
-  融合窗口与 Kulua session 通过 scid 隔离互不干扰
+  设备端由 `kulua-server.jar` 提供虚拟显示器，不依赖官方 scrcpy；手机上仍不装任何 APK；
+  融合窗口与 Kulua session 共用同一 server（scid 会话隔离）
 
 ## Status
 
@@ -247,8 +250,8 @@ kulua/
 - ✅ scid 会话隔离（session 重启/清理按 scid 精准 kill，不误杀融合窗口）
 - ✅ 应用列表（GUI 选择设备应用，server 一次性模式枚举 + 缓存）
 - ✅ 融合模式窗口（自研 fusion-viewer.exe：虚拟显示器 + FFmpeg 软解 + 输入注入，
-  可多开、独立关闭；不依赖官方 scrcpy.exe）
-- ⏳ 音频转发（实验性，支持 Opus 解码 + rodio 播放）
+  可多开、独立关闭；不依赖官方 scrcpy）
+- ✅ 音频转发（Opus / AAC / FLAC / RAW 解码 + rodio 播放，编码可热切换）
 
 ## License
 Apache 2.0

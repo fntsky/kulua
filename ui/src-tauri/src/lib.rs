@@ -283,7 +283,7 @@ fn settings_to_info(s: &response::Settings) -> SettingsInfo {
     }
 }
 
-/// 读取应用设置（含开机自启动状态 + scrcpy 编码参数）。
+/// 读取应用设置（含开机自启动状态 + 编码参数）。
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<SettingsInfo, String> {
     let resp = ipc_request(&state, "settings.get", None).await?;
@@ -306,7 +306,7 @@ async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<Sett
     }
 }
 
-/// 保存 scrcpy 编码参数（只更新提供的字段，其余保持原值）。
+/// 保存编码参数（只更新提供的字段，其余保持原值）；音频编码热切换不重启会话。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn set_scrcpy_params(
@@ -359,7 +359,7 @@ async fn get_apps(
     }
 }
 
-/// 在融合窗口（scrcpy --new-display -x）中打开指定应用，返回 window_id。
+/// 在融合窗口（自研 fusion-viewer 连接 kulua-server 的虚拟显示器）中打开指定应用，返回 window_id。
 #[tauri::command]
 async fn open_app(
     state: State<'_, AppState>,

@@ -51,7 +51,7 @@ function setTheme(mode: "dark" | "light") {
 const devices = ref<DeviceInfo[]>([]);
 // 当前页面：设备卡片 / ADB 连接 / 设置
 const view = ref<"devices" | "adb" | "settings">("devices");
-// 设置：开机自启动 + scrcpy 编码参数
+// 设置：开机自启动 + 编码参数
 interface SettingsState {
   autostartEnabled: boolean;
   autostartSupported: boolean;
@@ -80,7 +80,7 @@ const settings = ref<SettingsState>({
   audioBitRate: 128000,
   audioCodec: "opus",
 });
-// 设置页本地编辑中的 scrcpy 参数（Mbps / kbps 显示单位）
+// 设置页本地编辑中的编码参数（Mbps / kbps 显示单位）
 const scrcpyDraft = ref({
   videoBitRateMbps: 8,
   videoMaxSize: 0,
@@ -129,7 +129,7 @@ async function toggleAutostart() {
     settingsError.value = `设置自启动失败：${String(e)}`;
   }
 }
-// 保存 scrcpy 编码参数（0 值 = 不限制 / 用 scrcpy 默认）
+// 保存编码参数（0 值 = 不限制 / 用 server 默认）
 async function saveScrcpyParams() {
   const d = scrcpyDraft.value;
   const videoBitRate = Math.max(0, Math.round(d.videoBitRateMbps * 1_000_000));
@@ -148,7 +148,7 @@ async function saveScrcpyParams() {
     settingsError.value = "";
   } catch (e) {
     console.error("set_scrcpy_params failed:", e);
-    settingsError.value = `保存 scrcpy 参数失败：${String(e)}`;
+    settingsError.value = `保存编码参数失败：${String(e)}`;
   }
 }
 // adb 原始设备列表（含 Offline/Unauthorized）
@@ -161,7 +161,7 @@ const adbStateTextMap: Record<string, string> = {
 function adbStateText(s: string): string {
   return adbStateTextMap[s] || s.replace(/^Unknown\(|\)$/g, "");
 }
-// adb 列表的设备名：匹配合并列表（name 来自 scrcpy 协议）
+// adb 列表的设备名：匹配合并列表（name 来自 session getprop ro.product.model）
 function adbName(serial: string): string {
   return devices.value.find((x) => x.serial === serial)?.name || "";
 }
@@ -300,7 +300,7 @@ const hideSystemApps = ref(false);
 // 正在打开的应用包名（点击后 loading 防重复）
 const openingApp = ref<string | null>(null);
 const openFeedback = ref("");
-// daemon 是否找到 scrcpy.exe（false 时提示不可用）
+// daemon 是否找到 fusion-viewer.exe（false 时提示不可用）
 const fusionSupported = ref(true);
 // 融合窗口列表（app.windows-updated 事件，全设备）
 const fusionWindows = ref<AppWindowInfo[]>([]);
@@ -614,7 +614,7 @@ onMounted(async () => {
             </div>
           </div>
         </template>
-        <div class="section">scrcpy 编码</div>
+        <div class="section">编码设置</div>
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
         <template v-else>
           <div class="settings-card">
@@ -669,7 +669,7 @@ onMounted(async () => {
             </div>
             <div class="settings-save-row">
               <button class="save-btn" @click="saveScrcpyParams">保存</button>
-              <span class="settings-help-inline">0 表示不限制 / 使用 scrcpy 默认值；保存后自动重启所有设备会话</span>
+              <span class="settings-help-inline">0 表示不限制 / 使用 server 默认值；音频编码保存后立即生效（热切换，不重启会话）</span>
             </div>
           </div>
         </template>
@@ -730,7 +730,7 @@ onMounted(async () => {
           <span class="modal-close" @click="appPicker = null">✕</span>
         </div>
         <div v-if="!fusionSupported" class="modal-error">
-          未找到 scrcpy.exe：请将 scrcpy-win64 运行时放入 daemon 同目录后重启 daemon。
+          未找到 fusion-viewer.exe：请将其放入 daemon 同目录后重启 daemon。
         </div>
         <template v-else>
           <div class="modal-toolbar">
@@ -768,7 +768,7 @@ onMounted(async () => {
             </div>
           </div>
           <div v-if="openFeedback" class="modal-feedback">{{ openFeedback }}</div>
-          <div class="modal-help">点击应用后以 scrcpy 融合模式（独立窗口）打开，可同时打开多个</div>
+          <div class="modal-help">点击应用后以融合模式（独立窗口）打开，可同时打开多个</div>
         </template>
       </div>
     </div>

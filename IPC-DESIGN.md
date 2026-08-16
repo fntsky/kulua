@@ -17,8 +17,9 @@
 └─────────────┘                                └──────┬───────┘
                                                       │
                                               ┌───────┴───────┐
-                                              │  adb / scrcpy │
-                                              │  devices       │
+                                              │ adb / kulua-  │
+                                              │ server        │
+                                              │ devices       │
                                               └───────────────┘
 ```
 
@@ -187,7 +188,9 @@ Response { id: 9, result: PairingInfo { dns_id: "...", psk: "...", wifi_string: 
 ```
 
 ### settings.set_scrcpy_params
-保存 scrcpy 编码参数（全部 optional，只更新提供的字段）；保存后 daemon 自动重启所有设备会话。
+保存编码参数（全部 optional，只更新提供的字段）；音频编码保存后**热切换**（daemon
+更新 session 的 codec 并重连 audio 连接，会话不重启），视频参数变更对运行中会话
+在下次重建时生效。方法名沿用历史（`set_scrcpy_params`）。
 ```
 Request  { id: N, method: "settings.set_scrcpy_params", params: SetScrcpyParams { video_bit_rate: ..., video_max_size: ..., video_max_fps: ..., audio_bit_rate: ..., audio_codec: "opus|aac|flac|raw" } }
 Response { id: N, result: Settings { ... } }
@@ -195,17 +198,18 @@ Response { id: N, result: Settings { ... } }
 
 ### app.list
 枚举设备可启动应用（`app.open` 的候选列表）。daemon 侧先查 60s 缓存，miss 时通过
-`adb shell` 以 scrcpy server 一次性模式（`list_apps=true`）枚举（20s 超时）。
+`adb shell` 以 kulua-server 一次性模式（`list_apps=true`）枚举（20s 超时）。
 ```
 Request  { id: N, method: "app.list", params: AppListParams { uuid: "...", force: false } }
 Response { id: N, result: AppList { apps: [AppInfo, ...], fusion_supported: true } }
 ```
 - `force=true` 绕过缓存强制刷新。
-- `fusion_supported=false` 表示 daemon 未找到 `scrcpy.exe`，UI 应提示融合模式不可用。
+- `fusion_supported=false` 表示 daemon 未找到 `fusion-viewer.exe`，UI 应提示融合模式不可用。
 
 ### app.open
-为指定设备打开一个应用的融合窗口（`scrcpy --new-display -x --start-app=<pkg>`），
-返回窗口 id。daemon 侧校验：设备在线、包名合法、Android SDK ≥ 29（虚拟显示器要求 API 29+）。
+为指定设备打开一个应用的融合窗口（自研 `fusion-viewer.exe` 连接 session 已部署的
+kulua-server，video 连接携带显示器尺寸创建虚拟显示器，随后 START_APP），返回窗口 id。
+daemon 侧校验：设备在线、包名合法、Android SDK ≥ 29（虚拟显示器要求 API 29+）。
 ```
 Request  { id: N, method: "app.open", params: AppOpenParams { uuid: "...", package_name: "com.android.settings" } }
 Response { id: N, result: AppOpen { window_id: 7 } }
@@ -253,7 +257,7 @@ Event { data: Notification { serial: "...", title: "...", text: "...", app: "...
 Event { data: AppWindowsUpdated { windows: [AppWindowInfo, ...] } }
 ```
 融合窗口启动 / 退出 / 失败时推送全量列表（运行中的窗口 + 本 tick 退出的窗口，
-退出窗口带最终状态 `exited` / `failed`）。设备断开时窗口由 scrcpy 自行退出。
+退出窗口带最终状态 `exited` / `failed`）。设备断开时窗口由 viewer 检测连接断开自动退出。
 
 ## Connection Lifecycle
 
