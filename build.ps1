@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Release,
     # FFmpeg 运行时目录（含 avcodec-62.dll / avutil-60.dll / swresample-6.dll，融合窗口用）。
     # 默认依次查找：./vendor/scrcpy-win64、$env:SCRCPY_HOME。
@@ -50,19 +50,30 @@ if ($Release) {
         Write-Host "  WARNING: sync-ui.exe not found at $tauriExe" -ForegroundColor Red
     }
 
-    # ── scrcpy-server jar ──
+    # ── 自研 kulua-server jar（替代官方 scrcpy-server；未构建时自动构建） ──
     $jarFound = $false
-    $jarCandidates = @("scrcpy-server", "./scrcpy-server")
+    $jarCandidates = @("kulua-server/build/kulua-server.jar", "./kulua-server.jar", "kulua-server.jar")
     foreach ($j in $jarCandidates) {
         if (Test-Path $j) {
-            Copy-Item $j "$dist/"
-            Write-Host "  scrcpy-server bundled" -ForegroundColor Green
+            Copy-Item $j "$dist/kulua-server.jar"
+            Write-Host "  kulua-server.jar bundled ($j)" -ForegroundColor Green
             $jarFound = $true
             break
         }
     }
     if (-not $jarFound) {
-        Write-Host "  WARNING: scrcpy-server not found -- place it manually in $dist/" -ForegroundColor Yellow
+        Write-Host "  kulua-server.jar 未找到，尝试自动构建..." -ForegroundColor Yellow
+        if (Test-Path "./kulua-server/build.ps1") {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File "./kulua-server/build.ps1"
+            if (Test-Path "./kulua-server/build/kulua-server.jar") {
+                Copy-Item "./kulua-server/build/kulua-server.jar" "$dist/kulua-server.jar"
+                Write-Host "  kulua-server.jar 构建并打包" -ForegroundColor Green
+                $jarFound = $true
+            }
+        }
+    }
+    if (-not $jarFound) {
+        Write-Host "  WARNING: kulua-server.jar not found -- place it manually in $dist/" -ForegroundColor Yellow
     }
 
     # ── adb.exe + 依赖 DLL ──
@@ -141,7 +152,7 @@ if ($Release) {
     Write-Host "  daemon.exe  — 后台服务（双击运行即可）"
     Write-Host "  sync-ui.exe — 桌面 GUI（可选）"
     if ($adbFound) { Write-Host "  adb.exe     — 已捆绑（含 DLL），无需预装 ADB" }
-    if ($jarFound) { Write-Host "  scrcpy-server — scrcpy 服务端" }
+    if ($jarFound) { Write-Host "  kulua-server.jar — 自研设备端服务（剪贴板/多窗口视频/音频）" }
     if ($ffmpegFound) { Write-Host "  fusion-viewer.exe — 自研融合窗口客户端（+ FFmpeg DLL）" }
     Write-Host "`n使用方法：直接双击 daemon.exe 即可启动全部功能" -ForegroundColor Green
 } else {
