@@ -114,21 +114,44 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
             let keyframe = pts_flags & (1 << 61) != 0;
             let pts = (pts_flags & ((1 << 61) - 1)) as i64;
 
-            // 确保解码器已打开（无 extradata；SPS/PPS 由每个 IDR 帧自带）
+            if config {
+                // config 帧（MediaCodec csd）：转换为 Annex-B 后设为 extradata。
+                // 不能直接使用原始 csd（通常是 avcC 长度前缀格式，会迫使解码器
+                // 进入 length-prefixed 模式，与 Annex-B 媒体帧冲突导致错位）；
+                // 也不能丢弃——部分设备（如 vivo）的 IDR 帧不自带 SPS/PPS，
+                // 丢弃会 'non-existing PPS' 无法解码。
+                if !decoder.is_open() {
+                    let annexb = if crate::decoder::is_annexb(&payload) {
+                        payload
+                    } else {
+                        match crate::decoder::avcc_to_annexb(&payload) {
+                            Some(conv) => conv,
+                            None => {
+                                let _ = tx.send(VideoEvent::Error(
+                                    "config 帧既不是 Annex-B 也无法解析为 avcC".into(),
+                                ));
+                                return;
+                            }
+                        }
+                    };
+                    if let Err(e) = decoder.set_extradata(&annexb) {
+                        let _ = tx.send(VideoEvent::Error(format!("设置 extradata 失败: {}", e)));
+                        return;
+                    }
+                    if let Err(e) = decoder.open() {
+                        let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {}", e)));
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            // 确保解码器已打开（无 config 帧的异常流也能解码）
             if !decoder.is_open() {
                 if let Err(e) = decoder.open() {
                     let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {}", e)));
                     return;
                 }
-            }
-
-            if config {
-                // ★ 对照官方客户端（decoder.c）：config 帧直接丢弃，不设 extradata。
-                //   config 帧 payload 是 MediaCodec 的 csd（avcC 格式），设为 extradata
-                //   会迫使解码器进入 length-prefixed 模式，而媒体帧是 Annex-B（start
-                //   code），导致 'error while decoding MB' + 大规模 conceal 错位。
-                //   Android MediaCodec 编码器每个 IDR 帧自带 SPS/PPS，丢弃无碍。
-                continue;
             }
 
             match decoder.decode(&payload, Some(pts), keyframe) {

@@ -71,12 +71,38 @@ impl VideoDecoder {
         }
     }
 
+    /// 设置解码器 extradata（**必须为 Annex-B 格式**：start code + SPS/PPS）。
+    /// 必须在 `open` 之前调用。
+    ///
+    /// 注意：不能直接使用 MediaCodec 的 csd——它通常是 avcC 格式
+    /// （AVCDecoderConfigurationRecord，长度前缀式），会迫使解码器进入
+    /// length-prefixed 模式，与 Annex-B 媒体帧冲突。先用 [`avcc_to_annexb`] 转换。
+    pub fn set_extradata(&mut self, data: &[u8]) -> Result<(), String> {
+        if self.opened {
+            return Err("解码器已打开，不能设置 extradata".into());
+        }
+        unsafe {
+            if !(*self.codec_ctx).extradata.is_null() {
+                av_free((*self.codec_ctx).extradata as *mut _);
+            }
+            // 需要 AV_INPUT_BUFFER_PADDING_SIZE 填充（解码器可能越界读）
+            let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
+            let buf = av_malloc(data.len() + padding) as *mut u8;
+            if buf.is_null() {
+                return Err("av_malloc 失败".into());
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
+            std::ptr::write_bytes(buf.add(data.len()), 0, padding);
+            (*self.codec_ctx).extradata = buf;
+            (*self.codec_ctx).extradata_size = data.len() as i32;
+        }
+        Ok(())
+    }
+
     /// 打开解码器。
     ///
     /// 优先尝试 D3D11VA 硬件解码（把解码从 CPU 卸载到 GPU，缓解与音频解码的
     /// CPU 竞争）；GPU/驱动不支持时自动回退软解。
-    /// 注意：不设置 extradata——媒体帧是 Annex-B（每个 IDR 自带 SPS/PPS），
-    /// 与官方客户端一致（config 帧直接丢弃）。
     pub fn open(&mut self) -> Result<(), String> {
         if self.opened {
             return Ok(());
@@ -255,6 +281,59 @@ fn err_str(ret: i32) -> String {
     }
 }
 
+/// 判断 config 帧 payload 是否已是 Annex-B（start code）格式。
+pub fn is_annexb(data: &[u8]) -> bool {
+    data.len() >= 4 && data[..4] == [0x00, 0x00, 0x00, 0x01]
+}
+
+/// 将 MediaCodec 的 H264/H265 csd（avcC / hvcC 长度前缀格式）转换为 Annex-B。
+///
+/// avcC（AVCDecoderConfigurationRecord）布局：
+/// - byte 0: configurationVersion (1)
+/// - byte 1-3: profile/compat/level（H265 不同，但长度前缀部分相同）
+/// - byte 4: 低 2 位 lengthSizeMinusOne（我们不需要）
+/// - byte 5: 低 5 位 numOfSPS
+/// - numOfSPS × (u16 长度 + NAL 数据)
+/// - byte: numOfPPS
+/// - numOfPPS × (u16 长度 + NAL 数据)
+///
+/// 转换结果：`00 00 00 01 <SPS> 00 00 00 01 <PPS> ...`
+pub fn avcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 7 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut pos = 5;
+    let num_sps = (data[5] & 0x1F) as usize;
+    pos += 1;
+    for _ in 0..num_sps {
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    if pos >= data.len() {
+        return None;
+    }
+    let num_pps = data[pos] as usize;
+    pos += 1;
+    for _ in 0..num_pps {
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +389,42 @@ mod tests {
         let result = decoder.decode(&[0x00, 0x01, 0x02, 0x03], Some(0), false);
         // 垃圾数据不应 panic；可能是 Err 或 Ok(None)
         let _ = result;
+    }
+
+    #[test]
+    fn avcc_to_annexb_converts_sps_and_pps() {
+        // 构造最小 avcC：1 个 SPS（4 字节）+ 1 个 PPS（2 字节）
+        // 67 42 00 1E = SPS；68 CE 3C 80 = PPS
+        let avcc = [
+            0x01, 0x42, 0x00, 0x1E, // configurationVersion + profile/compat/level
+            0xFF, // lengthSizeMinusOne=3（低 2 位）
+            0xE1, // numOfSPS=1（低 5 位）
+            0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, // SPS: u16 长度 + NAL
+            0x01, // numOfPPS=1
+            0x00, 0x02, 0x68, 0xCE, // PPS: u16 长度 + NAL
+        ];
+        let annexb = avcc_to_annexb(&avcc).expect("应能转换");
+        assert_eq!(
+            annexb,
+            vec![
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, // start code + SPS
+                0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, // start code + PPS
+            ]
+        );
+    }
+
+    #[test]
+    fn avcc_to_annexb_rejects_truncated_data() {
+        assert!(avcc_to_annexb(&[0x01, 0x42]).is_none(), "过短应失败");
+        // SPS 长度越界
+        let bad = [0x01, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x10, 0x67];
+        assert!(avcc_to_annexb(&bad).is_none());
+    }
+
+    #[test]
+    fn is_annexb_detects_start_code() {
+        assert!(is_annexb(&[0x00, 0x00, 0x00, 0x01, 0x67]));
+        assert!(!is_annexb(&[0x01, 0x42, 0x00, 0x1E, 0xFF]));
+        assert!(!is_annexb(&[0x00, 0x00, 0x00]));
     }
 }
