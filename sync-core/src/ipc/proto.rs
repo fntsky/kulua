@@ -5,6 +5,8 @@
 
 use prost::Message;
 
+use crate::apps::AppInfo as CoreAppInfo;
+use crate::fusion::AppWindowInfo as CoreAppWindowInfo;
 use crate::ipc::types::SessionSummary as CoreSessionSummary;
 use crate::types::{Device as CoreDevice, DeviceIdentity as CoreDeviceIdentity};
 
@@ -20,7 +22,10 @@ pub struct Request {
     pub id: u64,
     #[prost(string, tag = "2")]
     pub method: String,
-    #[prost(oneof = "request::Payload", tags = "10, 11, 12, 13, 14, 15, 16")]
+    #[prost(
+        oneof = "request::Payload",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+    )]
     pub params: Option<request::Payload>,
 }
 
@@ -31,7 +36,7 @@ pub struct Request {
 pub struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "response::Payload", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "response::Payload", tags = "10, 11, 12, 13, 14, 15, 16")]
     pub result: Option<response::Payload>,
     #[prost(message, optional, tag = "3")]
     pub error: Option<RpcError>,
@@ -51,7 +56,7 @@ pub struct RpcError {
 /// 事件名由 oneof 的变体表达，不再需要字符串字段。
 #[derive(Clone, PartialEq, Message)]
 pub struct Event {
-    #[prost(oneof = "event::Payload", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "event::Payload", tags = "10, 11, 12, 13, 14, 15")]
     pub data: Option<event::Payload>,
 }
 
@@ -192,6 +197,56 @@ pub struct NotificationData {
     pub app: String,
 }
 
+/// 设备上的一个可启动应用（`app.list` 结果项）。
+#[derive(Clone, PartialEq, Message)]
+pub struct AppInfo {
+    #[prost(string, tag = "1")]
+    pub package_name: String,
+    #[prost(string, tag = "2")]
+    pub label: String,
+    /// true = 系统应用，false = 普通应用
+    #[prost(bool, tag = "3")]
+    pub system: bool,
+}
+
+impl From<&CoreAppInfo> for AppInfo {
+    fn from(app: &CoreAppInfo) -> Self {
+        Self {
+            package_name: app.package_name.clone(),
+            label: app.label.clone(),
+            system: app.system,
+        }
+    }
+}
+
+/// 融合窗口信息（`app.windows-updated` 事件项）。
+#[derive(Clone, PartialEq, Message)]
+pub struct AppWindowInfo {
+    #[prost(uint64, tag = "1")]
+    pub window_id: u64,
+    #[prost(string, tag = "2")]
+    pub serial: String,
+    #[prost(string, tag = "3")]
+    pub package_name: String,
+    #[prost(string, tag = "4")]
+    pub label: String,
+    /// running | exited | failed
+    #[prost(string, tag = "5")]
+    pub state: String,
+}
+
+impl From<&CoreAppWindowInfo> for AppWindowInfo {
+    fn from(window: &CoreAppWindowInfo) -> Self {
+        Self {
+            window_id: window.window_id,
+            serial: window.serial.clone(),
+            package_name: window.package_name.clone(),
+            label: window.label.clone(),
+            state: window.state.clone(),
+        }
+    }
+}
+
 // ── 请求参数 ──
 
 pub mod request {
@@ -257,6 +312,25 @@ pub mod request {
         pub audio_codec: Option<String>,
     }
 
+    /// `app.list` 参数。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct AppListParams {
+        #[prost(string, tag = "1")]
+        pub uuid: String,
+        /// true = 绕过缓存强制刷新
+        #[prost(bool, tag = "2")]
+        pub force: bool,
+    }
+
+    /// `app.open` 参数。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct AppOpenParams {
+        #[prost(string, tag = "1")]
+        pub uuid: String,
+        #[prost(string, tag = "2")]
+        pub package_name: String,
+    }
+
     /// 按方法区分的请求参数 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -281,6 +355,12 @@ pub mod request {
         /// `settings.set_scrcpy_params`
         #[prost(message, tag = "16")]
         SetScrcpyParams(SetScrcpyParams),
+        /// `app.list`
+        #[prost(message, tag = "17")]
+        AppListParams(AppListParams),
+        /// `app.open`
+        #[prost(message, tag = "18")]
+        AppOpenParams(AppOpenParams),
     }
 }
 
@@ -340,6 +420,23 @@ pub mod response {
         pub audio_codec: String,
     }
 
+    /// `app.list` 的结果。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct AppList {
+        #[prost(message, repeated, tag = "1")]
+        pub apps: Vec<super::AppInfo>,
+        /// daemon 是否找到 scrcpy.exe（false 时 UI 隐藏/禁用打开按钮）
+        #[prost(bool, tag = "2")]
+        pub fusion_supported: bool,
+    }
+
+    /// `app.open` 的结果。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct AppOpen {
+        #[prost(uint64, tag = "1")]
+        pub window_id: u64,
+    }
+
     /// 按方法区分的结果 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -358,6 +455,12 @@ pub mod response {
         /// `settings.get` / `settings.set_autostart`
         #[prost(message, tag = "14")]
         Settings(Settings),
+        /// `app.list`
+        #[prost(message, tag = "15")]
+        AppList(AppList),
+        /// `app.open`
+        #[prost(message, tag = "16")]
+        AppOpen(AppOpen),
     }
 }
 
@@ -382,7 +485,17 @@ pub mod event {
         /// `notification`
         #[prost(message, tag = "14")]
         Notification(super::NotificationData),
+        /// `app.windows-updated`：融合窗口启动 / 退出 / 失败
+        #[prost(message, tag = "15")]
+        AppWindowsUpdated(super::AppWindowsUpdated),
     }
+}
+
+/// `app.windows-updated` 事件载荷。
+#[derive(Clone, PartialEq, Message)]
+pub struct AppWindowsUpdated {
+    #[prost(message, repeated, tag = "1")]
+    pub windows: Vec<AppWindowInfo>,
 }
 
 #[cfg(test)]
@@ -485,5 +598,91 @@ mod tests {
         let bytes = req.encode_to_vec();
         let decoded = Request::decode(&bytes[..]).unwrap();
         assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn request_app_list_roundtrip() {
+        // 回归：Request.params oneof 必须声明 tag=17，app.list 才能编码/解码
+        let req = Request {
+            id: 11,
+            method: "app.list".into(),
+            params: Some(request::Payload::AppListParams(request::AppListParams {
+                uuid: "11111111-2222-3333-4444-555555555555".into(),
+                force: true,
+            })),
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = Request::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn request_app_open_roundtrip() {
+        // 回归：Request.params oneof 必须声明 tag=18，app.open 才能编码/解码
+        let req = Request {
+            id: 12,
+            method: "app.open".into(),
+            params: Some(request::Payload::AppOpenParams(request::AppOpenParams {
+                uuid: "11111111-2222-3333-4444-555555555555".into(),
+                package_name: "com.android.settings".into(),
+            })),
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = Request::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn response_app_list_roundtrip() {
+        // 回归：Response.result oneof 必须声明 tag=15，app.list 才能编码/解码
+        let resp = Response {
+            id: 13,
+            result: Some(response::Payload::AppList(response::AppList {
+                apps: vec![AppInfo {
+                    package_name: "com.android.settings".into(),
+                    label: "Settings".into(),
+                    system: true,
+                }],
+                fusion_supported: true,
+            })),
+            error: None,
+        };
+        let bytes = resp.encode_to_vec();
+        let decoded = Response::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn response_app_open_roundtrip() {
+        // 回归：Response.result oneof 必须声明 tag=16，app.open 才能编码/解码
+        let resp = Response {
+            id: 14,
+            result: Some(response::Payload::AppOpen(response::AppOpen {
+                window_id: 7,
+            })),
+            error: None,
+        };
+        let bytes = resp.encode_to_vec();
+        let decoded = Response::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn event_app_windows_updated_roundtrip() {
+        // 回归：Event.data oneof 必须声明 tag=15，app.windows-updated 才能编码/解码
+        let event = Event {
+            data: Some(event::Payload::AppWindowsUpdated(AppWindowsUpdated {
+                windows: vec![AppWindowInfo {
+                    window_id: 1,
+                    serial: "192.168.1.5:5555".into(),
+                    package_name: "com.android.settings".into(),
+                    label: "设置".into(),
+                    state: "running".into(),
+                }],
+            })),
+        };
+        let bytes = event.encode_to_vec();
+        let decoded = Event::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, event);
     }
 }

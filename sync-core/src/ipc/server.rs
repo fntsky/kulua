@@ -76,6 +76,7 @@ impl Drop for IpcServer {
 // ── 服务入口 ──
 
 /// 启动后台 accept 循环。
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     mut server: IpcServer,
     token: CancellationToken,
@@ -83,6 +84,7 @@ pub fn serve(
     device_watch: watch::Receiver<HashMap<String, Device>>,
     merged_watch: watch::Receiver<Vec<Device>>,
     session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
+    fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
     clip_tx: broadcast::Sender<String>,
     notif_tx: broadcast::Sender<NotifInfo>,
     pair_info: WirelessPairing,
@@ -101,11 +103,12 @@ pub fn serve(
                             let dw = device_watch.clone();
                             let mw = merged_watch.clone();
                             let sw = session_watch.clone();
+                            let fw = fusion_watch.clone();
                             let clip_sub = clip_tx.subscribe();
                             let notif_sub = notif_tx.subscribe();
                             let pi = pair_info.clone();
                             tokio::spawn(handle_ipc_connection(
-                                stream, cmd_tx, dw, mw, sw, clip_sub, notif_sub, pi,
+                                stream, cmd_tx, dw, mw, sw, fw, clip_sub, notif_sub, pi,
                             ));
                         }
                         Err(e) => {
@@ -128,6 +131,7 @@ async fn handle_ipc_connection(
     mut device_watch: watch::Receiver<HashMap<String, Device>>,
     mut merged_watch: watch::Receiver<Vec<Device>>,
     mut session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
+    mut fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
     mut clip_sub: broadcast::Receiver<String>,
     mut notif_sub: broadcast::Receiver<NotifInfo>,
     pair_info: WirelessPairing,
@@ -173,6 +177,23 @@ async fn handle_ipc_connection(
                 let sessions = session_watch.borrow().iter().map(proto::SessionSummary::from).collect();
                 let event = proto::Event {
                     data: Some(event::Payload::SessionUpdated(proto::SessionListData { sessions })),
+                };
+                let payload = event.encode_to_vec();
+                if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
+                    break;
+                }
+            }
+
+            _ = fusion_watch.changed() => {
+                let windows = fusion_watch
+                    .borrow()
+                    .iter()
+                    .map(proto::AppWindowInfo::from)
+                    .collect();
+                let event = proto::Event {
+                    data: Some(event::Payload::AppWindowsUpdated(proto::AppWindowsUpdated {
+                        windows,
+                    })),
                 };
                 let payload = event.encode_to_vec();
                 if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
@@ -419,6 +440,76 @@ async fn dispatch_request(
                 return make_error(req.id, ERROR_CODE, "core 正在关闭");
             }
             make_ok(req.id)
+        }
+
+        // ── 融合模式 ──
+        "app.list" => {
+            let Some(request::Payload::AppListParams(params)) = &req.params else {
+                return make_error(req.id, ERROR_CODE, "缺少 app.list 参数");
+            };
+            let uuid = match params.uuid.parse::<uuid::Uuid>() {
+                Ok(u) => u,
+                Err(_) => return make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(Command::ListApps {
+                    uuid,
+                    force: params.force,
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return make_error(req.id, ERROR_CODE, "core 正在关闭");
+            }
+            // 枚举最长 20s + 调度余量；等不到回复视为 core 异常
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                Ok(Ok(Ok(reply))) => make_result(
+                    req.id,
+                    response::Payload::AppList(response::AppList {
+                        apps: reply.apps.iter().map(proto::AppInfo::from).collect(),
+                        fusion_supported: reply.fusion_supported,
+                    }),
+                ),
+                Ok(Ok(Err(message))) => make_error(req.id, ERROR_CODE, &message),
+                Ok(Err(_)) => make_error(req.id, ERROR_CODE, "core 正在关闭"),
+                Err(_) => make_error(req.id, ERROR_CODE, "应用枚举超时"),
+            }
+        }
+
+        "app.open" => {
+            let Some(request::Payload::AppOpenParams(params)) = &req.params else {
+                return make_error(req.id, ERROR_CODE, "缺少 app.open 参数");
+            };
+            let uuid = match params.uuid.parse::<uuid::Uuid>() {
+                Ok(u) => u,
+                Err(_) => return make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
+            };
+            if params.package_name.is_empty() {
+                return make_error(req.id, ERROR_CODE, "缺少 package_name 参数");
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(Command::OpenApp {
+                    uuid,
+                    package_name: params.package_name.clone(),
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return make_error(req.id, ERROR_CODE, "core 正在关闭");
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+                Ok(Ok(Ok(window_id))) => make_result(
+                    req.id,
+                    response::Payload::AppOpen(response::AppOpen { window_id }),
+                ),
+                Ok(Ok(Err(message))) => make_error(req.id, ERROR_CODE, &message),
+                Ok(Err(_)) => make_error(req.id, ERROR_CODE, "core 正在关闭"),
+                Err(_) => make_error(req.id, ERROR_CODE, "打开应用超时"),
+            }
         }
 
         // ── 设置 ──
@@ -709,5 +800,203 @@ mod tests {
 
         let err = resp.error.expect("未知方法应报错");
         assert!(err.message.contains("未知方法"));
+    }
+
+    #[tokio::test]
+    async fn app_list_queues_command_and_returns_result() {
+        // app.list 需要同步结果：测试从命令通道取出命令并回填 oneshot 回复
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+        let uuid = "11111111-2222-3333-4444-555555555555";
+
+        let request = req(
+            6,
+            "app.list",
+            Some(request::Payload::AppListParams(request::AppListParams {
+                uuid: uuid.into(),
+                force: false,
+            })),
+        );
+        let resp_future =
+            dispatch_request(&request, &cmd_tx, &device_watch, &merged_watch, &pair_info);
+        tokio::pin!(resp_future);
+        // dispatch 内部会等待 oneshot 回复：并发驱动请求与命令通道，避免死锁
+        let resp = loop {
+            tokio::select! {
+                resp = &mut resp_future => break resp,
+                cmd = cmd_rx.recv() => {
+                    match cmd.expect("应收到 ListApps 命令") {
+                        Command::ListApps {
+                            uuid: parsed,
+                            force,
+                            reply,
+                        } => {
+                            assert_eq!(parsed.to_string(), uuid);
+                            assert!(!force, "未指定 force 时应为 false");
+                            reply
+                                .send(Ok(crate::app::AppListReply {
+                                    apps: vec![crate::apps::AppInfo {
+                                        package_name: "com.android.settings".into(),
+                                        label: "Settings".into(),
+                                        system: true,
+                                    }],
+                                    fusion_supported: true,
+                                }))
+                                .expect("reply 应送达");
+                        }
+                        other => panic!("expected Command::ListApps, got {:?}", other),
+                    }
+                }
+            }
+        };
+        match resp.result {
+            Some(response::Payload::AppList(list)) => {
+                assert!(list.fusion_supported);
+                assert_eq!(list.apps.len(), 1);
+                assert_eq!(list.apps[0].package_name, "com.android.settings");
+                assert!(list.apps[0].system);
+            }
+            other => panic!("expected typed AppList, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn app_list_propagates_core_error() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+        let uuid = "11111111-2222-3333-4444-555555555555";
+
+        let request = req(
+            7,
+            "app.list",
+            Some(request::Payload::AppListParams(request::AppListParams {
+                uuid: uuid.into(),
+                force: true,
+            })),
+        );
+        let resp_future =
+            dispatch_request(&request, &cmd_tx, &device_watch, &merged_watch, &pair_info);
+        tokio::pin!(resp_future);
+        let resp = loop {
+            tokio::select! {
+                resp = &mut resp_future => break resp,
+                cmd = cmd_rx.recv() => {
+                    match cmd.expect("应收到 ListApps 命令") {
+                        Command::ListApps { reply, .. } => {
+                            reply
+                                .send(Err("枚举应用失败: 超时".into()))
+                                .expect("reply 应送达");
+                        }
+                        other => panic!("expected Command::ListApps, got {:?}", other),
+                    }
+                }
+            }
+        };
+        let err = resp.error.expect("core 错误应透传");
+        assert!(err.message.contains("枚举应用失败"));
+    }
+
+    #[tokio::test]
+    async fn app_list_rejects_invalid_uuid() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+
+        let resp = dispatch_request(
+            &req(
+                8,
+                "app.list",
+                Some(request::Payload::AppListParams(request::AppListParams {
+                    uuid: "not-a-uuid".into(),
+                    force: false,
+                })),
+            ),
+            &cmd_tx,
+            &device_watch,
+            &merged_watch,
+            &pair_info,
+        )
+        .await;
+
+        let err = resp.error.expect("非法 uuid 应报错");
+        assert!(err.message.contains("uuid"));
+    }
+
+    #[tokio::test]
+    async fn app_open_queues_command_and_returns_window_id() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+        let uuid = "11111111-2222-3333-4444-555555555555";
+
+        let request = req(
+            9,
+            "app.open",
+            Some(request::Payload::AppOpenParams(request::AppOpenParams {
+                uuid: uuid.into(),
+                package_name: "com.android.settings".into(),
+            })),
+        );
+        let resp_future =
+            dispatch_request(&request, &cmd_tx, &device_watch, &merged_watch, &pair_info);
+        tokio::pin!(resp_future);
+        let resp = loop {
+            tokio::select! {
+                resp = &mut resp_future => break resp,
+                cmd = cmd_rx.recv() => {
+                    match cmd.expect("应收到 OpenApp 命令") {
+                        Command::OpenApp {
+                            uuid: parsed,
+                            package_name,
+                            reply,
+                        } => {
+                            assert_eq!(parsed.to_string(), uuid);
+                            assert_eq!(package_name, "com.android.settings");
+                            reply.send(Ok(42)).expect("reply 应送达");
+                        }
+                        other => panic!("expected Command::OpenApp, got {:?}", other),
+                    }
+                }
+            }
+        };
+        match resp.result {
+            Some(response::Payload::AppOpen(open)) => {
+                assert_eq!(open.window_id, 42);
+            }
+            other => panic!("expected typed AppOpen, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn app_open_rejects_missing_package() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let (_dev_tx, device_watch) = watch::channel(HashMap::new());
+        let (_m_tx, merged_watch) = watch::channel(Vec::<Device>::new());
+        let pair_info = WirelessPairing::new();
+
+        let resp = dispatch_request(
+            &req(
+                10,
+                "app.open",
+                Some(request::Payload::AppOpenParams(request::AppOpenParams {
+                    uuid: "11111111-2222-3333-4444-555555555555".into(),
+                    package_name: String::new(),
+                })),
+            ),
+            &cmd_tx,
+            &device_watch,
+            &merged_watch,
+            &pair_info,
+        )
+        .await;
+
+        let err = resp.error.expect("空包名应报错");
+        assert!(err.message.contains("package_name"));
     }
 }

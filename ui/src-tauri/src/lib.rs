@@ -94,6 +94,36 @@ struct NotificationInfo {
     app: String,
 }
 
+/// 设备上的一个可启动应用（`app.list` 结果项）。
+#[derive(Clone, serde::Serialize)]
+struct AppInfo {
+    package_name: String,
+    label: String,
+    system: bool,
+}
+
+/// 融合窗口信息（`app.windows-updated` 事件项）。
+#[derive(Clone, serde::Serialize)]
+struct AppWindowInfo {
+    window_id: u64,
+    serial: String,
+    package_name: String,
+    label: String,
+    state: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AppWindowsInfo {
+    windows: Vec<AppWindowInfo>,
+}
+
+/// `app.list` 的完整结果：应用列表 + 融合模式是否可用。
+#[derive(Clone, serde::Serialize)]
+struct AppListInfo {
+    apps: Vec<AppInfo>,
+    fusion_supported: bool,
+}
+
 // ── 转换辅助 ──
 
 fn device_to_info(device: &proto::Device) -> DeviceInfo {
@@ -302,6 +332,49 @@ async fn set_scrcpy_params(
     }
 }
 
+/// 枚举设备可启动应用（`app.list`；带 60s 缓存，force=true 强制刷新）。
+#[tauri::command]
+async fn get_apps(
+    state: State<'_, AppState>,
+    uuid: String,
+    force: bool,
+) -> Result<AppListInfo, String> {
+    let params = request::Payload::AppListParams(request::AppListParams { uuid, force });
+    let resp = ipc_request(&state, "app.list", Some(params)).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::AppList(list)) => Ok(AppListInfo {
+            apps: list
+                .apps
+                .iter()
+                .map(|a| AppInfo {
+                    package_name: a.package_name.clone(),
+                    label: a.label.clone(),
+                    system: a.system,
+                })
+                .collect(),
+            fusion_supported: list.fusion_supported,
+        }),
+        _ => Err("daemon 返回了意外的 app.list 结果".into()),
+    }
+}
+
+/// 在融合窗口（scrcpy --new-display -x）中打开指定应用，返回 window_id。
+#[tauri::command]
+async fn open_app(
+    state: State<'_, AppState>,
+    uuid: String,
+    package_name: String,
+) -> Result<u64, String> {
+    let params = request::Payload::AppOpenParams(request::AppOpenParams { uuid, package_name });
+    let resp = ipc_request(&state, "app.open", Some(params)).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::AppOpen(open)) => Ok(open.window_id),
+        _ => Err("daemon 返回了意外的 app.open 结果".into()),
+    }
+}
+
 // ── IPC Client ──
 
 async fn connect_daemon(app: AppHandle) {
@@ -412,6 +485,22 @@ async fn connect_daemon(app: AppHandle) {
                                     };
                                     let _ = app.emit("notification-received", &payload);
                                 }
+                                Some(event::Payload::AppWindowsUpdated(data)) => {
+                                    let payload = AppWindowsInfo {
+                                        windows: data
+                                            .windows
+                                            .iter()
+                                            .map(|w| AppWindowInfo {
+                                                window_id: w.window_id,
+                                                serial: w.serial.clone(),
+                                                package_name: w.package_name.clone(),
+                                                label: w.label.clone(),
+                                                state: w.state.clone(),
+                                            })
+                                            .collect(),
+                                    };
+                                    let _ = app.emit("app-windows-updated", &payload);
+                                }
                                 None => {}
                             }
                         }
@@ -513,6 +602,8 @@ pub fn run() {
             get_settings,
             set_autostart,
             set_scrcpy_params,
+            get_apps,
+            open_app,
         ])
         .setup(|app| {
             let h = app.handle().clone();

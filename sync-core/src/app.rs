@@ -31,6 +31,25 @@ pub enum Command {
         audio_sync: bool,
         volume: u16,
     },
+    /// 枚举设备应用（app.list）：先查缓存，miss 时阻塞枚举；reply 回传结果
+    ListApps {
+        uuid: Uuid,
+        force: bool,
+        reply: oneshot::Sender<Result<AppListReply, String>>,
+    },
+    /// 打开应用的融合窗口（app.open）；reply 回传 window_id
+    OpenApp {
+        uuid: Uuid,
+        package_name: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+}
+
+/// `app.list` 的完整回复：应用列表 + 融合模式是否可用。
+#[derive(Debug)]
+pub struct AppListReply {
+    pub apps: Vec<crate::apps::AppInfo>,
+    pub fusion_supported: bool,
 }
 
 /// 设备条目，合并设备信息、可选的 session 及其配置。
@@ -101,6 +120,15 @@ pub struct Core {
     merged_tx: watch::Sender<Vec<Device>>,
     merged_watch: watch::Receiver<Vec<Device>>,
 
+    // ── 融合窗口 ──
+    /// 融合窗口管理器（scrcpy.exe 进程生命周期）
+    fusion: crate::fusion::FusionManager,
+    /// 应用列表缓存（按设备 UUID，TTL 60s）
+    app_cache: crate::apps::AppCache,
+    /// 融合窗口列表 watch（IPC app.windows-updated 事件用）
+    fusion_tx: watch::Sender<Vec<crate::fusion::AppWindowInfo>>,
+    fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
+
     // ── 剪贴板防回环 ──
     clipboard_last_seen: Option<String>,
     last_received_from_phone: Option<String>,
@@ -149,6 +177,7 @@ impl Core {
         let (device_name_tx, device_name_rx) = mpsc::channel::<(String, String)>(32);
 
         let (session_tx, session_watch) = watch::channel(Vec::new());
+        let (fusion_tx, fusion_watch) = watch::channel(Vec::new());
 
         Self {
             adb_cmd: Arc::new(AdbCmd::new()),
@@ -179,6 +208,10 @@ impl Core {
             last_clipboard_error_print: Instant::now(),
             session_tx,
             session_watch,
+            fusion: crate::fusion::FusionManager::new(),
+            app_cache: crate::apps::AppCache::new(),
+            fusion_tx,
+            fusion_watch,
         }
     }
 
@@ -203,6 +236,7 @@ impl Core {
                 self.device_watch.clone(),
                 self.merged_watch.clone(),
                 self.session_watch.clone(),
+                self.fusion_watch.clone(),
                 self.clip_broadcast.clone(),
                 self.notif_broadcast.clone(),
                 self.pair_info.clone(),
@@ -229,6 +263,15 @@ impl Core {
                 }
                 _ = tick.tick() => {
                     self.poll_system_clipboard();
+                    // 回收已退出的融合窗口，并把“退出/失败”状态一次性推给 UI
+                    let exited = self.fusion.tick();
+                    if !exited.is_empty() {
+                        let mut windows = self.fusion.windows_info();
+                        windows.extend(exited);
+                        let _ = self.fusion_tx.send(windows);
+                    } else {
+                        self.push_fusion_windows();
+                    }
                     let from_track = self.device_watch.borrow_and_update().clone();
                     // 原始列表含 Offline/Unauthorized 等，仅 Device 状态进入设备合并（卡片语义不变）
                     let online: HashMap<String, Device> = from_track
@@ -575,7 +618,105 @@ impl Core {
                     self.start_session(device).await;
                 }
             }
+            Command::ListApps { uuid, force, reply } => {
+                let result = self.handle_list_apps(uuid, force).await;
+                let _ = reply.send(result);
+            }
+            Command::OpenApp {
+                uuid,
+                package_name,
+                reply,
+            } => {
+                let result = self.handle_open_app(uuid, package_name).await;
+                let _ = reply.send(result);
+            }
         }
+    }
+
+    /// `app.list` 处理：校验设备在线 → 缓存命中直接返回 → miss 时阻塞枚举（20s 超时）。
+    async fn handle_list_apps(&mut self, uuid: Uuid, force: bool) -> Result<AppListReply, String> {
+        // 仅 Device 状态可枚举（离线/未授权设备 adb 命令会失败）
+        let device = self
+            .devices
+            .get(&uuid)
+            .map(|e| e.device.clone())
+            .filter(|d| d.state == DeviceState::Device)
+            .ok_or_else(|| "设备不在线".to_string())?;
+        let fusion_supported = self.fusion.is_supported();
+
+        if !force && let Some(apps) = self.app_cache.get(uuid) {
+            return Ok(AppListReply {
+                apps: apps.to_vec(),
+                fusion_supported,
+            });
+        }
+
+        // 枚举是阻塞 adb 调用，放 spawn_blocking 隔离，避免卡住 Core 主循环
+        let adb = self.adb_cmd.clone();
+        let jar_path = self.jar_path.clone();
+        let device = device.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::apps::list_apps(adb, &device, &jar_path, crate::apps::LIST_APPS_TIMEOUT)
+        })
+        .await
+        .map_err(|e| format!("应用枚举任务异常: {}", e))?;
+
+        match result {
+            Ok(apps) => {
+                self.app_cache.put(uuid, apps.clone());
+                Ok(AppListReply {
+                    apps,
+                    fusion_supported,
+                })
+            }
+            Err(e) => Err(format!("枚举应用失败: {}", e)),
+        }
+    }
+
+    /// `app.open` 处理：校验设备/包名/Android 版本（虚拟显示器要求 SDK ≥ 29），
+    /// 然后拉起 scrcpy.exe 融合窗口。
+    async fn handle_open_app(&mut self, uuid: Uuid, package_name: String) -> Result<u64, String> {
+        let device = self
+            .devices
+            .get(&uuid)
+            .map(|e| e.device.clone())
+            .filter(|d| d.state == DeviceState::Device)
+            .ok_or_else(|| "设备不在线".to_string())?;
+        if !crate::apps::is_valid_package_name(&package_name) {
+            return Err(format!("非法包名: {}", package_name));
+        }
+
+        // 虚拟显示器是 Android 10+（API 29）能力，先校验再拉起，避免窗口秒退
+        let sdk = self
+            .adb_cmd
+            .run(&[
+                "-s",
+                &device.serial,
+                "shell",
+                "getprop",
+                "ro.build.version.sdk",
+            ])
+            .map_err(|e| format!("读取系统版本失败: {}", e))?;
+        let sdk_str = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+        let sdk_num: i32 = sdk_str
+            .parse()
+            .map_err(|_| format!("无法解析系统版本: {}", sdk_str))?;
+        if sdk_num < 29 {
+            return Err(format!(
+                "设备 Android 版本过低（SDK {}），融合模式需要 Android 10（API 29）及以上",
+                sdk_num
+            ));
+        }
+
+        // 应用名优先取自缓存（枚举过才有），否则退回包名
+        let label = self
+            .app_cache
+            .get(uuid)
+            .and_then(|apps| apps.iter().find(|a| a.package_name == package_name))
+            .map(|a| a.label.clone())
+            .unwrap_or_default();
+        self.fusion
+            .open_window(device.serial.clone(), package_name, label)
     }
 
     fn on_notification(&mut self, notif: NotifInfo) {
@@ -676,6 +817,8 @@ impl Core {
             };
             println!("Stopped session for {}", serial);
             handle.stop(self.adb_cmd.as_ref()).await;
+            // 设备已断连：应用列表缓存失效，避免重连后返回陈旧结果
+            self.app_cache.invalidate(uuid);
         }
     }
 
@@ -718,6 +861,14 @@ impl Core {
             .collect();
         if *self.session_watch.borrow() != sessions {
             let _ = self.session_tx.send(sessions);
+        }
+    }
+
+    /// 推送融合窗口快照到 `fusion_tx`（IPC app.windows-updated 事件用）。
+    fn push_fusion_windows(&self) {
+        let windows = self.fusion.windows_info();
+        if *self.fusion_watch.borrow() != windows {
+            let _ = self.fusion_tx.send(windows);
         }
     }
 
@@ -818,6 +969,8 @@ impl Core {
                 handle.stop(self.adb_cmd.as_ref()).await;
             }
         }
+        // daemon 退出：优雅关闭所有融合窗口（taskkill WM_CLOSE → 超时强杀）
+        self.fusion.shutdown();
     }
 
     /// 推送合并后设备列表（IPC device.list / device.updated 事件用）
@@ -923,6 +1076,10 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
+            fusion: crate::fusion::FusionManager::new(),
+            app_cache: crate::apps::AppCache::new(),
+            fusion_tx: watch::channel(Vec::new()).0,
+            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };
@@ -990,6 +1147,10 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
+            fusion: crate::fusion::FusionManager::new(),
+            app_cache: crate::apps::AppCache::new(),
+            fusion_tx: watch::channel(Vec::new()).0,
+            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };
@@ -1121,6 +1282,10 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
+            fusion: crate::fusion::FusionManager::new(),
+            app_cache: crate::apps::AppCache::new(),
+            fusion_tx: watch::channel(Vec::new()).0,
+            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };

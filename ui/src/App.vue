@@ -22,6 +22,20 @@ interface DeviceConfig {
   audioSync: boolean;
   volume: number;
 }
+// 设备上的一个可启动应用（app.list 结果项）
+interface AppInfo {
+  package_name: string;
+  label: string;
+  system: boolean;
+}
+// 融合窗口信息（app.windows-updated 事件项）
+interface AppWindowInfo {
+  window_id: number;
+  serial: string;
+  package_name: string;
+  label: string;
+  state: string;
+}
 const connected = ref(false);
 const theme = ref(localStorage.getItem("theme") || "dark");
 watch(theme, (v) => {
@@ -275,6 +289,89 @@ async function startAdbSession(serial: string, state: string) {
 }
 // 会话总数（含 failed 墓碑），tab 徽标用
 const sessionCount = computed(() => Object.keys(sessionStates.value).length);
+// ── 应用选择器（融合模式）──
+// 当前打开选择器的设备（null = 关闭）
+const appPicker = ref<{ uuid: string; name: string } | null>(null);
+const apps = ref<AppInfo[]>([]);
+const appsLoading = ref(false);
+const appsError = ref("");
+const appsSearch = ref("");
+const hideSystemApps = ref(false);
+// 正在打开的应用包名（点击后 loading 防重复）
+const openingApp = ref<string | null>(null);
+const openFeedback = ref("");
+// daemon 是否找到 scrcpy.exe（false 时提示不可用）
+const fusionSupported = ref(true);
+// 融合窗口列表（app.windows-updated 事件，全设备）
+const fusionWindows = ref<AppWindowInfo[]>([]);
+
+function fusionWindowsOf(serial: string): AppWindowInfo[] {
+  return fusionWindows.value.filter((w) => w.serial === serial);
+}
+
+async function loadApps(force: boolean) {
+  if (!appPicker.value) return;
+  appsLoading.value = true;
+  appsError.value = "";
+  openFeedback.value = "";
+  try {
+    const r = await invoke<{ apps: AppInfo[]; fusion_supported: boolean }>("get_apps", {
+      uuid: appPicker.value.uuid,
+      force,
+    });
+    apps.value = r.apps;
+    fusionSupported.value = r.fusion_supported;
+  } catch (e) {
+    console.error("get_apps failed:", e);
+    appsError.value = String(e);
+    apps.value = [];
+  } finally {
+    appsLoading.value = false;
+  }
+}
+
+function openAppPicker(uuid: string, name: string) {
+  appPicker.value = { uuid, name };
+  apps.value = [];
+  appsError.value = "";
+  openFeedback.value = "";
+  appsSearch.value = "";
+  hideSystemApps.value = false;
+  loadApps(false);
+}
+
+async function openApp(app: AppInfo) {
+  if (!appPicker.value || openingApp.value) return;
+  openingApp.value = app.package_name;
+  openFeedback.value = "";
+  try {
+    await invoke<number>("open_app", {
+      uuid: appPicker.value.uuid,
+      packageName: app.package_name,
+    });
+    openFeedback.value = `正在打开 ${app.label || app.package_name}…`;
+  } catch (e) {
+    console.error("open_app failed:", e);
+    openFeedback.value = `打开失败：${String(e)}`;
+  } finally {
+    openingApp.value = null;
+  }
+}
+
+// 搜索 + 隐藏系统应用过滤
+const filteredApps = computed(() => {
+  let list = apps.value;
+  if (hideSystemApps.value) {
+    list = list.filter((a) => !a.system);
+  }
+  const q = appsSearch.value.trim().toLowerCase();
+  if (q) {
+    list = list.filter(
+      (a) => a.label.toLowerCase().includes(q) || a.package_name.toLowerCase().includes(q)
+    );
+  }
+  return list;
+});
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
   connected.value = conn;
   devices.value = devs;
@@ -335,6 +432,9 @@ onMounted(async () => {
   });
   listen<PairingInfo>("pairing-info-updated", (e) => {
     renderQR(e.payload);
+  });
+  listen<{ windows: AppWindowInfo[] }>("app-windows-updated", (e) => {
+    fusionWindows.value = e.payload.windows;
   });
   listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; volume: number; session_state: string; audio_buffer_ms: number }> }>("sessions-updated", (e) => {
     // 全量推送：同步重建状态表（列表外的 uuid 状态清除）
@@ -437,6 +537,15 @@ onMounted(async () => {
           </div>
           <div v-if="sessionStates[d.uuid] === 'failed'" class="retry-row">
             <button class="retry-btn" @click="retrySession(d.uuid)">重试</button>
+          </div>
+          <!-- 融合模式：session 运行中才能打开应用窗口 -->
+          <div v-if="sessionStates[d.uuid] === 'running'" class="fusion-row">
+            <button class="apps-btn" @click="openAppPicker(d.uuid, d.name || d.serial)">
+              应用
+            </button>
+            <span v-if="fusionWindowsOf(d.serial).length > 0" class="fusion-count">
+              {{ fusionWindowsOf(d.serial).length }} 个窗口
+            </span>
           </div>
         </div>
       </div>
@@ -612,6 +721,57 @@ onMounted(async () => {
         <span class="dot" :class="{ on: connected, off: !connected }" />
       </div>
     </div>
+
+    <!-- 应用选择器（融合模式弹层） -->
+    <div v-if="appPicker" class="modal-overlay" @click.self="appPicker = null">
+      <div class="modal">
+        <div class="modal-header">
+          <span class="modal-title">打开应用 — {{ appPicker.name }}</span>
+          <span class="modal-close" @click="appPicker = null">✕</span>
+        </div>
+        <div v-if="!fusionSupported" class="modal-error">
+          未找到 scrcpy.exe：请将 scrcpy-win64 运行时放入 daemon 同目录后重启 daemon。
+        </div>
+        <template v-else>
+          <div class="modal-toolbar">
+            <input
+              class="modal-search"
+              v-model="appsSearch"
+              placeholder="搜索应用名 / 包名"
+            />
+            <label class="modal-hide">
+              <input type="checkbox" v-model="hideSystemApps" /> 隐藏系统应用
+            </label>
+            <button class="modal-refresh" :disabled="appsLoading" @click="loadApps(true)">
+              刷新
+            </button>
+          </div>
+          <div v-if="appsLoading" class="modal-hint">正在枚举设备应用…</div>
+          <div v-else-if="appsError" class="modal-error">{{ appsError }}</div>
+          <div v-else-if="filteredApps.length === 0" class="modal-hint">没有匹配的应用</div>
+          <div v-else class="modal-list">
+            <div
+              v-for="a in filteredApps"
+              :key="a.package_name"
+              class="modal-app"
+              :class="{ system: a.system, disabled: openingApp !== null }"
+              @click="openApp(a)"
+            >
+              <div class="modal-app-name">
+                {{ a.label || a.package_name }}
+                <span v-if="openingApp === a.package_name" class="modal-opening">打开中…</span>
+              </div>
+              <div class="modal-app-pkg">
+                {{ a.package_name }}
+                <span v-if="a.system" class="modal-badge">系统</span>
+              </div>
+            </div>
+          </div>
+          <div v-if="openFeedback" class="modal-feedback">{{ openFeedback }}</div>
+          <div class="modal-help">点击应用后以 scrcpy 融合模式（独立窗口）打开，可同时打开多个</div>
+        </template>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -768,6 +928,89 @@ body {
   padding: 4px 14px; font-size: 12px; cursor: pointer;
 }
 .retry-btn:hover { opacity: 0.85; }
+/* 融合模式：应用按钮 + 窗口计数 */
+.fusion-row {
+  display: flex; align-items: center; gap: 8px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+.apps-btn {
+  background: var(--green); color: #fff;
+  border: none; border-radius: 4px;
+  padding: 4px 16px; font-size: 12px; cursor: pointer;
+}
+.apps-btn:hover { opacity: 0.85; }
+.fusion-count { font-size: 11px; color: var(--dim); }
+/* 应用选择器弹层 */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+}
+.modal {
+  width: 420px; max-width: 90vw; max-height: 80vh;
+  background: var(--card); border-radius: 12px;
+  padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--border);
+}
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.modal-close {
+  cursor: pointer; color: var(--dim); font-size: 14px; padding: 2px 6px;
+}
+.modal-close:hover { color: var(--text); }
+.modal-toolbar {
+  display: flex; align-items: center; gap: 8px;
+}
+.modal-search {
+  flex: 1; padding: 5px 8px; font-size: 12px;
+  color: var(--text); background: var(--toggle-bg);
+  border: 1px solid var(--border); border-radius: 6px; outline: none;
+}
+.modal-search:focus { border-color: var(--green); }
+.modal-hide {
+  font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 4px;
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+.modal-refresh {
+  background: var(--toggle-bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.modal-refresh:hover { border-color: var(--green); }
+.modal-refresh:disabled { opacity: 0.5; cursor: default; }
+.modal-hint { color: var(--dim); font-size: 13px; text-align: center; padding: 24px 0; }
+.modal-error {
+  color: var(--red); font-size: 12px; padding: 8px 12px;
+  background: var(--error-bg); border-radius: 8px;
+}
+.modal-list {
+  overflow-y: auto; max-height: 45vh;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.modal-app {
+  padding: 8px 10px; border-radius: 8px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.modal-app:hover { background: var(--toggle-bg); }
+.modal-app.disabled { opacity: 0.6; cursor: default; }
+.modal-app-name {
+  font-size: 13px; font-weight: 500; color: var(--text);
+  display: flex; align-items: center; gap: 6px;
+}
+.modal-app-pkg { font-size: 11px; color: var(--dim); font-family: "Cascadia Code", monospace; }
+.modal-badge {
+  font-size: 10px; color: var(--dim); padding: 1px 6px;
+  border-radius: 8px; background: var(--toggle-bg); font-family: inherit;
+}
+.modal-opening { font-size: 11px; color: var(--green); }
+.modal-feedback {
+  font-size: 12px; color: var(--text); text-align: center;
+  padding: 6px; border-radius: 6px; background: var(--toggle-bg);
+}
+.modal-help { font-size: 11px; color: var(--dim); text-align: center; }
 .device-toggles {
   display: flex; align-items: center; gap: 16px; padding-top: 4px;
   border-top: 1px solid var(--border);

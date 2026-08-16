@@ -59,6 +59,10 @@ message Request {
     SessionUpdate session_update    = 12; // session.update
     UuidParam session_retry         = 13; // session.retry
     DeviceSerial session_start      = 14; // session.start
+    SetAutostart set_autostart      = 15; // settings.set_autostart
+    SetScrcpyParams set_scrcpy_params = 16; // settings.set_scrcpy_params
+    AppListParams app_list          = 17; // app.list
+    AppOpenParams app_open          = 18; // app.open
   }
 }
 
@@ -70,6 +74,9 @@ message Response {
     DeviceList adb_list      = 11; // device.adb_list
     ClipboardGet clipboard_get = 12; // clipboard.get
     PairingInfo pairing_info = 13; // pairing.info
+    Settings settings        = 14; // settings.*
+    AppList app_list         = 15; // app.list
+    AppOpen app_open         = 16; // app.open
   }
 
   RpcError error = 3;
@@ -82,6 +89,7 @@ message Event {
     SessionListData session_updated  = 12;
     ClipboardData clipboard_changed  = 13;
     NotificationData notification    = 14;
+    AppWindowsUpdated app_windows_updated = 15;
   }
 }
 ```
@@ -96,6 +104,13 @@ message Event {
 - `SessionListData { repeated SessionSummary sessions = 1; }`
 - `ClipboardData { string text = 1; string serial = 2; }`
 - `NotificationData { string serial = 1; string title = 2; string text = 3; string app = 4; }`
+- `AppListParams { string uuid = 1; bool force = 2; }`
+- `AppOpenParams { string uuid = 1; string package_name = 2; }`
+- `AppInfo { string package_name = 1; string label = 2; bool system = 3; }`
+- `AppList { repeated AppInfo apps = 1; bool fusion_supported = 2; }`
+- `AppOpen { uint64 window_id = 1; }`
+- `AppWindowsUpdated { repeated AppWindowInfo windows = 1; }`
+- `AppWindowInfo { uint64 window_id = 1; string serial = 2; string package_name = 3; string label = 4; string state = 5; }`（state: `running` / `exited` / `failed`）
 
 `Device` / `DeviceIdentity` / `SessionSummary` 字段与 `sync-core` 内部类型一一对应；
 `Device.state` 在线路上保留为调试文本（`Device` / `Offline` / `Unauthorized` / `Unknown(...)`），
@@ -171,8 +186,30 @@ Request  { id: 9, method: "pairing.info" }
 Response { id: 9, result: PairingInfo { dns_id: "...", psk: "...", wifi_string: "..." } }
 ```
 
-### clipboard.set *(未来)*
-预留方法，当前未实现。
+### settings.set_scrcpy_params
+保存 scrcpy 编码参数（全部 optional，只更新提供的字段）；保存后 daemon 自动重启所有设备会话。
+```
+Request  { id: N, method: "settings.set_scrcpy_params", params: SetScrcpyParams { video_bit_rate: ..., video_max_size: ..., video_max_fps: ..., audio_bit_rate: ..., audio_codec: "opus|aac|flac|raw" } }
+Response { id: N, result: Settings { ... } }
+```
+
+### app.list
+枚举设备可启动应用（`app.open` 的候选列表）。daemon 侧先查 60s 缓存，miss 时通过
+`adb shell` 以 scrcpy server 一次性模式（`list_apps=true`）枚举（20s 超时）。
+```
+Request  { id: N, method: "app.list", params: AppListParams { uuid: "...", force: false } }
+Response { id: N, result: AppList { apps: [AppInfo, ...], fusion_supported: true } }
+```
+- `force=true` 绕过缓存强制刷新。
+- `fusion_supported=false` 表示 daemon 未找到 `scrcpy.exe`，UI 应提示融合模式不可用。
+
+### app.open
+为指定设备打开一个应用的融合窗口（`scrcpy --new-display -x --start-app=<pkg>`），
+返回窗口 id。daemon 侧校验：设备在线、包名合法、Android SDK ≥ 29（虚拟显示器要求 API 29+）。
+```
+Request  { id: N, method: "app.open", params: AppOpenParams { uuid: "...", package_name: "com.android.settings" } }
+Response { id: N, result: AppOpen { window_id: 7 } }
+```
 
 ### Error format
 ```
@@ -210,6 +247,13 @@ Event { data: ClipboardChanged { text: "...", serial: "..." } }
 Event { data: Notification { serial: "...", title: "...", text: "...", app: "..." } }
 ```
 手机新通知到达时推送。
+
+### app.windows-updated
+```
+Event { data: AppWindowsUpdated { windows: [AppWindowInfo, ...] } }
+```
+融合窗口启动 / 退出 / 失败时推送全量列表（运行中的窗口 + 本 tick 退出的窗口，
+退出窗口带最终状态 `exited` / `failed`）。设备断开时窗口由 scrcpy 自行退出。
 
 ## Connection Lifecycle
 
@@ -252,6 +296,7 @@ crate::ipc::server::serve(
     device_watch,
     merged_watch,
     session_watch,
+    fusion_watch,   // 融合窗口列表 watch（app.windows-updated 事件）
     clip_broadcast,
     notif_broadcast,
     pair_info,
@@ -263,9 +308,13 @@ crate::ipc::server::serve(
 1. `Framed<TcpStream, FrameCodec>` 将 stream 拆为 frame。
 2. `tokio::select!` 多个分支：
    - 读 Request 帧 → `dispatch_request` → 写 Response 帧。
-   - `merged_watch` / `device_watch` / `session_watch` 变化 → 编码对应 Event 帧。
+   - `merged_watch` / `device_watch` / `session_watch` / `fusion_watch` 变化 → 编码对应 Event 帧。
    - 剪贴板 / 通知 broadcast → 编码对应 Event 帧。
 3. 任一方向出错或关闭 → 断开当前连接，外层 accept 循环继续等待。
+
+`app.list` / `app.open` 需要同步结果：`dispatch_request` 通过带 `oneshot::Sender` 的
+`Command::ListApps` / `Command::OpenApp` 把请求交给 Core，再等待回复（带超时），
+不阻塞 Core 主循环。
 
 ## Dependencies
 

@@ -41,6 +41,8 @@
 - **Session 配置** — 每设备独立开关（剪贴板同步 / 通知同步 / 音频开关）
 - **跨平台 GUI** — Tauri v2 + Vue 3 原生桌面界面
 - **音频转发** — 预留 scrcpy 音频协议支持（实验性）
+- **融合模式** — session 运行中可从 GUI 选择手机应用，以 scrcpy 4.0 融合模式
+  （`--new-display` + `-x` 弹性显示器）打开独立原生窗口，可同时开多个、独立关闭
 
 ## Architecture
 
@@ -60,7 +62,9 @@ Core (device mgmt + session orchestration)
 | `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`, `getprop`） |
 | `app` / `Core` | 设备发现、身份合并、连接调度、Session 编排 |
 | `session` | 单设备声明周期管理（scrcpy 部署、剪贴板 I/O、通知轮询、音频） |
-| `scrcpy` | scrcpy-server 部署/启停 + 剪贴板协议解析 |
+| `scrcpy` | scrcpy-server 部署/启停（scid 会话隔离 + 精准 kill）+ 剪贴板协议解析 |
+| `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，60s 缓存） |
+| `fusion` | 融合窗口管理（scrcpy.exe 进程生命周期：启动 / 回收 / 优雅关闭） |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
 | `ipc` | TCP Protobuf IPC 服务（GUI 通信） |
 | `cli` | 终端交互界面 |
@@ -121,6 +125,8 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 | `session.retry` | Request | 重试 failed 状态的 session（按 uuid 标识设备） |
 | `clipboard.get` | Request | 读取 PC 端剪贴板 |
 | `pairing.info` | Request | 获取配对二维码信息 |
+| `app.list` | Request | 枚举设备可启动应用（60s 缓存，`force` 可刷新） |
+| `app.open` | Request | 以融合模式窗口打开应用（返回 window_id） |
 
 #### 推送事件
 
@@ -131,6 +137,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 | `session.updated` | `SessionListData`（Protobuf） | Session 状态/配置变更（含 uuid / session_state / clipboard_sync / notification_sync / audio_enabled / audio_buffer_ms） |
 | `clipboard.changed` | `ClipboardData` | 剪贴板变更 |
 | `notification` | `NotifData` | 手机通知推送 |
+| `app.windows-updated` | `AppWindowsUpdated` | 融合窗口启动 / 退出 / 失败 |
 
 详见 [IPC-DESIGN.md](./IPC-DESIGN.md)。
 
@@ -142,6 +149,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 - [adb](https://developer.android.com/tools/adb)（`PATH` 中或项目目录下的 `adb.exe`）
 - Node.js 18+（构建 GUI）
 - Android 设备（Android 11+ 推荐无线调试）
+- scrcpy-win64 v4.0 运行时（融合模式需要；`vendor/scrcpy-win64`、`SCRCPY_HOME` 或 PATH 中）
 
 ### Build & Run
 
@@ -167,6 +175,10 @@ npm run tauri dev
 
 首次使用前需要将 `scrcpy-server` jar 文件放在项目根目录或 daemon 同级目录。
 
+Windows 发布包（`build.ps1 -Release`）会自动从 `vendor/scrcpy-win64`、`$env:SCRCPY_HOME`
+或 PATH 查找并打包 scrcpy 融合窗口运行时（`scrcpy.exe` + `SDL3.dll` + FFmpeg DLL），
+也可用 `-ScrcpyDir <目录>` 显式指定。缺少运行时不影响基础功能，仅融合模式不可用。
+
 ## Project Structure
 
 ```
@@ -177,7 +189,9 @@ kulua/
 │   └── src/
 │       ├── app.rs       # 设备管理主循环 + insert_device
 │       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
-│       ├── scrcpy.rs    # scrcpy-server 交互
+│       ├── scrcpy.rs    # scrcpy-server 交互（scid 会话隔离）
+│       ├── apps.rs      # 设备应用枚举（server 一次性模式 + 缓存）
+│       ├── fusion.rs    # 融合窗口管理（scrcpy.exe 进程）
 │       ├── adb_cmd.rs   # ADB CLI 封装
 │       ├── ipc/         # TCP Protobuf IPC 服务
 │       ├── wireless_pair.rs
@@ -187,6 +201,7 @@ kulua/
 ├── ui/                  # 桌面 GUI (Tauri v2 + Vue 3)
 │   ├── src/             # Vue 3 前端（App.vue）
 │   └── src-tauri/       # Tauri Rust 后端（复用 sync-core IPC 消息）
+├── vendor/scrcpy-win64/ # scrcpy v4.0 融合窗口运行时（打包用）
 ├── build.sh             # 构建脚本 (Linux/macOS)
 ├── build.ps1            # 构建脚本 (Windows)
 ├── scrcpy-server        # scrcpy server jar
@@ -198,6 +213,8 @@ kulua/
 - **手机上绝不安装任何 APK** — 所有功能通过 `adb push` + `adb shell app_process` 实现
 - 依赖 `scrcpy-server.jar`（scrcpy 官方的 server jar）
 - 需要本地有 `adb` 可执行文件
+- 融合窗口复用官方 `scrcpy.exe`（不在 Rust 中实现视频解码/渲染/输入注入），
+  手机上仍不装任何 APK；融合窗口与 Kulua session 通过 scid 隔离互不干扰
 
 ## Status
 
@@ -215,6 +232,9 @@ kulua/
 - ✅ 音频缓冲延迟显示（audio_buffer_ms，UI 显示播放队列积压 ms）
 - ✅ ADB 连接页面（tab 切换，显示 adb 原始设备列表含离线/未授权）
 - ✅ pending_serials 环（自动重试，失败 5 次丢弃）
+- ✅ scid 会话隔离（session 重启/清理按 scid 精准 kill，不误杀融合窗口）
+- ✅ 应用列表（GUI 选择设备应用，server 一次性模式枚举 + 缓存）
+- ✅ 融合模式窗口（scrcpy.exe --new-display -x 独立窗口，可多开、独立关闭）
 - ⏳ 音频转发（实验性，支持 Opus 解码 + rodio 播放）
 
 ## License

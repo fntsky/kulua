@@ -9,6 +9,48 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+/// scid 高 16 位固定标记：`0x4B4C` 即 ASCII "KL"（Kulua 前缀），低 16 位为 ADB 转发端口。
+///
+/// 每个 Kulua session 生成确定性 scid，server 监听 `localabstract:scrcpy_<scid>`
+/// （官方 scrcpy 不带 scid 时用默认 `scrcpy` socket）。这样 session 重启/清理时
+/// 可以精准定位自己的 server 进程，绝不误杀融合窗口等其它 scrcpy 实例。
+pub const SCID_PREFIX: u32 = 0x4B4C_0000;
+
+/// 由 ADB 转发端口推导确定性 scid（31 位非负，server 侧按 16 进制解析）。
+pub fn scid_for_port(port: u16) -> u32 {
+    SCID_PREFIX | u32::from(port)
+}
+
+/// scid 的 8 位小写 16 进制字符串（server socket 名用 `%08x` 格式化，必须对齐）。
+pub fn scid_hex(port: u16) -> String {
+    format!("{:08x}", scid_for_port(port))
+}
+
+/// 生成按 scid 精准 kill 的 shell 脚本。
+///
+/// 遍历 `/proc/<pid>/cmdline`，只 kill 参数含 `scid=<hex>` 的进程（即本会话的
+/// scrcpy-server），跳过 `$$`（脚本自身 shell），避免误杀融合窗口或自杀。
+/// 以 `true` 结尾保证 `adb shell` 退出码为 0。
+pub fn build_scid_kill_script(scid_hex: &str) -> String {
+    format!(
+        "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
+         [ \"$p\" = \"$$\" ] && continue; \
+         if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid={}' 2>/dev/null; then \
+         kill -9 \"$p\" 2>/dev/null; fi; done; true",
+        scid_hex
+    )
+}
+
+/// 按 scid 精准杀死设备上属于本会话的 scrcpy-server 进程。
+///
+/// 替换旧的 broad kill（`grep com.genymobile.scrcpy` 全量击杀）：只匹配参数含
+/// `scid=<本会话 hex>` 的进程，官方 scrcpy 融合窗口（各自随机 scid）不受影响。
+pub fn kill_by_scid(adb: &dyn AdbOps, serial: &str, port: u16) {
+    let script = build_scid_kill_script(&scid_hex(port));
+    let _ = adb.run(&["-s", serial, "shell", &script]);
+}
+
 pub struct ScrcpyServer {
     device: Device,
     process: std::process::Child,
@@ -16,12 +58,6 @@ pub struct ScrcpyServer {
 }
 
 impl ScrcpyServer {
-    /// 强制杀死设备上的 scrcpy-server 进程（与 `stop` 逻辑相同）。
-    fn force_kill_remote(adb: &dyn AdbOps, serial: &str) {
-        let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
-        let _ = adb.run(&["-s", serial, "shell", kill_cmd]);
-    }
-
     pub fn deploy_scrcpy(
         adb: &dyn AdbOps,
         device: &Device,
@@ -30,8 +66,8 @@ impl ScrcpyServer {
         audio_enabled: bool,
         params: crate::settings::ScrcpyParams,
     ) -> Result<Self, crate::types::AdbError> {
-        // 强制杀死设备上已有的 scrcpy-server，再重新部署
-        Self::force_kill_remote(adb, &device.serial);
+        // 仅清理同 scid 的陈旧进程（上次崩溃残留），不碰其它 scrcpy 实例（如融合窗口）
+        kill_by_scid(adb, &device.serial, port);
 
         let remote_jar = "/data/local/tmp/scrcpy-server.jar";
         let needs_push = adb
@@ -45,6 +81,7 @@ impl ScrcpyServer {
         let audio_flag = if audio_enabled { "true" } else { "false" };
         let classpath = format!("CLASSPATH={}", remote_jar);
         let audio_arg = format!("audio={}", audio_flag);
+        let scid_arg = format!("scid={}", scid_hex(port));
         // 编码参数：仅当用户显式配置（非 0 / 非默认）时追加，否则用 scrcpy 默认值
         let mut extra_args: Vec<String> = Vec::new();
         if params.video_bit_rate > 0 {
@@ -76,9 +113,12 @@ impl ScrcpyServer {
             "cleanup=true",
             "send_device_meta=true",
             "send_dummy_byte=true",
+            &scid_arg,
         ];
         args.extend(extra_args.iter().map(String::as_str));
-        adb.forward(device, port, "scrcpy")?;
+        // 隔离 socket：官方客户端默认连 `scrcpy`，带 scid 的 server 监听 `scrcpy_<hex>`
+        let forward_target = format!("scrcpy_{}", scid_hex(port));
+        adb.forward(device, port, &forward_target)?;
         let mut process = adb.spawn_shell(device, &args)?;
         if let Some(stderr) = process.stderr.take() {
             let serial = device.serial.clone();
@@ -106,9 +146,8 @@ impl ScrcpyServer {
 
     /// 强制停止 server（清理远程进程和本地 adb shell）。
     pub fn stop(&mut self, adb: &dyn AdbOps) {
-        // 先杀远程（设备端 scrcpy-server），确保无论本地如何终止都不会残留
-        let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
-        let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
+        // 先按 scid 精准杀远程（设备端 scrcpy-server），确保无论本地如何终止都不会残留
+        kill_by_scid(adb, &self.device.serial, self.port);
 
         // 再杀本地 adb shell 进程
         let _ = self.process.kill();
@@ -268,4 +307,50 @@ pub async fn send_clipboard_async(
 
     stream.write_all(&msg).await.map_err(AdbError::Io)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scid_prefix_is_kl_marker() {
+        // 高 16 位 0x4B4C 即 ASCII "KL"，用于在设备上区分 Kulua 会话与官方 scrcpy
+        assert_eq!(SCID_PREFIX, 0x4B4C_0000);
+    }
+
+    #[test]
+    fn scid_is_deterministic_from_port() {
+        // 27183 = 0x6A2F
+        assert_eq!(scid_for_port(27183), 0x4B4C_6A2F);
+        assert_eq!(scid_for_port(0), SCID_PREFIX);
+        assert_eq!(scid_for_port(0xFFFF), SCID_PREFIX | 0xFFFF);
+        // 31 位非负，满足 server 侧 scid 约束（-1 或 0..2^31）
+        assert!(scid_for_port(u16::MAX) < 1 << 31);
+    }
+
+    #[test]
+    fn scid_hex_is_8_lowercase_hex_digits() {
+        // server 侧 socket 名用 String.format("_%08x", scid)，必须严格 8 位对齐
+        assert_eq!(scid_hex(27183), "4b4c6a2f");
+        assert_eq!(scid_hex(0), "4b4c0000");
+        assert_eq!(scid_hex(0xFFFF), "4b4cffff");
+    }
+
+    #[test]
+    fn kill_script_targets_only_own_scid() {
+        let script = build_scid_kill_script("4b4c6a17");
+        assert!(script.contains("scid=4b4c6a17"), "应匹配本会话 scid");
+        assert!(!script.contains("scid=4b4c6a18"), "不得匹配其它 scid");
+        assert!(script.contains("$$"), "应跳过脚本自身 shell 进程");
+        assert!(script.contains("/proc/$p/cmdline"), "应遍历 /proc cmdline");
+        assert!(script.ends_with("true"), "应以 true 结尾保证 exit 0");
+    }
+
+    #[test]
+    fn kill_script_quotes_scid() {
+        // scid 必须带引号，防止设备 shell 展开/分词
+        let script = build_scid_kill_script("4b4c6a17");
+        assert!(script.contains("'scid=4b4c6a17'"), "scid 应被单引号包裹");
+    }
 }

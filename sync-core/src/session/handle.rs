@@ -110,8 +110,8 @@ impl Handle {
                 "session {} stop timeout, force killing remote",
                 self.device.serial
             );
-            let kill_cmd = "kill -9 $(ps 2>/dev/null | grep com.genymobile.scrcpy | grep -v grep | awk '{print $2}') 2>/dev/null; true";
-            let _ = adb.run(&["-s", &self.device.serial, "shell", kill_cmd]);
+            // 按 scid 精准清理本会话的 server，不误杀融合窗口等其它 scrcpy 实例
+            crate::scrcpy::kill_by_scid(adb, &self.device.serial, self.port);
         }
 
         // (4) 清理 ADB 转发
