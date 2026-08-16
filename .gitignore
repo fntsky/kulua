@@ -9,3 +9,5 @@ node_modules
 .agents/
 /.tools/
 kulua-server/build/
+# 根目录 jar 副本（daemon find_jar 运行时查找用，构建产物不入库）
+/kulua-server.jar
