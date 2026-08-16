@@ -27,18 +27,23 @@ pub struct VideoDecoder {
 unsafe impl Send for VideoDecoder {}
 
 impl VideoDecoder {
-    /// 创建解码器（codec_id 为 scrcpy 视频头的 codec id，如 H264=27）。
-    pub fn new(codec_id: i32) -> Result<Self, String> {
+    /// 创建解码器。
+    ///
+    /// `codec_id` 为 scrcpy v4.0 视频头的 codec id：**4 字节 ASCII 名称**
+    /// （`VideoCodec.java`：`0x68_32_36_34` = "h264"，`0x68_32_36_35` = "h265"，
+    /// `0x00_61_76_31` = "av1"）。v4.0 已从旧版的整数 id（H264=27）改为 ASCII，
+    /// 按整数匹配会得到 "不支持的 codec id"。
+    pub fn new(codec_id: u32) -> Result<Self, String> {
         let codec_id_enum = match codec_id {
-            27 => AVCodecID::AV_CODEC_ID_H264,
-            173 => AVCodecID::AV_CODEC_ID_HEVC,
-            225 => AVCodecID::AV_CODEC_ID_AV1,
-            other => return Err(format!("不支持的 codec id: {}", other)),
+            0x68_32_36_34 => AVCodecID::AV_CODEC_ID_H264, // "h264"
+            0x68_32_36_35 => AVCodecID::AV_CODEC_ID_HEVC, // "h265"
+            0x00_61_76_31 => AVCodecID::AV_CODEC_ID_AV1,  // "av1"
+            other => return Err(format!("不支持的 codec id: {:#x}", other)),
         };
         unsafe {
             let codec = avcodec_find_decoder(codec_id_enum);
             if codec.is_null() {
-                return Err(format!("找不到 codec: {}", codec_id));
+                return Err(format!("找不到 codec: {:#x}", codec_id));
             }
             let codec_ctx = avcodec_alloc_context3(codec);
             if codec_ctx.is_null() {
@@ -229,8 +234,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn h264_codec_id_constant() {
-        // scrcpy 视频头 codec id 与 FFmpeg AV_CODEC_ID 一致
+    fn h264_codec_id_is_ascii_name() {
+        // scrcpy v4.0 视频头 codec id 是 4 字节 ASCII（VideoCodec.java 核实）
+        assert_eq!(0x68_32_36_34u32, u32::from_be_bytes(*b"h264"));
+        assert_eq!(0x68_32_36_35u32, u32::from_be_bytes(*b"h265"));
+        assert_eq!(
+            0x00_61_76_31u32,
+            u32::from_be_bytes([0x00, 0x61, 0x76, 0x31])
+        ); // "av1"（前导 0）
+        // 对应的 FFmpeg 内部 codec id
         assert_eq!(AVCodecID::AV_CODEC_ID_H264 as i32, 27);
         assert_eq!(AVCodecID::AV_CODEC_ID_HEVC as i32, 173);
         assert_eq!(AVCodecID::AV_CODEC_ID_AV1 as i32, 225);
@@ -243,16 +255,31 @@ mod tests {
     }
 
     #[test]
+    fn ascii_codec_ids_are_accepted() {
+        assert!(
+            VideoDecoder::new(0x68_32_36_34).is_ok(),
+            "\"h264\" 应被接受"
+        );
+        assert!(
+            VideoDecoder::new(0x68_32_36_35).is_ok(),
+            "\"h265\" 应被接受"
+        );
+        assert!(VideoDecoder::new(0x00_61_76_31).is_ok(), "\"av1\" 应被接受");
+        // 旧版整数 id 不再被接受（v4.0 协议）
+        assert!(VideoDecoder::new(27).is_err());
+    }
+
+    #[test]
     fn decoder_opens_without_extradata() {
         // 无 extradata 也能 open（首帧可能解码失败，但 open 本身应成功）
-        let mut decoder = VideoDecoder::new(27).unwrap();
+        let mut decoder = VideoDecoder::new(0x68_32_36_34).unwrap();
         assert!(decoder.open().is_ok());
         assert!(decoder.is_open());
     }
 
     #[test]
     fn decode_garbage_returns_err_not_panic() {
-        let mut decoder = VideoDecoder::new(27).unwrap();
+        let mut decoder = VideoDecoder::new(0x68_32_36_34).unwrap();
         decoder.open().unwrap();
         let result = decoder.decode(&[0x00, 0x01, 0x02, 0x03], Some(0), false);
         // 垃圾数据不应 panic；可能是 Err 或 Ok(None)

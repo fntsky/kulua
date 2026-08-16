@@ -51,13 +51,18 @@ pub fn spawn_video_thread(video: TcpStream, tx: Sender<VideoEvent>, proxy: Event
         let device_name = String::from_utf8_lossy(&name_buf[..name_end]);
         println!("[viewer] 设备名: {}", device_name);
 
-        // 2. codec id（4 字节大端）
+        // 2. codec id（4 字节大端；v4.0 为 ASCII 名称如 "h264"/"h265"/"av1"）
         let mut codec_buf = [0u8; 4];
         if read_exact(&mut video, &mut codec_buf).is_err() {
             let _ = tx.send(VideoEvent::Error("读取 codec id 失败".into()));
             return;
         }
-        let codec_id = i32::from_be_bytes(codec_buf);
+        let codec_id = u32::from_be_bytes(codec_buf);
+        println!(
+            "[viewer] codec id: {:#010x} ({})",
+            codec_id,
+            String::from_utf8_lossy(&codec_buf)
+        );
         let mut decoder = match VideoDecoder::new(codec_id) {
             Ok(d) => d,
             Err(e) => {
