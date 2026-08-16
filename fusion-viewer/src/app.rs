@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
@@ -46,6 +47,11 @@ pub struct ViewerApp {
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     /// 窗口内容区尺寸（物理像素）
     window_size: (u32, u32),
+    /// 上次轮询窗口尺寸的时间（每 1s 轮询一次）
+    last_resize_check: Instant,
+    /// 上次发送给 server 的显示器尺寸（物理像素）。
+    /// 轮询到窗口尺寸与它不同才发 RESIZE_DISPLAY，避免重复发送
+    last_sent_size: (u32, u32),
     /// 最近一帧（渲染用）
     latest_frame: Option<DecodedFrame>,
 
@@ -67,6 +73,8 @@ impl ViewerApp {
             context: None,
             surface: None,
             window_size: (0, 0),
+            last_resize_check: Instant::now(),
+            last_sent_size: (0, 0), // (0,0) 保证首次轮询必然发送
             latest_frame: None,
             mouse_down: false,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
@@ -304,6 +312,31 @@ impl ViewerApp {
         );
         let _ = self.session.send(&msg);
     }
+
+    /// 轮询窗口当前尺寸，与上次发送的显示器尺寸不同则发 RESIZE_DISPLAY。
+    ///
+    /// 为什么轮询而非依赖 Resized 事件：窗口拖动/系统缩放时 Resized 事件
+    /// 可能不触发或触发不稳定（实测缩放后分辨率不跟随），轮询窗口实际
+    /// 物理尺寸能稳定收敛。首帧前虚拟显示器未就绪，跳过。
+    fn poll_window_size(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if self.latest_frame.is_none() {
+            return; // 首帧前显示器未就绪
+        }
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let w = size.width.min(u16::MAX as u32) as u16;
+        let h = size.height.min(u16::MAX as u32) as u16;
+        if (w as u32, h as u32) == self.last_sent_size {
+            return; // 尺寸未变，不发
+        }
+        self.last_sent_size = (w as u32, h as u32);
+        let _ = self.session.resize_display(w, h);
+    }
 }
 
 impl ApplicationHandler for ViewerApp {
@@ -346,15 +379,10 @@ impl ApplicationHandler for ViewerApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                // 只更新渲染尺寸；RESIZE_DISPLAY 由每秒轮询统一发送——
+                // Resized 事件在拖动/DPI 变化时可能丢事件或不稳定触发，
+                // 轮询窗口实际尺寸更可靠（见 poll_window_size）
                 self.window_size = (size.width, size.height);
-                // 弹性显示器：窗口尺寸变化 → 调整虚拟显示器分辨率。
-                // 首帧前虚拟显示器尚未创建，跳过（flex 模式 display 就绪后才可 resize）
-                if self.latest_frame.is_some() && size.width > 0 && size.height > 0 {
-                    let _ = self.session.resize_display(
-                        size.width.min(u16::MAX as u32) as u16,
-                        size.height.min(u16::MAX as u32) as u16,
-                    );
-                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -441,6 +469,11 @@ impl ApplicationHandler for ViewerApp {
         // 被视频线程 user event 唤醒或需要重绘时刷新
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+        // 每秒轮询窗口尺寸 → 弹性显示器 resize
+        if self.last_resize_check.elapsed() >= Duration::from_secs(1) {
+            self.last_resize_check = Instant::now();
+            self.poll_window_size();
         }
     }
 
