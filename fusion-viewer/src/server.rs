@@ -59,19 +59,36 @@ impl ServerSession {
         //    断连而永久残留（虚拟显示器泄漏，累积后新 server 无法创建显示器）。
         kill_stale_servers(adb, &args.serial);
 
-        // 2. 总是 push 最新 jar：设备上可能残留旧版本（旧 jar 不识别 new_display
-        //    等参数，会导致 server 启动失败），viewer 作为自包含客户端必须保证版本一致
+        // 2. jar 版本检查：设备上已存在且 md5 与本地一致 → 跳过 push。
+        //    8MB 无线传输很贵（1~5s），而 md5sum 校验只需一次 0.3s 的 shell 往返；
+        //    同时仍保证设备 jar 与本地一致（防旧 jar 不识别 new_display 等参数）
         if !Path::new(&args.jar).exists() {
             return Err(format!("jar 不存在: {}", args.jar));
         }
-        let status = Command::new(adb)
-            .args(["-s", &args.serial, "push", &args.jar, REMOTE_JAR])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("adb push 失败: {}", e))?;
-        if !status.success() {
-            return Err("adb push 失败".into());
+        let local_md5 = local_jar_md5(&args.jar)?;
+        let device_md5 = Command::new(adb)
+            .args(["-s", &args.serial, "shell", "md5sum", REMOTE_JAR])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_md5sum(&String::from_utf8_lossy(&o.stdout)));
+        let up_to_date = device_md5.as_deref() == Some(local_md5.as_str());
+        if up_to_date {
+            println!("[viewer] jar 已是最新，跳过 push");
+        } else {
+            println!(
+                "[viewer] 推送 jar（设备 md5: {}）",
+                device_md5.as_deref().unwrap_or("无")
+            );
+            let status = Command::new(adb)
+                .args(["-s", &args.serial, "push", &args.jar, REMOTE_JAR])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("adb push 失败: {}", e))?;
+            if !status.success() {
+                return Err("adb push 失败".into());
+            }
         }
 
         // 2. 挑选空闲本地端口并建立 forward
@@ -266,6 +283,26 @@ fn build_scid_kill_script(scid_hex: &str) -> String {
     )
 }
 
+/// 计算本地 jar 的 MD5（hex 小写）。
+fn local_jar_md5(path: &str) -> Result<String, String> {
+    use md5::{Digest, Md5};
+    let data = std::fs::read(path).map_err(|e| format!("读取 jar 失败: {}", e))?;
+    let mut hasher = Md5::new();
+    hasher.update(&data);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 解析 `md5sum` 输出（toybox 格式：`<hash>  <文件名>` 或 `<hash> <文件名>`）。
+fn parse_md5sum(output: &str) -> Option<String> {
+    let hash = output.split_whitespace().next()?;
+    // md5 必须是 32 位小写 hex，防止把错误输出误当哈希
+    if hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 /// 清理设备上 viewer 残留的陈旧 server 进程（scid 前缀 4b4d）。
 fn kill_stale_servers(adb: &str, serial: &str) {
     let script = build_stale_kill_script();
@@ -344,6 +381,41 @@ mod tests {
         assert!(!script.contains("scid=4b4c"), "不得匹配 Kulua session 前缀");
         assert!(script.contains("$$"), "应跳过脚本自身 shell 进程");
         assert!(script.ends_with("true"), "应以 true 结尾保证 exit 0");
+    }
+
+    #[test]
+    fn parse_md5sum_extracts_hash() {
+        // toybox 格式：`<hash>  <文件名>`（两个空格）
+        let out = "900150983cd24fb0d6963f7d28e17f72  /data/local/tmp/scrcpy-server.jar\n";
+        assert_eq!(
+            parse_md5sum(out).as_deref(),
+            Some("900150983cd24fb0d6963f7d28e17f72")
+        );
+        // 单空格格式
+        assert_eq!(
+            parse_md5sum("900150983cd24fb0d6963f7d28e17f72 x").as_deref(),
+            Some("900150983cd24fb0d6963f7d28e17f72")
+        );
+        // 错误输出 / 空输出 → None
+        assert_eq!(parse_md5sum(""), None);
+        assert_eq!(parse_md5sum("md5sum: not found"), None);
+        assert_eq!(parse_md5sum("abc"), None, "非 32 位 hex 应拒绝");
+    }
+
+    #[test]
+    fn local_jar_md5_matches_known_value() {
+        // "abc" 的 MD5 是 900150983cd24fb0d6963f7d28e17f72
+        let dir = std::env::temp_dir();
+        let path = dir.join("fusion-viewer-md5-test.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let hash = local_jar_md5(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(hash, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn local_jar_md5_missing_file_is_error() {
+        assert!(local_jar_md5("/nonexistent/jar").is_err());
     }
 
     #[test]
