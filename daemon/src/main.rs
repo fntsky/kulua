@@ -6,6 +6,8 @@ use sync_core::cli;
 use sync_core::wireless_pair;
 
 use std::path::Path;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 
 fn find_jar() -> Option<String> {
     let candidates = [
@@ -29,7 +31,10 @@ fn find_jar() -> Option<String> {
     None
 }
 /// 查找并启动 sync-ui 桌面窗口（与 daemon.exe 同目录优先，调试构建回退到 target/debug）。
-fn launch_ui() {
+///
+/// 启动前先终止上一次残留的 UI 进程（避免重复窗口），并把新进程句柄存入 `ui_handle`，
+/// 供托盘「退出」时结束前台 UI。
+fn spawn_ui(ui_handle: &Mutex<Option<Child>>) {
     let ui_name = if cfg!(target_os = "windows") {
         "sync-ui.exe"
     } else {
@@ -46,12 +51,38 @@ fn launch_ui() {
                 "../target/debug/sync-ui"
             })
         });
+
+    // 复用 handle；有旧 UI 先杀掉再拉起新实例
+    {
+        let mut guard = ui_handle.lock().unwrap();
+        if let Some(mut old) = guard.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+    }
+
     match std::process::Command::new(&ui_path).spawn() {
-        Ok(_) => println!("sync-ui 已启动: {}", ui_path.display()),
+        Ok(child) => {
+            println!("sync-ui 已启动: {}", ui_path.display());
+            *ui_handle.lock().unwrap() = Some(child);
+        }
         Err(e) => eprintln!("启动 sync-ui 失败 ({}): {}", ui_path.display(), e),
     }
 }
-fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
+
+/// 结束前台 sync-ui 进程并清空句柄。
+fn kill_ui(ui_handle: &Mutex<Option<Child>>) {
+    let mut guard = ui_handle.lock().unwrap();
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn setup_tray_icon(
+    ui_handle: Arc<Mutex<Option<Child>>>,
+    token: tokio_util::sync::CancellationToken,
+) {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
@@ -97,9 +128,11 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
 
                     while let Ok(event) = MenuEvent::receiver().try_recv() {
                         if event.id() == quit_item.id() {
+                            // 退出：先结束前台 UI，再让 daemon 优雅退出
+                            kill_ui(&ui_handle);
                             token.cancel();
                         } else if event.id() == open_item.id() {
-                            launch_ui();
+                            spawn_ui(&ui_handle);
                         }
                     }
                 }
@@ -112,9 +145,10 @@ fn setup_tray_icon(token: tokio_util::sync::CancellationToken) {
             let receiver = MenuEvent::receiver();
             while let Ok(event) = receiver.recv() {
                 if event.id() == quit_item.id() {
+                    kill_ui(&ui_handle);
                     token.cancel();
                 } else if event.id() == open_item.id() {
-                    launch_ui();
+                    spawn_ui(&ui_handle);
                 }
             }
         }
@@ -163,10 +197,13 @@ async fn main() {
         }
     })
     .expect("Error setting Ctrl+C handler");
-    setup_tray_icon(token);
+
+    // 共享的 UI 进程句柄：托盘「打开」/启动时写入，托盘「退出」时结束它
+    let ui_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    setup_tray_icon(ui_handle.clone(), token);
 
     // 启动时自动打开 UI（UI 会轮询 %TEMP%/sync-daemon.port 等待 daemon 就绪）
-    launch_ui();
+    spawn_ui(&ui_handle);
 
     core.run().await;
 }
