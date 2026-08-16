@@ -528,6 +528,7 @@ impl Core {
                         .get(&serial)
                         .map(|d| d.state.clone())
                         .unwrap_or(DeviceState::Offline);
+                    println!("[debug] device 条目缺失，state={:?}", state);
                     if state != DeviceState::Device {
                         return;
                     }
@@ -542,7 +543,6 @@ impl Core {
                     Some(entry) => entry.device.uuid,
                     None => return,
                 };
-
                 // 已有活跃 session（connecting/running）→ no-op，维持“一设备一 session”
                 let has_active = self
                     .devices

@@ -39,7 +39,19 @@ New-Item -ItemType Directory -Force -Path $classes | Out-Null
 Write-Host "[1/3] javac..." -ForegroundColor Yellow
 $sources = Get-ChildItem -Recurse (Join-Path $project "src") -Filter "*.java" | ForEach-Object { $_.FullName }
 # android.jar 放 classpath（lambda 等 Java 8+ 语法由 d8 desugar，不用作 bootclasspath）
-& $Javac -encoding UTF-8 --release 11 -classpath $androidJar -d $classes $sources
+$cp = $androidJar
+# stubs/ 目录含隐藏类（如 IContentProvider）的编译期替身：javac 若直接看到 .java 源
+# 文件会把它也编译进 classes/（进而进 dex，与设备真实类冲突）；因此先把 stub
+# 编译成 .class 到 build/stub-classes/，仅作为 classpath 引用，d8 不处理该目录
+$stubSources = Get-ChildItem -Recurse (Join-Path $project "stubs") -Filter "*.java" | ForEach-Object { $_.FullName }
+if ($stubSources) {
+    $stubClasses = Join-Path $out "stub-classes"
+    New-Item -ItemType Directory -Force -Path $stubClasses | Out-Null
+    & $Javac -encoding UTF-8 --release 11 -classpath $androidJar -d $stubClasses $stubSources
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+    $cp = "$androidJar;$stubClasses"
+}
+& $Javac -encoding UTF-8 --release 11 -classpath $cp -d $classes $sources
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 # ── 2. d8 ──

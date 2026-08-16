@@ -56,6 +56,12 @@ public final class ControlChannel {
 
     public void run() throws IOException {
         DataInputStream input = new DataInputStream(socket.getInputStream());
+        // 就绪字节（0x00）：客户端写完类型握手后读此字节验证 server 已就绪。
+        // 为什么需要：adb forward 的 TCP 连接在 server 冷启动期间可能短暂成功
+        // （写只进 adb 缓冲），客户端需要确认 accept 真正完成；官方 scrcpy 的
+        // dummy byte 同款机制。
+        socket.getOutputStream().write(0x00);
+        socket.getOutputStream().flush();
         // 剪贴板变化推送（server → client）：注册监听，连接断开时注销
         Clipboard.ChangeListener listener = this::pushClipboard;
         Clipboard.addChangeListener(listener);

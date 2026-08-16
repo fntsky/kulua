@@ -100,8 +100,16 @@ public final class AudioCapture {
     }
 
     /**
-     * 创建 loopback AudioRecord（反射 AudioPolicy，对照 scrcpy AudioPlaybackCapture）。
-     * 捕获系统播放的混音（USAGE_MEDIA 等），shell 权限下可用。
+     * 创建 loopback AudioRecord（反射 AudioPolicy，对照 scrcpy AudioPlaybackCapture
+     * 的完整流程，逐行核对）：
+     * - AudioMixingRule(MIX_ROLE_PLAYERS + RULE_MATCH_ATTRIBUTE_USAGE)
+     * - AudioMix(ROUTE_FLAG_LOOP_BACK)
+     * - AudioPolicy.Builder(FakeContext) + addMix → build
+     * - AudioManager.registerAudioPolicyStatic（隐藏静态方法，返回 0 成功）
+     * - audioPolicy.createAudioRecordSink(mix)（隐藏方法，返回绑定 mix 的 AudioRecord）
+     *
+     * 关键差异（与早期实现相比）：必须用 registerAudioPolicyStatic + createAudioRecordSink，
+     * 不能 policy.register() + 反射塞 mAudioMix 字段（后者在 Android 13+ 无法工作）。
      */
     @SuppressWarnings("unchecked")
     private static AudioRecord createLoopbackRecorder() throws IOException {
@@ -121,16 +129,20 @@ public final class AudioCapture {
             audioMixingRuleBuilderClass.getMethod("setTargetMixRole", int.class)
                     .invoke(mixRuleBuilder, mixRolePlayers);
 
-            // builder.addMixRule(RULE_MATCH_ATTRIBUTE_USAGE, mediaAttributes);
+            // builder.addMixRule(RULE_MATCH_ATTRIBUTE_USAGE, mediaAttributes)
             AudioAttributes mediaAttributes = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA).build();
             int ruleMatchUsage = audioMixingRuleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null);
             audioMixingRuleBuilderClass.getMethod("addMixRule", int.class, Object.class)
                     .invoke(mixRuleBuilder, ruleMatchUsage, mediaAttributes);
 
+            // builder.voiceCommunicationCaptureAllowed(true)（官方同款）
+            audioMixingRuleBuilderClass.getMethod("voiceCommunicationCaptureAllowed", boolean.class)
+                    .invoke(mixRuleBuilder, true);
+
             Object mixRule = audioMixingRuleBuilderClass.getMethod("build").invoke(mixRuleBuilder);
 
-            // AudioMix.Builder mixBuilder = new AudioMix.Builder(mixRule);
+            // AudioMix.Builder mixBuilder = new AudioMix.Builder(mixRule)
             Object mixBuilder = audioMixBuilderClass.getConstructor(audioMixingRuleClass)
                     .newInstance(mixRule);
 
@@ -147,46 +159,32 @@ public final class AudioCapture {
 
             Object mix = audioMixBuilderClass.getMethod("build").invoke(mixBuilder);
 
-            // AudioPolicy.Builder policyBuilder = new AudioPolicy.Builder(context);
+            // AudioPolicy.Builder policyBuilder = new AudioPolicy.Builder(FakeContext)
             Object policyBuilder = audioPolicyBuilderClass
                     .getConstructor(android.content.Context.class)
-                    .newInstance(Clipboard.getContext());
-            // policyBuilder.setMix(mix)（无参版本在 shell 下可用）
-            policyBuilder.getClass().getMethod("setMix", audioMixClass).invoke(policyBuilder, mix);
+                    .newInstance(FakeContext.get());
+            // policyBuilder.addMix(mix)
+            policyBuilder.getClass().getMethod("addMix", audioMixClass).invoke(policyBuilder, mix);
             Object policy = audioPolicyBuilderClass.getMethod("build").invoke(policyBuilder);
 
-            // policy.register()
-            boolean registered = (Boolean) audioPolicyClass.getMethod("register").invoke(policy);
-            if (!registered) {
-                throw new IOException("AudioPolicy.register() failed");
+            // AudioManager.registerAudioPolicyStatic(audioPolicy)（隐藏静态方法）
+            java.lang.reflect.Method registerStatic = android.media.AudioManager.class
+                    .getDeclaredMethod("registerAudioPolicyStatic", audioPolicyClass);
+            registerStatic.setAccessible(true);
+            int result = (int) registerStatic.invoke(null, policy);
+            if (result != 0) {
+                throw new IOException("registerAudioPolicyStatic() returned " + result);
             }
 
-            // 通过 policy.getMix() 拿到 AudioMix 再建 AudioRecord（反射字段）
-            // 简化：直接用 AudioRecord 构造 + 反射 set 私有字段 AudioMix
-            return createAudioRecordForMix(mix);
+            // audioPolicy.createAudioRecordSink(mix)（隐藏方法，返回绑定 mix 的 AudioRecord）
+            java.lang.reflect.Method createSink = audioPolicyClass
+                    .getMethod("createAudioRecordSink", audioMixClass);
+            return (AudioRecord) createSink.invoke(policy, mix);
         } catch (IOException e) {
             throw e;
         } catch (Exception e) {
             throw new IOException("create loopback recorder failed", e);
         }
-    }
-
-    /** 反射把 AudioMix 塞进 AudioRecord（AudioRecord 构造后通过反射字段）。 */
-    private static AudioRecord createAudioRecordForMix(Object mix) throws Exception {
-        int bufferBytes = FRAME_BYTES * 4;
-        AudioRecord record = new AudioRecord.Builder()
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                        .build())
-                .setBufferSizeInBytes(bufferBytes)
-                .build();
-        // 反射写入 AudioRecord 的 AudioMix 字段（scrcpy 同款私有 API 用法）
-        java.lang.reflect.Field field = AudioRecord.class.getDeclaredField("mAudioMix");
-        field.setAccessible(true);
-        field.set(record, mix);
-        return record;
     }
 
     public void stop() {
