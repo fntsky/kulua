@@ -29,15 +29,19 @@ pub fn scid_hex(port: u16) -> String {
 
 /// 生成按 scid 精准 kill 的 shell 脚本。
 ///
-/// 遍历 `/proc/<pid>/cmdline`，只 kill 参数含 `scid=<hex>` 的进程（即本会话的
-/// scrcpy-server），跳过 `$$`（脚本自身 shell），避免误杀融合窗口或自杀。
-/// 以 `true` 结尾保证 `adb shell` 退出码为 0。
+/// 用 `grep -l` 一次扫描全部 cmdline（匹配文件路径），而不是逐进程循环
+/// `tr | grep`：无线 adb 下 toybox 每个 fork 都慢，984 个 /proc 进程的循环
+/// 实测 ~26s，而单次 grep 扫描 <0.2s（快 160 倍）。匹配结果形如
+/// `/proc/<pid>/cmdline`，从中提取 pid 后 kill。
+/// - 跳过 `$$`（脚本自身 shell）与 `/proc/self`、`/proc/thread-self`
+/// - 以 `true` 结尾保证 `adb shell` 退出码为 0
 pub fn build_scid_kill_script(scid_hex: &str) -> String {
     format!(
-        "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
+        "for f in $(grep -l 'scid={}' /proc/[0-9]*/cmdline 2>/dev/null); do \
+         p=${{f#/proc/}}; p=${{p%/cmdline}}; \
          [ \"$p\" = \"$$\" ] && continue; \
-         if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid={}' 2>/dev/null; then \
-         kill -9 \"$p\" 2>/dev/null; fi; done; true",
+         [ \"$p\" = \"self\" ] && continue; \
+         kill -9 \"$p\" 2>/dev/null; done; true",
         scid_hex
     )
 }
@@ -66,40 +70,62 @@ impl ScrcpyServer {
     /// 与官方 scrcpy-server 的关键区别（docs/fusion-mode-plan.md 阶段 4）：
     /// - 一个 server 进程管理多个虚拟显示器：video 连接携带创建参数（WxH/DPI）
     /// - 每个连接首字节为类型握手（0x01=control / 0x02=audio / 0x03=video）
-    /// - server 参数只有 scid（会话隔离），无 video/audio/control 开关
+    /// - server 参数：scid（会话隔离）+ audio_codec / audio_bit_rate（音频编码）
     pub fn deploy_scrcpy(
         adb: &dyn AdbOps,
         device: &Device,
         local_jar: &str,
         port: u16,
         _audio_enabled: bool,
-        _params: crate::settings::ScrcpyParams,
+        params: crate::settings::ScrcpyParams,
     ) -> Result<Self, crate::types::AdbError> {
+        // 部署分步计时（KULUA_TIMING=1 时打印），定位启动慢的瓶颈
+        let timing = std::env::var("KULUA_TIMING").map(|v| v == "1").unwrap_or(false);
+        let t0 = std::time::Instant::now();
+        let mark = |label: &str| {
+            if timing {
+                eprintln!("[timing]   deploy: {} — {}ms", label, t0.elapsed().as_millis());
+            }
+        };
+
         // 仅清理同 scid 的陈旧进程（上次崩溃残留），不碰其它 scrcpy 实例（如融合窗口）
         kill_by_scid(adb, &device.serial, port);
+        mark("kill_by_scid");
 
         let remote_jar = REMOTE_JAR;
         let needs_push = adb
             .run(&["-s", &device.serial, "shell", "test", "-f", remote_jar])
             .is_err();
+        mark("jar 检查");
         if needs_push {
             adb.push(device, local_jar, remote_jar)?;
         } else {
             println!("kulua-server.jar already exists on device, skipping push");
         }
+        mark("jar push（如需）");
         let classpath = format!("CLASSPATH={}", remote_jar);
         let scid_arg = format!("scid={}", scid_hex(port));
-        let args = vec![
-            &classpath,
-            "app_process",
-            "/",
-            "com.kulua.server.Server",
-            &scid_arg,
+        let mut args = vec![
+            classpath.clone(),
+            "app_process".to_string(),
+            "/".to_string(),
+            "com.kulua.server.Server".to_string(),
+            scid_arg.clone(),
         ];
+        // 音频编码参数：仅当显式配置时追加，否则 server 用默认（raw）
+        if !params.audio_codec.is_empty() {
+            args.push(format!("audio_codec={}", params.audio_codec));
+        }
+        if params.audio_bit_rate > 0 {
+            args.push(format!("audio_bit_rate={}", params.audio_bit_rate));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         // 隔离 socket：客户端默认连 `scrcpy_<hex>`（scid 会话隔离）
         let forward_target = format!("scrcpy_{}", scid_hex(port));
         adb.forward(device, port, &forward_target)?;
-        let mut process = adb.spawn_shell(device, &args)?;
+        mark("adb forward");
+        let mut process = adb.spawn_shell(device, &arg_refs)?;
+        mark("spawn app_process");
         if let Some(stderr) = process.stderr.take() {
             let serial = device.serial.clone();
             thread::spawn(move || {
@@ -323,7 +349,12 @@ mod tests {
         assert!(script.contains("scid=4b4c6a17"), "应匹配本会话 scid");
         assert!(!script.contains("scid=4b4c6a18"), "不得匹配其它 scid");
         assert!(script.contains("$$"), "应跳过脚本自身 shell 进程");
-        assert!(script.contains("/proc/$p/cmdline"), "应遍历 /proc cmdline");
+        assert!(
+            script.contains("/proc/[0-9]*/cmdline"),
+            "应 grep 扫描 /proc cmdline（高效，非逐进程循环）"
+        );
+        assert!(!script.contains("tr '\\0'"), "不得用逐进程 tr|grep 循环（无线 adb 下极慢）");
+        assert!(script.contains("self"), "应跳过 /proc/self 与 thread-self");
         assert!(script.ends_with("true"), "应以 true 结尾保证 exit 0");
     }
 
@@ -332,5 +363,16 @@ mod tests {
         // scid 必须带引号，防止设备 shell 展开/分词
         let script = build_scid_kill_script("4b4c6a17");
         assert!(script.contains("'scid=4b4c6a17'"), "scid 应被单引号包裹");
+    }
+
+    #[test]
+    fn kill_script_extracts_pid_from_grep_path() {
+        // 验证从 /proc/<pid>/cmdline 提取 pid 的参数展开逻辑
+        let script = build_scid_kill_script("4b4c6a17");
+        assert!(
+            script.contains("p=${f#/proc/}") && script.contains("p=${p%/cmdline}"),
+            "应从 grep 输出路径提取 pid"
+        );
+        assert!(script.contains("kill -9 \"$p\""), "应 kill 提取出的 pid");
     }
 }

@@ -82,7 +82,7 @@ public final class ConnectionManager {
 
     /** 音频连接：捕获系统播放声音并推流，直到连接断开。 */
     private void handleAudioConnection(LocalSocket socket) throws IOException {
-        AudioCapture capture = new AudioCapture(socket);
+        AudioCapture capture = new AudioCapture(socket, options.audioCodec, options.audioBitRate);
         try {
             capture.start();
             // 等待连接断开（客户端关闭时 read 返回 -1）

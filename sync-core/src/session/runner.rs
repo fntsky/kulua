@@ -90,6 +90,16 @@ impl Session {
 
     /// 运行 session 主循环：部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 音频帧 + 通知轮询。
     pub async fn run(&mut self) {
+        // 启动计时（debug 诊断）：`KULUA_TIMING=1` 时打印每阶段耗时，
+        // 用于定位 session 启动慢的瓶颈（部署 / 设备名 / 连接握手）
+        let timing = std::env::var("KULUA_TIMING").map(|v| v == "1").unwrap_or(false);
+        let t0 = std::time::Instant::now();
+        let mark = |label: &str| {
+            if timing {
+                eprintln!("[timing] {}: {}ms", label, t0.elapsed().as_millis());
+            }
+        };
+
         let mut stop_rx = self.stop_rx.take().expect("run can only be called once");
         let port = self.port;
         let audio_enabled = self.audio_enabled.load(Ordering::SeqCst);
@@ -110,6 +120,7 @@ impl Session {
             )
         })
         .await;
+        mark("deploy（adb push/forward/spawn）");
 
         let mut server = match server {
             Ok(Ok(s)) => s,
@@ -153,6 +164,7 @@ impl Session {
                 }
             }
         }
+        mark("设备名 getprop");
 
         if !audio_enabled {
             // 音频未启用：单连接 control-only
@@ -172,6 +184,7 @@ impl Session {
         };
         // 控制通道禁用 Nagle（官方默认行为）
         let _ = control_stream.set_nodelay(true);
+        mark("control 连接（含重试）");
 
         let (audio_stream, audio_codec_id) = self
             .connect_socket(port, &mut server, &mut stop_rx, ConnectionType::Audio)
@@ -181,6 +194,7 @@ impl Session {
         };
         // 启用 TCP_NODELAY 及时检测断连
         let _ = audio_stream.set_nodelay(true);
+        mark("audio 连接 + codec id");
 
         // connect_socket 已读 codec ID（Audio 连接首 4 字节）
         let Some(codec_id) = audio_codec_id else {
@@ -211,6 +225,7 @@ impl Session {
         // 握手完成（双 socket + 设备名 + codec header）→ running
         self.session_state
             .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+        mark("session RUNNING（总耗时）");
         // 4. 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
         notification::spawn_notification_poller_tokio(

@@ -12,6 +12,12 @@ public final class Options {
     /** 一次性模式：枚举可启动应用后退出（apps.rs 解析输出） */
     public boolean listApps;
 
+    /** 音频编码器：raw / opus / aac / flac（缺省 raw，与早期版本行为一致） */
+    public String audioCodec = "raw";
+
+    /** 音频码率（bps），0 = 编码器默认 */
+    public int audioBitRate;
+
     private Options() {
         // use parse()
     }
@@ -30,6 +36,18 @@ public final class Options {
             options.scid = scid;
         }
         options.listApps = "true".equals(map.get("list_apps"));
+        String audioCodec = map.get("audio_codec");
+        if (audioCodec != null) {
+            options.audioCodec = audioCodec;
+        }
+        String audioBitRate = map.get("audio_bit_rate");
+        if (audioBitRate != null) {
+            try {
+                options.audioBitRate = Integer.parseInt(audioBitRate);
+            } catch (NumberFormatException ignored) {
+                // 非法码率忽略，用默认
+            }
+        }
         return options;
     }
 }
