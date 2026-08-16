@@ -40,6 +40,11 @@ public final class Server {
     }
 
     private static void internalMain(String... args) throws IOException {
+        // app_process 直跑 main 没有 Looper，而 ActivityThread 构造需要它
+        // （构造 Handler）。官方 scrcpy 同样在 main 里先 prepare（quitAllowed=true，
+        // 见 Server.prepareMainLooper）。
+        android.os.Looper.prepare();
+
         Options options = Options.parse(args);
         android.util.Log.i("kulua", "kulua-server " + options.scid);
 
@@ -50,6 +55,13 @@ public final class Server {
         }
 
         ConnectionManager manager = new ConnectionManager(options);
+        // 预热系统 Context：必须由主线程（已 Looper.prepare）初始化 ActivityThread，
+        // 若留给 clipboard-monitor 等后台线程首次触发，会因无 Looper 而崩溃
+        // （ActivityThread 构造需要 Handler）
+        Clipboard.getContext();
+        // 回填 ActivityThread 隐藏字段（mBoundApplication 包名 = com.android.shell 等），
+        // 否则 createVirtualDisplay 校验 uid 失败（"packageName must match the calling uid"）
+        Workarounds.apply();
         // 轮询系统剪贴板，变化时推送给所有 control 连接（手机 → PC 方向）
         Clipboard.startMonitor();
         manager.loop();

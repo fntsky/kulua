@@ -31,8 +31,32 @@ public final class Clipboard {
     private static Context createSystemContext() {
         try {
             Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-            Method currentActivityThread = activityThreadClass.getMethod("currentActivityThread");
-            Object activityThread = currentActivityThread.invoke(null);
+            // app_process 直跑 main 不会初始化 ActivityThread（sCurrentActivityThread 为 null，
+            // currentActivityThread() 返回 null → 后续 getSystemContext NPE）。官方 scrcpy
+            // 用 Workarounds 手动构造实例并回填静态字段，这里照做：
+            Object activityThread;
+            try {
+                Method currentActivityThread = activityThreadClass.getMethod("currentActivityThread");
+                activityThread = currentActivityThread.invoke(null);
+            } catch (Exception ignored) {
+                activityThread = null;
+            }
+            if (activityThread == null) {
+                java.lang.reflect.Constructor<?> ctor =
+                        activityThreadClass.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                activityThread = ctor.newInstance();
+                // ActivityThread.sCurrentActivityThread = activityThread;
+                java.lang.reflect.Field sCurrentActivityThread =
+                        activityThreadClass.getDeclaredField("sCurrentActivityThread");
+                sCurrentActivityThread.setAccessible(true);
+                sCurrentActivityThread.set(null, activityThread);
+                // activityThread.mSystemThread = true（否则 getSystemContext 内部校验失败）
+                java.lang.reflect.Field mSystemThread =
+                        activityThreadClass.getDeclaredField("mSystemThread");
+                mSystemThread.setAccessible(true);
+                mSystemThread.setBoolean(activityThread, true);
+            }
             Method getSystemContext = activityThreadClass.getMethod("getSystemContext");
             return (Context) getSystemContext.invoke(activityThread);
         } catch (Exception e) {

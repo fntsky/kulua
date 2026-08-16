@@ -106,12 +106,28 @@ public final class DisplayEncoder {
 
             if (virtualDisplay == null) {
                 // 首次创建 VirtualDisplay；resize 时复用已有实例（换 surface）
-                android.hardware.display.DisplayManager systemDisplayManager =
-                        (android.hardware.display.DisplayManager) Clipboard.getContext()
-                                .getSystemService(android.content.Context.DISPLAY_SERVICE);
-                virtualDisplay = systemDisplayManager.createVirtualDisplay(
-                        "kulua-" + id, widthField, heightField, dpi, inputSurface,
-                        DisplayRegistry.buildFlags());
+                //
+                // 不能用 getSystemService(DISPLAY_SERVICE)：那样 DisplayManager
+                // 内部的 mContext 是系统 ContextImpl（包名 "android"），
+                // DisplayManagerGlobal.createVirtualDisplay 用
+                // context.getPackageName() 校验 uid → SecurityException
+                // （"packageName must match the calling uid"）。
+                // 官方做法（wrappers/DisplayManager.createNewVirtualDisplay）：
+                // 反射构造 DisplayManager(FakeContext)，包名 = "com.android.shell"
+                // （正好是 shell uid 的包名），校验通过。
+                try {
+                    java.lang.reflect.Constructor<android.hardware.display.DisplayManager> ctor =
+                            android.hardware.display.DisplayManager.class
+                                    .getDeclaredConstructor(android.content.Context.class);
+                    ctor.setAccessible(true);
+                    android.hardware.display.DisplayManager systemDisplayManager =
+                            ctor.newInstance(FakeContext.get());
+                    virtualDisplay = systemDisplayManager.createVirtualDisplay(
+                            "kulua-" + id, widthField, heightField, dpi, inputSurface,
+                            DisplayRegistry.buildFlags());
+                } catch (ReflectiveOperationException e) {
+                    throw new IOException("cannot create DisplayManager: " + e, e);
+                }
                 displayManager.attachVirtualDisplay(id, virtualDisplay);
             } else {
                 virtualDisplay.resize(widthField, heightField, dpi);

@@ -39,6 +39,20 @@ fn main() {
         args.port, session.display_id
     );
 
+    // 立即发送 START_APP：自研 server 的虚拟显示器在 video 握手时已创建
+    // （displayId 即返回），不需要等首帧——空显示器上无内容，MediaCodec
+    // 不会产生任何帧，等首帧会死锁（应用启动后才有画面）
+    match control::start_app(session.display_id, &args.package) {
+        Ok(msg) => {
+            if let Err(e) = session.send(&msg) {
+                eprintln!("[viewer] START_APP 发送失败: {}", e);
+            } else {
+                println!("[viewer] 已请求启动 {}", args.package);
+            }
+        }
+        Err(e) => eprintln!("[viewer] {}", e),
+    }
+
     // 2. control socket 读方向 drain：server 会向所有 control 连接推送剪贴板
     //    事件（0x00），viewer 不处理剪贴板（session 负责），但必须把数据读走，
     //    否则 TCP 缓冲区满后 server 的推送线程会阻塞在写
@@ -56,8 +70,6 @@ fn main() {
     }
 
     // 3. 视频读取线程（解码后唤醒事件循环重绘）
-    //    START_APP 不在此处发送：虚拟显示器要等视频流启动后才真正就绪，
-    //    过早发送可能得到 "No known display id"；改为收到首帧后由 ViewerApp 发送
     let (video_tx, video_rx) = mpsc::channel::<video::VideoEvent>();
 
     // 4. winit 事件循环

@@ -107,6 +107,12 @@ public final class ConnectionManager {
         Log.i(TAG, "create video stream " + width + "x" + height + "@" + dpi);
 
         DisplayRegistry.DisplayEntry entry = displayManager.create(width, height, dpi);
+        // 先回 4B displayId（大端），客户端用它发起输入注入/RESIZE/START_APP
+        socket.getOutputStream().write(new byte[]{
+                (byte) (entry.id >>> 24), (byte) (entry.id >>> 16),
+                (byte) (entry.id >>> 8), (byte) entry.id,
+        });
+        socket.getOutputStream().flush();
         DisplayEncoder encoder = new DisplayEncoder(entry.id, socket, displayManager,
                 width, height, dpi);
         displayManager.attachEncoder(entry.id, encoder);
