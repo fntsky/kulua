@@ -6,7 +6,7 @@ $config = if ($Release) { "release" } else { "debug" }
 $targetFlag = if ($Release) { "--release" } else { "" }
 $ErrorActionPreference = "Stop"
 
-Write-Host "===== Sync Workspace Build =====" -ForegroundColor Cyan
+Write-Host "===== Kulua Build =====" -ForegroundColor Cyan
 
 # ── 1. daemon ──
 Write-Host "`n[1/2] Building daemon..." -ForegroundColor Yellow
@@ -28,7 +28,7 @@ Pop-Location
 
 # ── 3. 打包发布文件夹 ──
 if ($Release) {
-    $dist = "dist/sync-workspace"
+    $dist = "dist/kulua"
     Write-Host "`n[3/3] Packaging release to $dist ..." -ForegroundColor Yellow
 
     New-Item -ItemType Directory -Force -Path $dist | Out-Null

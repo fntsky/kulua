@@ -38,6 +38,8 @@ pub struct Session {
     /// 音频缓冲延迟（ms），audio_task 写，Core 读推 UI
     audio_latency: Arc<AtomicU64>,
     device_name_tx: Option<mpsc::Sender<(String, String)>>,
+    /// scrcpy 编码参数（部署 server 时使用，配置变更后新会话生效）
+    scrcpy_params: crate::settings::ScrcpyParams,
 }
 impl Session {
     pub fn new(
@@ -56,6 +58,7 @@ impl Session {
         device_name_tx: mpsc::Sender<(String, String)>,
         session_state: Arc<AtomicU8>,
         audio_latency: Arc<AtomicU64>,
+        scrcpy_params: crate::settings::ScrcpyParams,
     ) -> Self {
         session_state.store(SESSION_STATE_CONNECTING, Ordering::SeqCst);
         Self {
@@ -74,6 +77,7 @@ impl Session {
             session_state,
             audio_latency,
             device_name_tx: Some(device_name_tx),
+            scrcpy_params,
         }
     }
 
@@ -83,10 +87,11 @@ impl Session {
         let port = self.port;
         let audio_enabled = self.audio_enabled.load(Ordering::SeqCst);
 
-        // 1. 部署 scrcpy-server（带音频开关）
+        // 1. 部署 scrcpy-server（带音频开关 + 编码参数）
         let adb = self.adb.clone();
         let device = self.device.clone();
         let jar_path = self.jar_path.clone();
+        let scrcpy_params = self.scrcpy_params.clone();
         let server = tokio::task::spawn_blocking(move || {
             scrcpy::ScrcpyServer::deploy_scrcpy(
                 adb.as_ref(),
@@ -94,6 +99,7 @@ impl Session {
                 &jar_path,
                 port,
                 audio_enabled,
+                scrcpy_params,
             )
         })
         .await;
@@ -210,8 +216,8 @@ impl Session {
         let audio_task = if codec_id == 0 {
             // 设备禁用了音频流，无需读取
             None
-        } else if codec_id != 0x6f707573 {
-            // 非 OPUS codec → 只读取丢弃（暂无对应播放支持）
+        } else if crate::audio_player::AudioCodec::from_codec_id(codec_id).is_none() {
+            // 未知 codec → 只读取丢弃（无法播放）
             Some(tokio::spawn(async move {
                 let mut header = [0u8; 12];
                 while audio_reader.read_exact(&mut header).await.is_ok() {
@@ -227,31 +233,19 @@ impl Session {
                 }
             }))
         } else {
-            // OPUS → 解码播放
+            // 已知 codec → 解码播放
+            let codec = crate::audio_player::AudioCodec::from_codec_id(codec_id).unwrap();
             let serial = self.device.serial.clone();
             let volume = self.volume.clone();
             let latency = self.audio_latency.clone();
             Some(tokio::spawn(async move {
-                let mut player = match crate::audio_player::AudioPlayer::new() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("[audio] failed to init player on {serial}: {e}");
-                        return;
-                    }
-                };
-                // 初始音量
-                player.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
-
+                // codec config 包（bit 62）：AAC 的 AudioSpecificConfig / FLAC 的 STREAMINFO，
+                // 必须先于首帧捕获；OPUS/RAW 无配置包
+                let mut codec_config: Option<Vec<u8>> = None;
+                let mut player: Option<crate::audio_player::AudioPlayer> = None;
                 let mut last_vol = volume.load(Ordering::Relaxed);
                 let mut log_timer = tokio::time::Instant::now();
                 loop {
-                    // 同步音量变更
-                    let cur = volume.load(Ordering::Relaxed);
-                    if cur != last_vol {
-                        player.set_volume(cur as f32 / 100.0);
-                        last_vol = cur;
-                    }
-
                     // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
                     let mut header = [0u8; 12];
                     if audio_reader.read_exact(&mut header).await.is_err() {
@@ -277,22 +271,56 @@ impl Session {
                         break;
                     }
 
-                    if (pts_raw >> 62) & 1 == 0 {
-                        // 正常音频帧 → 解码播放
-                        // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
-                        if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
-                            eprintln!(
-                                "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
-                                player.buffer_ms()
-                            );
-                            player.clear();
+                    // codec config 包（bit 62）：仅在解码器创建前捕获一次
+                    if (pts_raw >> 62) & 1 != 0 {
+                        if player.is_none() {
+                            codec_config = Some(frame_data);
                         }
-                        if let Err(e) = player.feed_frame(&frame_data) {
-                            eprintln!("[audio] opus decode error on {serial}: {e}");
-                        } else {
-                            // 上报播放队列积压（缓冲延迟，ms）
-                            latency.store(player.buffer_ms(), Ordering::Relaxed);
-                        }
+                        continue;
+                    }
+
+                    // 首个正常音频帧 → 惰性创建解码器（此时 config 已就绪）
+                    if player.is_none() {
+                        let p = match crate::audio_player::AudioPlayer::new(
+                            codec,
+                            codec_config.as_deref(),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "[audio] failed to init {} player on {serial}: {e}",
+                                    codec.name()
+                                );
+                                return;
+                            }
+                        };
+                        // 初始音量
+                        p.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
+                        player = Some(p);
+                    }
+                    let player = player.as_mut().unwrap();
+
+                    // 同步音量变更
+                    let cur = volume.load(Ordering::Relaxed);
+                    if cur != last_vol {
+                        player.set_volume(cur as f32 / 100.0);
+                        last_vol = cur;
+                    }
+
+                    // 正常音频帧 → 解码播放
+                    // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
+                    if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
+                        eprintln!(
+                            "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
+                            player.buffer_ms()
+                        );
+                        player.clear();
+                    }
+                    if let Err(e) = player.feed_frame(&frame_data) {
+                        eprintln!("[audio] {} decode error on {serial}: {e}", codec.name());
+                    } else {
+                        // 上报播放队列积压（缓冲延迟，ms）
+                        latency.store(player.buffer_ms(), Ordering::Relaxed);
                     }
 
                     // 诊断打点：每 5s 打印一次缓冲延迟

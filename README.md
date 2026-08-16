@@ -1,4 +1,4 @@
-# Sync Workspace
+# Kulua
 
 通过 Wi-Fi 无线管理 Android 设备并同步剪贴板——**手机上无需安装任何软件**。
 
@@ -170,7 +170,7 @@ npm run tauri dev
 ## Project Structure
 
 ```
-sync-workspace/
+kulua/
 ├── daemon/              # 后台系统托盘服务 (Rust)
 │   └── src/main.rs
 ├── sync-core/           # 核心库 (Rust)

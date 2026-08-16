@@ -28,6 +28,7 @@ impl ScrcpyServer {
         local_jar: &str,
         port: u16,
         audio_enabled: bool,
+        params: crate::settings::ScrcpyParams,
     ) -> Result<Self, crate::types::AdbError> {
         // 强制杀死设备上已有的 scrcpy-server，再重新部署
         Self::force_kill_remote(adb, &device.serial);
@@ -44,7 +45,24 @@ impl ScrcpyServer {
         let audio_flag = if audio_enabled { "true" } else { "false" };
         let classpath = format!("CLASSPATH={}", remote_jar);
         let audio_arg = format!("audio={}", audio_flag);
-        let args = vec![
+        // 编码参数：仅当用户显式配置（非 0 / 非默认）时追加，否则用 scrcpy 默认值
+        let mut extra_args: Vec<String> = Vec::new();
+        if params.video_bit_rate > 0 {
+            extra_args.push(format!("video_bit_rate={}", params.video_bit_rate));
+        }
+        if params.video_max_size > 0 {
+            extra_args.push(format!("max_size={}", params.video_max_size));
+        }
+        if params.video_max_fps > 0 {
+            extra_args.push(format!("max_fps={}", params.video_max_fps));
+        }
+        if params.audio_bit_rate > 0 {
+            extra_args.push(format!("audio_bit_rate={}", params.audio_bit_rate));
+        }
+        if !params.audio_codec.is_empty() {
+            extra_args.push(format!("audio_codec={}", params.audio_codec));
+        }
+        let mut args = vec![
             &classpath,
             "app_process",
             "/",
@@ -59,6 +77,7 @@ impl ScrcpyServer {
             "send_device_meta=true",
             "send_dummy_byte=true",
         ];
+        args.extend(extra_args.iter().map(String::as_str));
         adb.forward(device, port, "scrcpy")?;
         let mut process = adb.spawn_shell(device, &args)?;
         if let Some(stderr) = process.stderr.take() {

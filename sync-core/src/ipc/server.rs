@@ -421,16 +421,13 @@ async fn dispatch_request(
             make_ok(req.id)
         }
 
-        // ── 设置：开机自启动 ──
+        // ── 设置 ──
         "settings.get" => {
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
             let state = crate::autostart::current_state(&exe);
             make_result(
                 req.id,
-                response::Payload::Settings(response::Settings {
-                    autostart_enabled: state.enabled,
-                    autostart_supported: state.supported,
-                }),
+                response::Payload::Settings(settings_payload(state.enabled, state.supported)),
             )
         }
 
@@ -442,16 +439,72 @@ async fn dispatch_request(
             match crate::autostart::set_enabled(&exe, params.enabled) {
                 Ok(state) => make_result(
                     req.id,
-                    response::Payload::Settings(response::Settings {
-                        autostart_enabled: state.enabled,
-                        autostart_supported: state.supported,
-                    }),
+                    response::Payload::Settings(settings_payload(state.enabled, state.supported)),
                 ),
                 Err(e) => make_error(req.id, ERROR_CODE, &format!("设置自启动失败: {e}")),
             }
         }
 
+        "settings.set_scrcpy_params" => {
+            let Some(request::Payload::SetScrcpyParams(params)) = &req.params else {
+                return make_error(req.id, ERROR_CODE, "缺少 settings.set_scrcpy_params 参数");
+            };
+            let mut config = crate::settings::read();
+            if let Some(v) = params.video_bit_rate {
+                config.video_bit_rate = v;
+            }
+            if let Some(v) = params.video_max_size {
+                config.video_max_size = v;
+            }
+            if let Some(v) = params.video_max_fps {
+                config.video_max_fps = v;
+            }
+            if let Some(v) = params.audio_bit_rate {
+                config.audio_bit_rate = v;
+            }
+            if let Some(v) = &params.audio_codec {
+                // 白名单校验：只接受 scrcpy 支持的音频编码器
+                if matches!(v.as_str(), "opus" | "aac" | "flac" | "raw") {
+                    config.audio_codec = v.clone();
+                } else {
+                    return make_error(req.id, ERROR_CODE, &format!("不支持的音频编码器: {v}"));
+                }
+            }
+            match crate::settings::write(&config) {
+                Ok(()) => {
+                    // 通知 Core 重启所有设备会话，使新编码参数立即生效
+                    if cmd_tx.send(Command::RestartAllSessions).await.is_err() {
+                        return make_error(req.id, ERROR_CODE, "core 正在关闭");
+                    }
+                    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
+                    let state = crate::autostart::current_state(&exe);
+                    make_result(
+                        req.id,
+                        response::Payload::Settings(settings_payload(
+                            state.enabled,
+                            state.supported,
+                        )),
+                    )
+                }
+                Err(e) => make_error(req.id, ERROR_CODE, &format!("保存 scrcpy 参数失败: {e}")),
+            }
+        }
+
         _ => make_error(req.id, ERROR_CODE, &format!("未知方法: {}", req.method)),
+    }
+}
+
+/// 由 config + 自启动状态组装 `settings.*` 的响应载荷。
+fn settings_payload(autostart_enabled: bool, autostart_supported: bool) -> response::Settings {
+    let config = crate::settings::read();
+    response::Settings {
+        autostart_enabled,
+        autostart_supported,
+        video_bit_rate: config.video_bit_rate,
+        video_max_size: config.video_max_size,
+        video_max_fps: config.video_max_fps,
+        audio_bit_rate: config.audio_bit_rate,
+        audio_codec: config.audio_codec.clone(),
     }
 }
 

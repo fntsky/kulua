@@ -104,7 +104,7 @@ fn setup_tray_icon(
         let _tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
-            .with_tooltip("Sync Workspace")
+            .with_tooltip("Kulua")
             .build()
             .expect("build tray icon");
 

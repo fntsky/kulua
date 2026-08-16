@@ -20,7 +20,7 @@ pub struct Request {
     pub id: u64,
     #[prost(string, tag = "2")]
     pub method: String,
-    #[prost(oneof = "request::Payload", tags = "10, 11, 12, 13, 14, 15")]
+    #[prost(oneof = "request::Payload", tags = "10, 11, 12, 13, 14, 15, 16")]
     pub params: Option<request::Payload>,
 }
 
@@ -235,6 +235,28 @@ pub mod request {
         pub enabled: bool,
     }
 
+    /// `settings.set_scrcpy_params` 参数。
+    ///
+    /// 全部为 optional：只更新提供的字段，未提供的字段保持原值。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SetScrcpyParams {
+        /// 视频码率（bps），0 = 用 scrcpy 默认
+        #[prost(uint32, optional, tag = "1")]
+        pub video_bit_rate: Option<u32>,
+        /// 最大分辨率（px），0 = 不限制
+        #[prost(uint32, optional, tag = "2")]
+        pub video_max_size: Option<u32>,
+        /// 最大帧率，0 = 不限制
+        #[prost(uint32, optional, tag = "3")]
+        pub video_max_fps: Option<u32>,
+        /// 音频码率（bps），0 = 用 scrcpy 默认
+        #[prost(uint32, optional, tag = "4")]
+        pub audio_bit_rate: Option<u32>,
+        /// 音频编码器：opus / aac / flac / raw
+        #[prost(string, optional, tag = "5")]
+        pub audio_codec: Option<String>,
+    }
+
     /// 按方法区分的请求参数 oneof。
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Payload {
@@ -256,6 +278,9 @@ pub mod request {
         /// `settings.set_autostart`
         #[prost(message, tag = "15")]
         SetAutostart(SetAutostart),
+        /// `settings.set_scrcpy_params`
+        #[prost(message, tag = "16")]
+        SetScrcpyParams(SetScrcpyParams),
     }
 }
 
@@ -289,7 +314,7 @@ pub mod response {
         pub wifi_string: String,
     }
 
-    /// `settings.get` / `settings.set_autostart` 的结果。
+    /// `settings.get` / `settings.set_autostart` / `settings.set_scrcpy_params` 的结果。
     #[derive(Clone, PartialEq, Message)]
     pub struct Settings {
         /// 是否开启自启动（config 真源值）
@@ -298,6 +323,21 @@ pub mod response {
         /// 当前平台是否支持自启动
         #[prost(bool, tag = "2")]
         pub autostart_supported: bool,
+        /// scrcpy 视频码率（bps），0 = 用 scrcpy 默认
+        #[prost(uint32, tag = "3")]
+        pub video_bit_rate: u32,
+        /// scrcpy 最大分辨率（px），0 = 不限制
+        #[prost(uint32, tag = "4")]
+        pub video_max_size: u32,
+        /// scrcpy 最大帧率，0 = 不限制
+        #[prost(uint32, tag = "5")]
+        pub video_max_fps: u32,
+        /// scrcpy 音频码率（bps），0 = 用 scrcpy 默认
+        #[prost(uint32, tag = "6")]
+        pub audio_bit_rate: u32,
+        /// scrcpy 音频编码器：opus / aac / flac / raw
+        #[prost(string, tag = "7")]
+        pub audio_codec: String,
     }
 
     /// 按方法区分的结果 oneof。
@@ -393,18 +433,44 @@ mod tests {
 
     #[test]
     fn response_settings_roundtrip() {
-        // 回归：Response.result oneof 必须声明 tag=14，settings.get/set_autostart 才能编码/解码
+        // 回归：Response.result oneof 必须声明 tag=14，settings.* 才能编码/解码
         let resp = Response {
             id: 7,
             result: Some(response::Payload::Settings(response::Settings {
                 autostart_enabled: true,
                 autostart_supported: true,
+                video_bit_rate: 4_000_000,
+                video_max_size: 1920,
+                video_max_fps: 60,
+                audio_bit_rate: 128_000,
+                audio_codec: "aac".to_string(),
             })),
             error: None,
         };
         let bytes = resp.encode_to_vec();
         let decoded = Response::decode(&bytes[..]).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn request_set_scrcpy_params_roundtrip() {
+        // 回归：Request.params oneof 必须声明 tag=16，set_scrcpy_params 才能编码/解码
+        let req = Request {
+            id: 9,
+            method: "settings.set_scrcpy_params".into(),
+            params: Some(request::Payload::SetScrcpyParams(
+                request::SetScrcpyParams {
+                    video_bit_rate: Some(4_000_000),
+                    video_max_size: None,
+                    video_max_fps: Some(60),
+                    audio_bit_rate: Some(96_000),
+                    audio_codec: Some("flac".to_string()),
+                },
+            )),
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = Request::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, req);
     }
 
     #[test]

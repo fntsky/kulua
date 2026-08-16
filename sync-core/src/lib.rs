@@ -1,6 +1,7 @@
 pub mod adb_cmd;
 pub mod autostart;
 pub mod ipc;
+pub mod settings;
 
 pub mod app;
 pub mod audio_player;

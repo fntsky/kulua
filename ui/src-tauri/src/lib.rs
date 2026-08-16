@@ -52,6 +52,11 @@ struct AdbDeviceInfo {
 struct SettingsInfo {
     autostart_enabled: bool,
     autostart_supported: bool,
+    video_bit_rate: u32,
+    video_max_size: u32,
+    video_max_fps: u32,
+    audio_bit_rate: u32,
+    audio_codec: String,
 }
 
 /// 发送给前端的会话列表事件载荷。
@@ -235,16 +240,26 @@ async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo
     }
 }
 
-/// 读取应用设置（含开机自启动状态）。
+/// 将 daemon 返回的 `response::Settings` 映射为前端结构。
+fn settings_to_info(s: &response::Settings) -> SettingsInfo {
+    SettingsInfo {
+        autostart_enabled: s.autostart_enabled,
+        autostart_supported: s.autostart_supported,
+        video_bit_rate: s.video_bit_rate,
+        video_max_size: s.video_max_size,
+        video_max_fps: s.video_max_fps,
+        audio_bit_rate: s.audio_bit_rate,
+        audio_codec: s.audio_codec.clone(),
+    }
+}
+
+/// 读取应用设置（含开机自启动状态 + scrcpy 编码参数）。
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<SettingsInfo, String> {
     let resp = ipc_request(&state, "settings.get", None).await?;
     check_response(&resp)?;
     match resp.result {
-        Some(response::Payload::Settings(s)) => Ok(SettingsInfo {
-            autostart_enabled: s.autostart_enabled,
-            autostart_supported: s.autostart_supported,
-        }),
+        Some(response::Payload::Settings(s)) => Ok(settings_to_info(&s)),
         _ => Err("daemon 返回了意外的 settings.get 结果".into()),
     }
 }
@@ -256,11 +271,34 @@ async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<Sett
     let resp = ipc_request(&state, "settings.set_autostart", Some(params)).await?;
     check_response(&resp)?;
     match resp.result {
-        Some(response::Payload::Settings(s)) => Ok(SettingsInfo {
-            autostart_enabled: s.autostart_enabled,
-            autostart_supported: s.autostart_supported,
-        }),
+        Some(response::Payload::Settings(s)) => Ok(settings_to_info(&s)),
         _ => Err("daemon 返回了意外的 settings.set_autostart 结果".into()),
+    }
+}
+
+/// 保存 scrcpy 编码参数（只更新提供的字段，其余保持原值）。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn set_scrcpy_params(
+    state: State<'_, AppState>,
+    video_bit_rate: Option<u32>,
+    video_max_size: Option<u32>,
+    video_max_fps: Option<u32>,
+    audio_bit_rate: Option<u32>,
+    audio_codec: Option<String>,
+) -> Result<SettingsInfo, String> {
+    let params = request::Payload::SetScrcpyParams(request::SetScrcpyParams {
+        video_bit_rate,
+        video_max_size,
+        video_max_fps,
+        audio_bit_rate,
+        audio_codec,
+    });
+    let resp = ipc_request(&state, "settings.set_scrcpy_params", Some(params)).await?;
+    check_response(&resp)?;
+    match resp.result {
+        Some(response::Payload::Settings(s)) => Ok(settings_to_info(&s)),
+        _ => Err("daemon 返回了意外的 settings.set_scrcpy_params 结果".into()),
     }
 }
 
@@ -474,6 +512,7 @@ pub fn run() {
             get_adb_devices,
             get_settings,
             set_autostart,
+            set_scrcpy_params,
         ])
         .setup(|app| {
             let h = app.handle().clone();

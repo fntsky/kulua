@@ -22,6 +22,8 @@ pub enum Command {
     Retry(Uuid),
     /// 点击 ADB 列表设备建立 session（无活跃 session 时；failed 墓碑视为可重建）
     StartSession(String),
+    /// scrcpy 编码参数等全局设置变更 → 重启所有设备会话使新参数生效
+    RestartAllSessions,
     UpdateConfig {
         uuid: Uuid,
         clipboard_sync: bool,
@@ -447,6 +449,29 @@ impl Core {
                     self.start_session(device).await;
                 }
             }
+            Command::RestartAllSessions => {
+                // 全局 scrcpy 编码参数变更 → 重启所有会话（含 failed 墓碑，等价重试）使新参数生效。
+                // 注意：必须先收集设备列表再逐个停/启，避免在遍历 devices 时修改它。
+                let devices: Vec<Device> =
+                    self.devices.values().map(|e| e.device.clone()).collect();
+                for device in &devices {
+                    if let Some(mut handle) = self
+                        .devices
+                        .get_mut(&device.uuid)
+                        .and_then(|e| e.session.take())
+                    {
+                        handle.stop(self.adb_cmd.as_ref()).await;
+                    }
+                }
+                println!(
+                    "Restarting {} device sessions after settings change",
+                    devices.len()
+                );
+                // start_session 内部会校验设备状态（仅 Device 状态重建），离线设备自动跳过
+                for device in devices {
+                    self.start_session(device).await;
+                }
+            }
             Command::StartSession(serial) => {
                 // 设备条目缺失（daemon 刚启动、索引未建）→ 按 adb 原始列表补录
                 if !self.devices.values().any(|e| {
@@ -751,6 +776,8 @@ impl Core {
             self.device_name_tx.clone(),
             session_state.clone(),
             audio_latency.clone(),
+            // 全局 scrcpy 编码参数（config 真源，新会话生效）
+            crate::settings::ScrcpyParams::from(&crate::settings::read()),
         );
 
         let task = tokio::spawn(async move { sess.run().await });
@@ -1210,5 +1237,32 @@ mod tests {
             core.devices.values().all(|e| e.session.is_none()),
             "未知设备不得创建 session"
         );
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_sessions_stops_and_rebuilds() {
+        // scrcpy 编码参数变更 → 所有会话重启（停旧 → 用新配置重建）
+        let device = test_device(DeviceState::Device);
+        let mut core = core_with_device(device.clone());
+        let mut stop_rx =
+            inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
+
+        core.on_command(Command::RestartAllSessions).await;
+
+        assert!(stop_rx.try_recv().is_ok(), "旧 session 应收到 stop 信号");
+        let entry = core.devices.get(&device.uuid).unwrap();
+        let handle = entry.session.as_ref().expect("应重建 session");
+        assert_eq!(handle.port, 27183, "应使用新端口部署 session");
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_sessions_no_devices_is_noop() {
+        // 无设备时重启命令不 panic
+        let mut core = core_with_device(test_device(DeviceState::Device));
+        core.devices.clear();
+
+        core.on_command(Command::RestartAllSessions).await;
+
+        assert!(core.devices.is_empty());
     }
 }

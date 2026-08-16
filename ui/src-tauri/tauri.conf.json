@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Sync Workspace",
+  "productName": "Kulua",
   "version": "0.1.0",
-  "identifier": "com.sync-workspace.ui",
+  "identifier": "com.kulua.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Sync Workspace",
+        "title": "Kulua",
         "width": 900,
         "height": 480,
         "minWidth": 900,

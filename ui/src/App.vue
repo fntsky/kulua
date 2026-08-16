@@ -37,26 +37,67 @@ function setTheme(mode: "dark" | "light") {
 const devices = ref<DeviceInfo[]>([]);
 // 当前页面：设备卡片 / ADB 连接 / 设置
 const view = ref<"devices" | "adb" | "settings">("devices");
-// 设置：开机自启动
+// 设置：开机自启动 + scrcpy 编码参数
 interface SettingsState {
   autostartEnabled: boolean;
   autostartSupported: boolean;
+  videoBitRate: number; // bps
+  videoMaxSize: number; // px, 0=不限
+  videoMaxFps: number; // fps, 0=不限
+  audioBitRate: number; // bps
+  audioCodec: string; // opus/aac/flac/raw
 }
+// daemon 返回的原始设置字段（snake_case）
+type SettingsPayload = {
+  autostart_enabled: boolean;
+  autostart_supported: boolean;
+  video_bit_rate: number;
+  video_max_size: number;
+  video_max_fps: number;
+  audio_bit_rate: number;
+  audio_codec: string;
+};
 const settings = ref<SettingsState>({
   autostartEnabled: false,
   autostartSupported: false,
+  videoBitRate: 8000000,
+  videoMaxSize: 0,
+  videoMaxFps: 0,
+  audioBitRate: 128000,
+  audioCodec: "opus",
+});
+// 设置页本地编辑中的 scrcpy 参数（Mbps / kbps 显示单位）
+const scrcpyDraft = ref({
+  videoBitRateMbps: 8,
+  videoMaxSize: 0,
+  videoMaxFps: 0,
+  audioBitRateKbps: 128,
+  audioCodec: "opus",
 });
 // 读取设置失败时的错误文案（不误显示“不支持”）
 const settingsError = ref("");
+function applySettings(s: SettingsPayload) {
+  settings.value = {
+    autostartEnabled: s.autostart_enabled,
+    autostartSupported: s.autostart_supported,
+    videoBitRate: s.video_bit_rate,
+    videoMaxSize: s.video_max_size,
+    videoMaxFps: s.video_max_fps,
+    audioBitRate: s.audio_bit_rate,
+    audioCodec: s.audio_codec,
+  };
+  scrcpyDraft.value = {
+    videoBitRateMbps: s.video_bit_rate / 1_000_000,
+    videoMaxSize: s.video_max_size,
+    videoMaxFps: s.video_max_fps,
+    audioBitRateKbps: s.audio_bit_rate / 1000,
+    audioCodec: s.audio_codec,
+  };
+}
 async function loadSettings() {
   try {
-    const s = await invoke<{ autostart_enabled: boolean; autostart_supported: boolean }>(
-      "get_settings",
-    );
-    settings.value = {
-      autostartEnabled: s.autostart_enabled,
-      autostartSupported: s.autostart_supported,
-    };
+    const s = await invoke<SettingsPayload>("get_settings");
+    applySettings(s);
     settingsError.value = "";
   } catch (e) {
     console.error("get_settings failed:", e);
@@ -66,18 +107,34 @@ async function loadSettings() {
 async function toggleAutostart() {
   const target = !settings.value.autostartEnabled;
   try {
-    const s = await invoke<{ autostart_enabled: boolean; autostart_supported: boolean }>(
-      "set_autostart",
-      { enabled: target },
-    );
-    settings.value = {
-      autostartEnabled: s.autostart_enabled,
-      autostartSupported: s.autostart_supported,
-    };
+    const s = await invoke<SettingsPayload>("set_autostart", { enabled: target });
+    applySettings(s);
     settingsError.value = "";
   } catch (e) {
     console.error("set_autostart failed:", e);
     settingsError.value = `设置自启动失败：${String(e)}`;
+  }
+}
+// 保存 scrcpy 编码参数（0 值 = 不限制 / 用 scrcpy 默认）
+async function saveScrcpyParams() {
+  const d = scrcpyDraft.value;
+  const videoBitRate = Math.max(0, Math.round(d.videoBitRateMbps * 1_000_000));
+  const videoMaxSize = Math.max(0, Math.round(d.videoMaxSize));
+  const videoMaxFps = Math.max(0, Math.round(d.videoMaxFps));
+  const audioBitRate = Math.max(0, Math.round(d.audioBitRateKbps * 1000));
+  try {
+    const s = await invoke<SettingsPayload>("set_scrcpy_params", {
+      videoBitRate,
+      videoMaxSize,
+      videoMaxFps,
+      audioBitRate,
+      audioCodec: d.audioCodec,
+    });
+    applySettings(s);
+    settingsError.value = "";
+  } catch (e) {
+    console.error("set_scrcpy_params failed:", e);
+    settingsError.value = `保存 scrcpy 参数失败：${String(e)}`;
   }
 }
 // adb 原始设备列表（含 Offline/Unauthorized）
@@ -448,6 +505,65 @@ onMounted(async () => {
             </div>
           </div>
         </template>
+        <div class="section">scrcpy 编码</div>
+        <div v-if="!connected" class="hint">正在连接 daemon…</div>
+        <template v-else>
+          <div class="settings-card">
+            <div class="settings-field">
+              <span class="settings-field-label">视频码率 (Mbps)</span>
+              <input
+                class="settings-input"
+                type="number"
+                min="0"
+                step="0.5"
+                v-model.number="scrcpyDraft.videoBitRateMbps"
+              />
+            </div>
+            <div class="settings-field">
+              <span class="settings-field-label">最大分辨率 (px，0=不限)</span>
+              <input
+                class="settings-input"
+                type="number"
+                min="0"
+                step="1"
+                v-model.number="scrcpyDraft.videoMaxSize"
+              />
+            </div>
+            <div class="settings-field">
+              <span class="settings-field-label">最大帧率 (fps，0=不限)</span>
+              <input
+                class="settings-input"
+                type="number"
+                min="0"
+                step="1"
+                v-model.number="scrcpyDraft.videoMaxFps"
+              />
+            </div>
+            <div class="settings-field">
+              <span class="settings-field-label">音频码率 (kbps)</span>
+              <input
+                class="settings-input"
+                type="number"
+                min="0"
+                step="8"
+                v-model.number="scrcpyDraft.audioBitRateKbps"
+              />
+            </div>
+            <div class="settings-field">
+              <span class="settings-field-label">音频编码器</span>
+              <select class="settings-input" v-model="scrcpyDraft.audioCodec">
+                <option value="opus">OPUS（默认）</option>
+                <option value="aac">AAC</option>
+                <option value="flac">FLAC</option>
+                <option value="raw">RAW（PCM）</option>
+              </select>
+            </div>
+            <div class="settings-save-row">
+              <button class="save-btn" @click="saveScrcpyParams">保存</button>
+              <span class="settings-help-inline">0 表示不限制 / 使用 scrcpy 默认值；保存后自动重启所有设备会话</span>
+            </div>
+          </div>
+        </template>
       </div>
       <!-- error -->
       <div v-if="error" class="error">{{ error }}</div>
@@ -690,6 +806,29 @@ body {
   font-size: 12px; color: var(--red); padding: 8px 12px;
   background: var(--error-bg); border-radius: 8px;
 }
+.settings-field {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 12px; color: var(--dim);
+}
+.settings-field-label { user-select: none; }
+.settings-input {
+  width: 110px; padding: 4px 8px;
+  font-size: 12px; color: var(--text);
+  background: var(--toggle-bg); border: 1px solid var(--border);
+  border-radius: 6px; outline: none;
+}
+.settings-input:focus { border-color: var(--green); }
+.settings-save-row {
+  display: flex; align-items: center; gap: 8px;
+  border-top: 1px solid var(--border); padding-top: 10px;
+}
+.save-btn {
+  background: var(--green); color: #fff;
+  border: none; border-radius: 6px;
+  padding: 5px 18px; font-size: 12px; cursor: pointer;
+}
+.save-btn:hover { opacity: 0.85; }
+.settings-help-inline { font-size: 11px; color: var(--dim); }
 .toggle-switch {
   position: relative; width: 36px; height: 20px;
   background: var(--toggle-bg); border-radius: 10px; transition: 0.2s; cursor: pointer;

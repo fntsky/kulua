@@ -20,6 +20,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 opus = "0.3"
 rodio = "0.22"
+symphonia = { version = "0.5", features = ["aac", "flac", "pcm"] }
 
 uuid = { version = "1", features = ["serde", "v4"] }
 serde_json = "1"
