@@ -59,22 +59,24 @@ pub mod keycode {
     pub const KEY_BACKSLASH: u32 = 73;
 }
 
-/// 构建 INJECT_KEYCODE 消息（14 字节）。
-pub fn inject_keycode(action: u8, keycode: u32, repeat: u32, metastate: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; 14];
+/// 构建 INJECT_KEYCODE 消息（18 字节，含 displayId u32be 前缀）。
+pub fn inject_keycode(display_id: u32, action: u8, keycode: u32, repeat: u32, metastate: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 18];
     buf[0] = msg_type::INJECT_KEYCODE;
-    buf[1] = action;
-    buf[2..6].copy_from_slice(&keycode.to_be_bytes());
-    buf[6..10].copy_from_slice(&repeat.to_be_bytes());
-    buf[10..14].copy_from_slice(&metastate.to_be_bytes());
+    buf[1..5].copy_from_slice(&display_id.to_be_bytes());
+    buf[5] = action;
+    buf[6..10].copy_from_slice(&keycode.to_be_bytes());
+    buf[10..14].copy_from_slice(&repeat.to_be_bytes());
+    buf[14..18].copy_from_slice(&metastate.to_be_bytes());
     buf
 }
 
-/// 构建 INJECT_TEXT 消息（1 + 4 + len，UTF-8 文本）。
-pub fn inject_text(text: &str) -> Vec<u8> {
+/// 构建 INJECT_TEXT 消息（5 + 4 + len，UTF-8 文本，含 displayId u32be 前缀）。
+pub fn inject_text(display_id: u32, text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
-    let mut buf = Vec::with_capacity(5 + bytes.len());
+    let mut buf = Vec::with_capacity(9 + bytes.len());
     buf.push(msg_type::INJECT_TEXT);
+    buf.extend_from_slice(&display_id.to_be_bytes());
     buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(bytes);
     buf
@@ -138,9 +140,13 @@ pub fn inject_scroll(
     buf
 }
 
-/// 构建 BACK_OR_SCREEN_ON 消息（2 字节）。
-pub fn back_or_screen_on(action: u8) -> Vec<u8> {
-    vec![msg_type::BACK_OR_SCREEN_ON, action]
+/// 构建 BACK_OR_SCREEN_ON 消息（6 字节，含 displayId u32be 前缀）。
+pub fn back_or_screen_on(display_id: u32, action: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 6];
+    buf[0] = msg_type::BACK_OR_SCREEN_ON;
+    buf[1..5].copy_from_slice(&display_id.to_be_bytes());
+    buf[5] = action;
+    buf
 }
 
 /// 构建 START_APP 消息（5 + len，包名最长 255 字节，含 displayId u32be 前缀）。
@@ -185,21 +191,23 @@ mod tests {
 
     #[test]
     fn keycode_message_layout() {
-        let msg = inject_keycode(key_action::DOWN, keycode::HOME, 0, 0);
-        assert_eq!(msg.len(), 14);
+        let msg = inject_keycode(7, key_action::DOWN, keycode::HOME, 0, 0);
+        assert_eq!(msg.len(), 18);
         assert_eq!(msg[0], msg_type::INJECT_KEYCODE);
-        assert_eq!(msg[1], 0); // down
-        assert_eq!(&msg[2..6], &3u32.to_be_bytes()); // HOME
-        assert_eq!(&msg[6..10], &0u32.to_be_bytes());
+        assert_eq!(&msg[1..5], &7u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(msg[5], 0); // down
+        assert_eq!(&msg[6..10], &3u32.to_be_bytes()); // HOME
         assert_eq!(&msg[10..14], &0u32.to_be_bytes());
+        assert_eq!(&msg[14..18], &0u32.to_be_bytes());
     }
 
     #[test]
     fn text_message_layout() {
-        let msg = inject_text("hello");
+        let msg = inject_text(2, "hello");
         assert_eq!(msg[0], msg_type::INJECT_TEXT);
-        assert_eq!(&msg[1..5], &5u32.to_be_bytes());
-        assert_eq!(&msg[5..], b"hello");
+        assert_eq!(&msg[1..5], &2u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(&msg[5..9], &5u32.to_be_bytes());
+        assert_eq!(&msg[9..], b"hello");
     }
 
     #[test]
@@ -279,8 +287,11 @@ mod tests {
 
     #[test]
     fn back_and_start_app_layout() {
-        let back = back_or_screen_on(key_action::DOWN);
-        assert_eq!(back, vec![msg_type::BACK_OR_SCREEN_ON, 0]);
+        let back = back_or_screen_on(3, key_action::DOWN);
+        assert_eq!(back.len(), 6);
+        assert_eq!(back[0], msg_type::BACK_OR_SCREEN_ON);
+        assert_eq!(&back[1..5], &3u32.to_be_bytes(), "displayId 前缀");
+        assert_eq!(back[5], 0);
 
         let start = start_app(5, "com.android.settings").unwrap();
         assert_eq!(start[0], msg_type::START_APP);

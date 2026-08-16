@@ -107,20 +107,21 @@ pub fn spawn_video_thread(
                 // 进入 length-prefixed 模式，与 Annex-B 媒体帧冲突导致错位）；
                 // 也不能丢弃——部分设备（如 vivo）的 IDR 帧不自带 SPS/PPS，
                 // 丢弃会 'non-existing PPS' 无法解码。
-                if !decoder.is_open() {
-                    let annexb = if crate::decoder::is_annexb(&payload) {
-                        payload
-                    } else {
-                        match crate::decoder::avcc_to_annexb(&payload) {
-                            Some(conv) => conv,
-                            None => {
-                                let _ = tx.send(VideoEvent::Error(
-                                    "config 帧既不是 Annex-B 也无法解析为 avcC".into(),
-                                ));
-                                return;
-                            }
+                let annexb = if crate::decoder::is_annexb(&payload) {
+                    payload
+                } else {
+                    match crate::decoder::avcc_to_annexb(&payload) {
+                        Some(conv) => conv,
+                        None => {
+                            let _ = tx.send(VideoEvent::Error(
+                                "config 帧既不是 Annex-B 也无法解析为 avcC".into(),
+                            ));
+                            return;
                         }
-                    };
+                    }
+                };
+                if !decoder.is_open() {
+                    // 首次：设置 extradata 后打开解码器
                     if let Err(e) = decoder.set_extradata(&annexb) {
                         let _ = tx.send(VideoEvent::Error(format!("设置 extradata 失败: {}", e)));
                         return;
@@ -129,6 +130,15 @@ pub fn spawn_video_thread(
                         let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {}", e)));
                         return;
                     }
+                } else {
+                    // 已打开：resize 后新编码器发出新分辨率 SPS/PPS，必须重置解码器，
+                    // 否则沿用旧分辨率参数解新尺寸流 → 大量 concealing 报错
+                    // （vivo IDR 不带 SPS/PPS，新 config 是唯一的新参数来源）
+                    if let Err(e) = decoder.reset_with_extradata(&annexb) {
+                        let _ = tx.send(VideoEvent::Error(format!("重置解码器失败: {}", e)));
+                        return;
+                    }
+                    println!("[viewer] 解码器已按新分辨率重置");
                 }
                 continue;
             }

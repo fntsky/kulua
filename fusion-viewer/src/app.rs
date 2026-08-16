@@ -12,7 +12,7 @@ use std::sync::mpsc::Receiver;
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -247,7 +247,7 @@ impl ViewerApp {
         if modifiers.super_key() {
             meta |= meta::META_ON;
         }
-        let msg = control::inject_keycode(action, keycode, 0, meta);
+        let msg = control::inject_keycode(self.session.display_id, action, keycode, 0, meta);
         let _ = self.session.send(&msg);
     }
 
@@ -267,7 +267,7 @@ impl ViewerApp {
             if let Some(text) = text {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() && !modifiers.control_key() && !modifiers.alt_key() {
-                    let msg = control::inject_text(trimmed);
+                    let msg = control::inject_text(self.session.display_id, trimmed);
                     let _ = self.session.send(&msg);
                     return;
                 }
@@ -322,6 +322,9 @@ impl ApplicationHandler for ViewerApp {
                 return;
             }
         };
+        // 启用 IME：否则 Windows 输入法（微软拼音等）无法在窗口唤起
+        // （winit 0.30 无 with_ime_allowed 属性，只能创建后设置）
+        window.set_ime_allowed(true);
         let context = Context::new(window.clone());
         let surface = context
             .as_ref()
@@ -394,13 +397,28 @@ impl ApplicationHandler for ViewerApp {
                             ElementState::Pressed => key_action::DOWN,
                             ElementState::Released => key_action::UP,
                         };
-                        let _ = self.session.send(&control::back_or_screen_on(action));
+                        let _ =
+                            self.session.send(&control::back_or_screen_on(self.session.display_id, action));
                     }
                     _ => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.handle_mouse_wheel(delta);
+            }
+            WindowEvent::Ime(ime) => {
+                // 中文输入：IME 提交的文本 → INJECT_TEXT。
+                // 非 ASCII 由 server 内部走剪贴板+PASTE 粘贴注入
+                // （KeyCharacterMap 无法映射中文）。
+                // 注意：IME 启用后字母键也会以 Commit 形式提交，
+                // 与 KeyboardInput 的 text 双通道重复注入——这里只处理
+                // 含非 ASCII 的提交（纯 ASCII 由 KeyboardInput 注入）
+                if let Ime::Commit(text) = ime {
+                    if !text.is_empty() && !text.is_ascii() {
+                        let msg = control::inject_text(self.session.display_id, &text);
+                        let _ = self.session.send(&msg);
+                    }
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // physical_key 可能是未识别的键（PhysicalKey::Unidentified）

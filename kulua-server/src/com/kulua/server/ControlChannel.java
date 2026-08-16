@@ -17,13 +17,13 @@ import java.nio.charset.StandardCharsets;
  * 控制通道：解析 client → server 控制消息并执行。
  *
  * 消息布局沿用 scrcpy v4.0（对照 app/src/control_msg.c）：
- * - 0  INJECT_KEYCODE: action u8, keycode u32be, repeat u32be, metaState u32be
- * - 1  INJECT_TEXT:    len u32be + UTF-8
+ * - 0  INJECT_KEYCODE: displayId u32be, action u8, keycode u32be, repeat u32be, metaState u32be
+ * - 1  INJECT_TEXT:    displayId u32be, len u32be + UTF-8
  * - 2  INJECT_TOUCH:   displayId u32be, action u8, pointerId u64be, x i32be, y i32be,
  *                      w u16be, h u16be, pressure u16fp, actionButton u32be, buttons u32be
  * - 3  INJECT_SCROLL:  displayId u32be, x i32be, y i32be, w u16be, h u16be,
  *                      hScroll i16fp, vScroll i16fp, buttons u32be
- * - 4  BACK_OR_SCREEN_ON: action u8
+ * - 4  BACK_OR_SCREEN_ON: displayId u32be, action u8
  * - 9  SET_CLIPBOARD:  sequence u64be, paste u8, len u32be + UTF-8
  * - 16 START_APP:      displayId u32be, len u8 + package（多显示器扩展）
  * - 21 RESIZE_DISPLAY: displayId u32be, w u16be, h u16be（多显示器扩展）
@@ -146,6 +146,7 @@ public final class ControlChannel {
     }
 
     private void injectKeycode(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int action = input.readUnsignedByte();
         int keyCode = input.readInt();
         int repeat = input.readInt();
@@ -153,10 +154,11 @@ public final class ControlChannel {
         long now = System.currentTimeMillis();
         KeyEvent event = new KeyEvent(now, now, action, keyCode, repeat, metaState,
                 KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD);
-        Device.injectKeyEvent(event);
+        Device.injectKeyEvent(event, displayId);
     }
 
     private void injectText(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int len = input.readInt();
         if (len < 0 || len > 1024 * 1024) {
             Log.w(TAG, "invalid text length: " + len);
@@ -165,7 +167,7 @@ public final class ControlChannel {
         byte[] data = new byte[len];
         input.readFully(data);
         String text = new String(data, StandardCharsets.UTF_8);
-        Device.injectText(text);
+        Device.injectText(text, displayId);
     }
 
     private void injectTouch(DataInputStream input) throws IOException {
@@ -202,10 +204,11 @@ public final class ControlChannel {
     }
 
     private void injectBackOrScreenOn(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int action = input.readUnsignedByte();
         Device.injectKeyEvent(new KeyEvent(System.currentTimeMillis(), System.currentTimeMillis(),
                 action, KeyEvent.KEYCODE_BACK, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0,
-                InputDevice.SOURCE_KEYBOARD));
+                InputDevice.SOURCE_KEYBOARD), displayId);
     }
 
     private void setClipboard(DataInputStream input) throws IOException {
@@ -223,7 +226,11 @@ public final class ControlChannel {
         Log.i(TAG, "set clipboard (" + sequence + ") paste=" + paste + " ok=" + ok);
         Clipboard.broadcastChange(text);
         if (paste) {
-            Device.injectText(text);
+            // 粘贴到哪个显示器？SET_CLIPBOARD 无 displayId 字段，粘贴目标
+            // 用 displayManager 的"最近注入"显示器不可靠；scrcpy 官方粘贴到
+            // 主屏。这里简单起见粘贴到实体屏（0），viewer 的中文输入走
+            // INJECT_TEXT（内部剪贴板+PASTE 注入带 displayId），不依赖本分支。
+            Device.injectText(text, 0);
         }
     }
 

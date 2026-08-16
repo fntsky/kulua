@@ -12,8 +12,7 @@ import android.view.MotionEvent;
 /**
  * 设备操作：输入注入与应用启动（shell 权限，app_process 下可用）。
  *
- * 注：触摸注入使用 displayId=0（实体屏）；多显示器场景的 display 映射在
- * 阶段 2 完善（位置事件按 position.screenSize 匹配显示器）。
+ * 所有注入均带 displayId：0=实体屏，>0=虚拟显示器（setDisplayId 隐藏 API）。
  */
 public final class Device {
 
@@ -39,8 +38,8 @@ public final class Device {
         }
     }
 
-    public static boolean injectKeyEvent(KeyEvent event) {
-        return injectEvent(event, 0);
+    public static boolean injectKeyEvent(KeyEvent event, int displayId) {
+        return injectEvent(event, displayId);
     }
 
     public static boolean injectTouch(int displayId, int action, long pointerId, int x, int y,
@@ -82,24 +81,58 @@ public final class Device {
         return injectEvent(event, displayId);
     }
 
-    /** 文本注入：按字符映射为 key event（KeyCharacterMap.getKeyEvents，公开 API）。 */
-    public static boolean injectText(String text) {
-        boolean ok = true;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            // getEvents 是实例方法；getKeyEvents(char) 是隐藏 API
-            @SuppressWarnings("deprecation")
-            KeyEvent[] events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
-                    .getEvents(new char[]{c});
-            if (events == null || events.length == 0) {
-                Log.w(TAG, "cannot map char: " + c);
-                continue;
+    /**
+     * 文本注入到指定显示器。
+     *
+     * - 全 ASCII：按字符映射为 key event（KeyCharacterMap.getKeyEvents）逐字符注入
+     * - 含非 ASCII（中文等）：KeyCharacterMap 无法映射 → 写入系统剪贴板后注入
+     *   KEYCODE_PASTE 粘贴（scrcpy 客户端同款方案；需输入框有焦点）
+     */
+    public static boolean injectText(String text, int displayId) {
+        if (isAscii(text)) {
+            boolean ok = true;
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                @SuppressWarnings("deprecation")
+                KeyEvent[] events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
+                        .getEvents(new char[]{c});
+                if (events == null || events.length == 0) {
+                    Log.w(TAG, "cannot map char: " + c);
+                    continue;
+                }
+                for (KeyEvent event : events) {
+                    ok &= injectEvent(event, displayId);
+                }
             }
-            for (KeyEvent event : events) {
-                ok &= injectEvent(event, 0);
+            return ok;
+        }
+
+        // 非 ASCII：剪贴板 + 粘贴
+        if (!Clipboard.set(text)) {
+            Log.w(TAG, "clipboard set failed for paste");
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        KeyEvent paste = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
+                KeyEvent.KEYCODE_PASTE, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0,
+                InputDevice.SOURCE_KEYBOARD);
+        boolean down = injectEvent(paste, displayId);
+        KeyEvent pasteUp = new KeyEvent(now, now, KeyEvent.ACTION_UP,
+                KeyEvent.KEYCODE_PASTE, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0,
+                InputDevice.SOURCE_KEYBOARD);
+        boolean up = injectEvent(pasteUp, displayId);
+        Log.i(TAG, "paste non-ascii text (" + text.length() + " chars) down=" + down
+                + " up=" + up);
+        return down && up;
+    }
+
+    private static boolean isAscii(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) > 0x7F) {
+                return false;
             }
         }
-        return ok;
+        return true;
     }
 
     private static boolean injectEvent(InputEvent event, int displayId) {

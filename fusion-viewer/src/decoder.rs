@@ -136,6 +136,9 @@ impl VideoDecoder {
     }
 
     /// 解码一帧（`keyframe` 标记关键帧）。
+    ///
+    /// 解码错误（坏帧/瞬时异常）不返回 Err：flush 后继续，避免 resize 重置
+    /// 后的首个坏帧把整个视频线程杀掉（表现为"视频流已结束"）。
     pub fn decode(
         &mut self,
         data: &[u8],
@@ -151,7 +154,9 @@ impl VideoDecoder {
             let send_ret = avcodec_send_packet(self.codec_ctx, self.packet);
             av_packet_unref(self.packet);
             if send_ret < 0 {
-                return Err(format!("avcodec_send_packet 失败: {}", err_str(send_ret)));
+                // 坏帧：flush 解码器内部状态后继续（AVERROR_INVALIDDATA 等）
+                avcodec_flush_buffers(self.codec_ctx);
+                return Ok(None);
             }
 
             let recv_ret = avcodec_receive_frame(self.codec_ctx, self.frame);
@@ -160,7 +165,9 @@ impl VideoDecoder {
                 return Ok(None);
             }
             if recv_ret < 0 {
-                return Err(format!("avcodec_receive_frame 失败: {}", err_str(recv_ret)));
+                // 解码错误（如 SPS/PPS 缺失的坏帧）：flush 后继续
+                avcodec_flush_buffers(self.codec_ctx);
+                return Ok(None);
             }
 
             // 硬件帧（D3D11 纹理）：先转回系统内存（NV12）再拷贝平面；
@@ -188,6 +195,35 @@ impl VideoDecoder {
     /// 解码器是否已打开。
     pub fn is_open(&self) -> bool {
         self.opened
+    }
+
+    /// 已打开时用新 extradata 重新初始化解码器（resize 后调用）。
+    ///
+    /// 为什么需要：弹性显示器 resize 后 server 重启编码器，新 codec 发出
+    /// 新分辨率 SPS/PPS（config 帧）。vivo 等设备的 IDR 帧不带 SPS/PPS，
+    /// 若忽略新 config 帧，解码器继续用旧分辨率参数解新尺寸的流 → 大量
+    /// "concealing DC/AC/MV errors"。做法：释放旧 context（含 hw ctx）→
+    /// 按原 codec 重新分配 → 设置新 extradata → 重新 open。
+    pub fn reset_with_extradata(&mut self, data: &[u8]) -> Result<(), String> {
+        unsafe {
+            let codec_id = (*self.codec_ctx).codec_id;
+            avcodec_free_context(&mut self.codec_ctx.clone());
+            self.codec_ctx = std::ptr::null_mut();
+            self.hw_device_ctx = std::ptr::null_mut(); // 由旧 ctx 释放，重新创建
+
+            let codec = avcodec_find_decoder(codec_id);
+            if codec.is_null() {
+                return Err("reset: 找不到 codec".into());
+            }
+            let codec_ctx = avcodec_alloc_context3(codec);
+            if codec_ctx.is_null() {
+                return Err("reset: avcodec_alloc_context3 失败".into());
+            }
+            self.codec_ctx = codec_ctx;
+            self.opened = false;
+        }
+        self.set_extradata(data)?;
+        self.open()
     }
 }
 
