@@ -12,12 +12,23 @@ $ErrorActionPreference = "Stop"
 Write-Host "===== Kulua Build =====" -ForegroundColor Cyan
 
 # ── 1. daemon ──
-Write-Host "`n[1/2] Building daemon..." -ForegroundColor Yellow
+Write-Host "`n[1/4] Building daemon..." -ForegroundColor Yellow
 cargo build --package daemon $targetFlag
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-# ── 2. UI ──
-Write-Host "`n[2/2] Building UI (exe, no installer)..." -ForegroundColor Yellow
+# ── 2. fusion-viewer（自研融合窗口客户端） ──
+# 必须用干净 PATH（msys2/mingw64 会污染 ffmpeg-sys-next 的 C 头文件探测），
+# 统一走 scripts/build-viewer.cmd
+Write-Host "`n[2/4] Building fusion-viewer..." -ForegroundColor Yellow
+if (-not (Test-Path "scripts/build-viewer.cmd")) {
+    Write-Host "  WARNING: scripts/build-viewer.cmd not found, skipping fusion-viewer build" -ForegroundColor Yellow
+} else {
+    cmd /c "scripts\build-viewer.cmd build -p fusion-viewer $targetFlag"
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+}
+
+# ── 3. UI ──
+Write-Host "`n[3/4] Building UI (exe, no installer)..." -ForegroundColor Yellow
 Push-Location ui
 npm install --silent
 if ($Release) {
@@ -32,9 +43,11 @@ Pop-Location
 # ── 3. 打包发布文件夹 ──
 if ($Release) {
     $dist = "dist/kulua"
-    Write-Host "`n[3/3] Packaging release to $dist ..." -ForegroundColor Yellow
+    Write-Host "`n[4/4] Packaging release to $dist ..." -ForegroundColor Yellow
 
+    # 清理旧打包残留（如早期版本的官方 scrcpy-server jar），避免混淆
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
+    Get-ChildItem $dist -File -ErrorAction SilentlyContinue | Remove-Item -Force
 
     # ── daemon ──
     Copy-Item "target/release/daemon.exe" "$dist/" -ErrorAction SilentlyContinue

@@ -23,6 +23,12 @@ fn find_jar() -> Option<String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // 发布包布局：daemon.exe 与 kulua-server.jar 同级（dist/kulua/）
+            let sibling = dir.join("kulua-server.jar");
+            if sibling.exists() {
+                return Some(sibling.to_string_lossy().to_string());
+            }
+            // 调试布局：daemon.exe 在 target/debug/，jar 在项目根
             let p = dir.join("../../kulua-server.jar");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
