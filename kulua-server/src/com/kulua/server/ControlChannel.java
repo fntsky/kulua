@@ -19,13 +19,14 @@ import java.nio.charset.StandardCharsets;
  * 消息布局沿用 scrcpy v4.0（对照 app/src/control_msg.c）：
  * - 0  INJECT_KEYCODE: action u8, keycode u32be, repeat u32be, metaState u32be
  * - 1  INJECT_TEXT:    len u32be + UTF-8
- * - 2  INJECT_TOUCH:   action u8, pointerId u64be, x i32be, y i32be,
+ * - 2  INJECT_TOUCH:   displayId u32be, action u8, pointerId u64be, x i32be, y i32be,
  *                      w u16be, h u16be, pressure u16fp, actionButton u32be, buttons u32be
- * - 3  INJECT_SCROLL:  x i32be, y i32be, w u16be, h u16be, hScroll i16fp, vScroll i16fp, buttons u32be
+ * - 3  INJECT_SCROLL:  displayId u32be, x i32be, y i32be, w u16be, h u16be,
+ *                      hScroll i16fp, vScroll i16fp, buttons u32be
  * - 4  BACK_OR_SCREEN_ON: action u8
  * - 9  SET_CLIPBOARD:  sequence u64be, paste u8, len u32be + UTF-8
  * - 16 START_APP:      len u8 + package
- * - 21 RESIZE_DISPLAY: w u16be, h u16be
+ * - 21 RESIZE_DISPLAY: displayId u32be, w u16be, h u16be（多显示器扩展）
  * - 100 CREATE_DISPLAY: w u16be, h u16be, dpi u16be（扩展，阶段 2 生效）
  * - 101 DESTROY_DISPLAY: displayId u32be（扩展，阶段 2 生效）
  */
@@ -46,9 +47,9 @@ public final class ControlChannel {
     private static final int TYPE_DESTROY_DISPLAY = 101;
 
     private final LocalSocket socket;
-    private final DisplayManager displayManager;
+    private final DisplayRegistry displayManager;
 
-    public ControlChannel(LocalSocket socket, DisplayManager displayManager) {
+    public ControlChannel(LocalSocket socket, DisplayRegistry displayManager) {
         this.socket = socket;
         this.displayManager = displayManager;
     }
@@ -132,6 +133,7 @@ public final class ControlChannel {
     }
 
     private void injectTouch(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int action = input.readUnsignedByte();
         long pointerId = input.readLong();
         int x = input.readInt();
@@ -143,11 +145,13 @@ public final class ControlChannel {
         int buttons = input.readInt();
         // u16 定点压力（0..0xFFFF）→ float 0..1
         float pressureFloat = pressure / 65535.0f;
-        Device.injectTouch(action, pointerId, x, y, screenWidth, screenHeight,
+        int systemDisplayId = displayManager.systemDisplayId(displayId);
+        Device.injectTouch(systemDisplayId, action, pointerId, x, y, screenWidth, screenHeight,
                 pressureFloat, actionButton, buttons);
     }
 
     private void injectScroll(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int x = input.readInt();
         int y = input.readInt();
         int screenWidth = input.readUnsignedShort();
@@ -157,7 +161,8 @@ public final class ControlChannel {
         int buttons = input.readInt();
         float hScroll = hScrollRaw / 32768.0f * 16.0f;
         float vScroll = vScrollRaw / 32768.0f * 16.0f;
-        Device.injectScroll(x, y, screenWidth, screenHeight, hScroll, vScroll, buttons);
+        int systemDisplayId = displayManager.systemDisplayId(displayId);
+        Device.injectScroll(systemDisplayId, x, y, screenWidth, screenHeight, hScroll, vScroll, buttons);
     }
 
     private void injectBackOrScreenOn(DataInputStream input) throws IOException {
@@ -194,24 +199,25 @@ public final class ControlChannel {
     }
 
     private void resizeDisplay(DataInputStream input) throws IOException {
+        int displayId = input.readInt();
         int width = input.readUnsignedShort();
         int height = input.readUnsignedShort();
-        // 阶段 2：找到对应显示器并 resize；当前无显示器可调整，仅记录
-        Log.i(TAG, "resize display to " + width + "x" + height + " (TODO: 阶段 2)");
+        DisplayRegistry.DisplayEntry entry = displayManager.get(displayId);
+        if (entry != null && entry.encoder != null) {
+            Log.i(TAG, "resize display #" + displayId + " to " + width + "x" + height);
+            entry.encoder.resize(width, height);
+        } else {
+            Log.w(TAG, "resize unknown display #" + displayId);
+        }
     }
 
     private void createDisplay(DataInputStream input) throws IOException {
         int width = input.readUnsignedShort();
         int height = input.readUnsignedShort();
         int dpi = input.readUnsignedShort();
-        int displayId = displayManager.allocateDisplayId();
-        Log.i(TAG, "create display #" + displayId + " " + width + "x" + height + "@" + dpi
-                + " (TODO: 阶段 2 连接虚拟显示器)");
-        // 回复 DISPLAY_CREATED（阶段 2 携带真实 VirtualDisplay id）
-        sendControlEvent(TYPE_CREATE_DISPLAY, new byte[]{
-                (byte) (displayId >>> 24), (byte) (displayId >>> 16),
-                (byte) (displayId >>> 8), (byte) displayId,
-        });
+        // video 连接自带创建参数（6B），控制通道的 CREATE_DISPLAY 仅登记尺寸
+        Log.i(TAG, "create display request " + width + "x" + height + "@" + dpi
+                + " (由 video 连接实际创建)");
     }
 
     private void destroyDisplay(DataInputStream input) throws IOException {

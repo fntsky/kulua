@@ -40,10 +40,10 @@ public final class Device {
     }
 
     public static boolean injectKeyEvent(KeyEvent event) {
-        return injectEvent(event);
+        return injectEvent(event, 0);
     }
 
-    public static boolean injectTouch(int action, long pointerId, int x, int y,
+    public static boolean injectTouch(int displayId, int action, long pointerId, int x, int y,
                                       int screenWidth, int screenHeight, float pressure,
                                       int actionButton, int buttons) {
         long now = System.currentTimeMillis();
@@ -60,11 +60,11 @@ public final class Device {
         MotionEvent event = MotionEvent.obtain(now, now, action, 1,
                 properties, coords, 0, actionButton | buttons,
                 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
-        return injectEvent(event);
+        return injectEvent(event, displayId);
     }
 
-    public static boolean injectScroll(int x, int y, int screenWidth, int screenHeight,
-                                       float hScroll, float vScroll, int buttons) {
+    public static boolean injectScroll(int displayId, int x, int y, int screenWidth,
+                                       int screenHeight, float hScroll, float vScroll, int buttons) {
         long now = System.currentTimeMillis();
         MotionEvent.PointerProperties[] properties = {
                 new MotionEvent.PointerProperties(),
@@ -79,7 +79,7 @@ public final class Device {
         MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_SCROLL, 1,
                 properties, coords, 0, buttons,
                 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
-        return injectEvent(event);
+        return injectEvent(event, displayId);
     }
 
     /** 文本注入：按字符映射为 key event（KeyCharacterMap.getKeyEvents，公开 API）。 */
@@ -96,13 +96,23 @@ public final class Device {
                 continue;
             }
             for (KeyEvent event : events) {
-                ok &= injectEvent(event);
+                ok &= injectEvent(event, 0);
             }
         }
         return ok;
     }
 
-    private static boolean injectEvent(InputEvent event) {
+    private static boolean injectEvent(InputEvent event, int displayId) {
+        // 隐藏 API InputEvent.setDisplayId(int)：注入到指定虚拟显示器
+        if (displayId != 0) {
+            try {
+                java.lang.reflect.Method method = InputEvent.class.getMethod("setDisplayId", int.class);
+                method.invoke(event, displayId);
+            } catch (Exception e) {
+                Log.e(TAG, "setDisplayId failed", e);
+                return false;
+            }
+        }
         // INJECT_INPUT_EVENT_MODE_ASYNC 是隐藏常量，值为 0
         boolean ok = injectInputEvent(event, 0);
         if (!ok) {

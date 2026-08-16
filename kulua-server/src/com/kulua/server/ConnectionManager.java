@@ -4,6 +4,7 @@ import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.util.Log;
 
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -13,7 +14,9 @@ import java.io.InputStream;
  * 握手协议：每个连接第一个字节声明类型
  * - 0x01 control：控制通道（剪贴板 / 输入注入 / START_APP / 显示器管理）
  * - 0x02 audio：音频流（阶段 3 实现）
- * - 0x03 video：视频流，连接驱动显示器创建（阶段 2 实现）
+ * - 0x03 video：视频流，连接驱动显示器创建：
+ *   连接后先读 6 字节创建请求（width u16be, height u16be, dpi u16be），
+ *   然后 server 创建 VirtualDisplay + 编码器并向该 socket 推流
  */
 public final class ConnectionManager {
 
@@ -24,11 +27,11 @@ public final class ConnectionManager {
     private static final String TAG = "kulua-server";
 
     private final Options options;
-    private final DisplayManager displayManager;
+    private final DisplayRegistry displayManager;
 
     public ConnectionManager(Options options) {
         this.options = options;
-        this.displayManager = new DisplayManager();
+        this.displayManager = new DisplayRegistry();
     }
 
     public void loop() throws IOException {
@@ -57,7 +60,8 @@ public final class ConnectionManager {
                         Log.i(TAG, "audio connection (TODO: 阶段 3)");
                         break;
                     case TYPE_VIDEO:
-                        Log.i(TAG, "video connection (TODO: 阶段 2)");
+                        Log.i(TAG, "video connection");
+                        handleVideoConnection(socket);
                         break;
                     default:
                         Log.w(TAG, "unknown connection type: " + type);
@@ -73,5 +77,37 @@ public final class ConnectionManager {
                 }
             }
         }).start();
+    }
+
+    /**
+     * 视频连接：读 6B 创建请求 → 创建虚拟显示器 + 编码器 → 推流直到断开。
+     * 连接断开时销毁对应显示器。
+     */
+    private void handleVideoConnection(LocalSocket socket) throws IOException {
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        int width = input.readUnsignedShort();
+        int height = input.readUnsignedShort();
+        int dpi = input.readUnsignedShort();
+        Log.i(TAG, "create video stream " + width + "x" + height + "@" + dpi);
+
+        DisplayRegistry.DisplayEntry entry = displayManager.create(width, height, dpi);
+        DisplayEncoder encoder = new DisplayEncoder(entry.id, socket, displayManager,
+                width, height, dpi);
+        displayManager.attachEncoder(entry.id, encoder);
+        try {
+            encoder.start();
+            // 推流直到连接断开（编码循环退出后 socket 关闭）
+            // 编码循环结束条件：socket 写失败（客户端断开）
+            // 等待编码循环结束：通过轮询 socket 输入（对端关闭时读返回 -1）
+            while (true) {
+                int b = input.read();
+                if (b < 0) {
+                    break;
+                }
+            }
+        } finally {
+            Log.i(TAG, "video connection closed, destroy display #" + entry.id);
+            displayManager.destroy(entry.id);
+        }
     }
 }
