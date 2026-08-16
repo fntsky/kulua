@@ -1,6 +1,6 @@
 //! 命令行参数解析（纯函数，便于单测）。
 //!
-//! 用法：`fusion-viewer.exe --connect <port> --package <pkg> [--label <名称>] [--display <WxH/DPI>]`
+//! 用法：`fusion-viewer.exe --connect <port> --package <pkg> [--label <名称>] [--display <WxH/DPI>] [--scale <系数>]`
 //!
 //! 连接模式：viewer 不部署 server，而是连接 daemon session 已启动的
 //! kulua-server（`adb forward tcp:<port>` 由 session 建立），通过
@@ -17,6 +17,9 @@ pub struct Args {
     pub label: String,
     /// 初始虚拟显示器尺寸，如 `1280x960/160`（缺省用默认值）
     pub display: String,
+    /// 虚拟显示器分辨率相对窗口物理尺寸的缩放系数
+    /// （如 1.0 = 与窗口一致，0.5 = 窗口的一半；缺省 1.0）
+    pub scale: f32,
 }
 
 impl Args {
@@ -33,6 +36,13 @@ impl Args {
 /// 默认虚拟显示器尺寸/DPI（与 scrcpy `-x` 模式默认一致）。
 pub const DEFAULT_DISPLAY: &str = "1280x960/160";
 
+/// 默认缩放系数：视频分辨率 = 窗口物理尺寸 × 1.0。
+pub const DEFAULT_SCALE: f32 = 1.0;
+
+/// 缩放系数允许范围。
+pub const SCALE_MIN: f32 = 0.1;
+pub const SCALE_MAX: f32 = 4.0;
+
 /// 解析命令行参数。
 ///
 /// 支持 `--key value` 与 `--key=value` 两种形式；未知参数报错。
@@ -41,6 +51,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
     let mut package = None;
     let mut label = String::new();
     let mut display = DEFAULT_DISPLAY.to_string();
+    let mut scale = DEFAULT_SCALE;
 
     let mut iter = iter.into_iter();
     while let Some(arg) = iter.next() {
@@ -66,6 +77,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
             "--package" => package = Some(value()?),
             "--label" => label = value()?,
             "--display" => display = value()?,
+            "--scale" => {
+                let v = value()?;
+                let s: f32 = v.parse().map_err(|_| format!("非法缩放系数: {}", v))?;
+                if !(SCALE_MIN..=SCALE_MAX).contains(&s) {
+                    return Err(format!(
+                        "缩放系数 {} 超出范围 [{}, {}]",
+                        s, SCALE_MIN, SCALE_MAX
+                    ));
+                }
+                scale = s;
+            }
             other => return Err(format!("未知参数: {}", other)),
         }
     }
@@ -78,6 +100,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         package,
         label,
         display,
+        scale,
     })
 }
 
@@ -100,12 +123,15 @@ mod tests {
             "设置",
             "--display",
             "1024x768/160",
+            "--scale",
+            "0.5",
         ]))
         .unwrap();
         assert_eq!(a.port, 27183);
         assert_eq!(a.package, "com.android.settings");
         assert_eq!(a.label, "设置");
         assert_eq!(a.display, "1024x768/160");
+        assert_eq!(a.scale, 0.5);
     }
 
     #[test]
@@ -124,6 +150,27 @@ mod tests {
         let a = parse_args(args(&["--connect", "27183", "--package", "pkg"])).unwrap();
         assert_eq!(a.label, "");
         assert_eq!(a.display, DEFAULT_DISPLAY);
+        assert_eq!(a.scale, DEFAULT_SCALE);
+    }
+
+    #[test]
+    fn supports_scale_equals_form() {
+        let a = parse_args(args(&[
+            "--connect=27183",
+            "--package=pkg",
+            "--scale=2.0",
+        ]))
+        .unwrap();
+        assert_eq!(a.scale, 2.0);
+    }
+
+    #[test]
+    fn invalid_scale_is_error() {
+        // 非数字
+        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "abc"])).is_err());
+        // 超出范围
+        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "0"])).is_err());
+        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "10"])).is_err());
     }
 
     #[test]

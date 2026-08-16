@@ -329,13 +329,20 @@ impl ViewerApp {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let w = size.width.min(u16::MAX as u32) as u16;
-        let h = size.height.min(u16::MAX as u32) as u16;
-        if (w as u32, h as u32) == self.last_sent_size {
+        // 虚拟显示器分辨率 = 窗口物理尺寸 × 缩放系数（--scale）。
+        // 为什么乘以系数：窗口尺寸就是用户看到的画面大小，但把虚拟显示器
+        // 分辨率设成与窗口完全一致可能超出 MediaCodec 编码能力上限或带宽
+        // 预算，系数 <1 时以更低分辨率编码、由 FFmpeg 放大到窗口，画质
+        // 略降但流畅度与带宽更可控；>1 则超采样更清晰。
+        let w = ((size.width as f32 * self.args.scale).round() as u32)
+            .clamp(1, u16::MAX as u32);
+        let h = ((size.height as f32 * self.args.scale).round() as u32)
+            .clamp(1, u16::MAX as u32);
+        if (w, h) == self.last_sent_size {
             return; // 尺寸未变，不发
         }
-        self.last_sent_size = (w as u32, h as u32);
-        let _ = self.session.resize_display(w, h);
+        self.last_sent_size = (w, h);
+        let _ = self.session.resize_display(w as u16, h as u16);
     }
 }
 

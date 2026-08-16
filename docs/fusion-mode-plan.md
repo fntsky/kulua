@@ -22,6 +22,11 @@
 > - `list_apps=true` 一次性模式输出格式与官方一致，apps.rs 解析器复用
 > - daemon session 部署 `kulua-server.jar`（参数仅 `scid=<hex>`），viewer 用
 >   `--connect <port>` 连接 session 的 forward 端口，不再自部署 server
+>
+> ⚠️ **变更（2026-08-16）**：虚拟显示器分辨率跟随窗口物理尺寸（每秒轮询窗口尺寸
+> 发 RESIZE_DISPLAY，替代不稳定的 Resized 事件），并新增 `--scale <系数>` 参数
+> （默认 1.0，范围 0.1~4.0）：视频分辨率 = 窗口物理尺寸 × 系数，
+> 系数 <1 降低编码分辨率换流畅度/带宽，>1 超采样更清晰。
 
 ---
 
