@@ -243,10 +243,12 @@ fn connect_video_with_dummy(port: u16) -> Result<TcpStream, String> {
 /// 生成按 scid 前缀精准 kill 的 shell 脚本（只杀 viewer 家族的残留 server）。
 ///
 /// 匹配参数含 `scid=4b4d`（viewer scid 前缀）的进程；跳过 `$$` 防止 shell 自杀；
+/// `[ -r ]` 预检避免 PID 竞争时 shell 打印 "can't open /proc/.../cmdline" 噪音；
 /// 以 `true` 结尾保证 exit 0。不碰 Kulua session（`4b4c` 前缀）与官方 scrcpy（随机 scid）。
 fn build_stale_kill_script() -> String {
     "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
      [ \"$p\" = \"$$\" ] && continue; \
+     [ -r /proc/$p/cmdline ] || continue; \
      if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid=4b4d' 2>/dev/null; then \
      kill -9 \"$p\" 2>/dev/null; fi; done; true"
         .to_string()
@@ -257,6 +259,7 @@ fn build_scid_kill_script(scid_hex: &str) -> String {
     format!(
         "for p in $(ls /proc | grep -E '^[0-9]+$'); do \
          [ \"$p\" = \"$$\" ] && continue; \
+         [ -r /proc/$p/cmdline ] || continue; \
          if tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'scid={}' 2>/dev/null; then \
          kill -9 \"$p\" 2>/dev/null; fi; done; true",
         scid_hex
