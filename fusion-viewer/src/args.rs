@@ -70,10 +70,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         match key {
             "--connect" => {
                 let v = value()?;
-                addr = Some(
-                    v.parse()
-                        .map_err(|_| format!("非法地址（应为 ip:port）: {}", v))?,
-                );
+                addr = Some(v.parse().map_err(|_| {
+                    // 裸端口 = 旧版 daemon 行为（只传给端口）；新版要求 ip:port 直连
+                    if v.parse::<u16>().is_ok() {
+                        format!(
+                            "--connect 只收到端口 {v}（旧版 daemon）：请重新编译并重启 daemon，\
+                             新版应传 'ip:port' 直连地址"
+                        )
+                    } else {
+                        format!("非法地址（应为 ip:port）: {v}")
+                    }
+                })?);
             }
             "--package" => package = Some(value()?),
             "--label" => label = value()?,
