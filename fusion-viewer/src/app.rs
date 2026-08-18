@@ -65,6 +65,8 @@ pub struct ViewerApp {
     last_sent_size: (u32, u32),
     /// 最近一帧（渲染用）
     latest_frame: Option<DecodedFrame>,
+    /// viewer 启动时刻（用于打印首帧耗时，诊断"应用启动很久"）
+    started_at: Instant,
 
     // 输入状态
     mouse_down: bool,
@@ -89,6 +91,7 @@ impl ViewerApp {
             stable_ticks: 0,
             last_sent_size: (0, 0), // (0,0) 保证首次轮询必然发送
             latest_frame: None,
+            started_at: Instant::now(),
             mouse_down: false,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
@@ -101,6 +104,14 @@ impl ViewerApp {
         while let Ok(event) = self.video_rx.try_recv() {
             match event {
                 VideoEvent::Frame(frame) => {
+                    // 首帧计时：诊断"应用启动很久"——区分 viewer/连接耗时、
+                    // am 子进程耗时与应用自身冷启动耗时（对照 server 日志）
+                    if self.latest_frame.is_none() {
+                        println!(
+                            "[viewer] 首帧到达（自 viewer 启动 {:.1}s）",
+                            self.started_at.elapsed().as_secs_f32()
+                        );
+                    }
                     // START_APP 已在连接后由 main 发送（displayId 握手时即返回，
                     // 空显示器无帧，等首帧会死锁）
                     self.latest_frame = Some(frame);

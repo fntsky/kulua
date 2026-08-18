@@ -171,9 +171,27 @@ public final class Device {
                 command.add(String.valueOf(displayId));
             }
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-            process.waitFor();
-            Log.i(TAG, "start app " + packageName + " on display " + displayId
-                    + " exit=" + process.exitValue());
+            // 为什么异步等待：`am start` 每次都要冷启动一个 app_process 虚拟机
+            // （实测 1~3s），同步 waitFor 会阻塞本 control 连接的消息处理线程，
+            // 期间输入注入等消息全部排队（应用已开始启动但控制通道被卡住）。
+            // 改为后台线程等待退出并记录结果；输出也要 drain，避免 am 写满
+            // 管道缓冲而自己阻塞。
+            new Thread(() -> {
+                try {
+                    byte[] buf = new byte[1024];
+                    // 读完剩余输出后 am 自然退出
+                    while (process.getInputStream().read(buf) != -1) {
+                        // discard
+                    }
+                    int exit = process.waitFor();
+                    Log.i(TAG, "start app " + packageName + " on display " + displayId
+                            + " exit=" + exit);
+                } catch (IOException e) {
+                    Log.w(TAG, "start app stream: " + packageName, e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "am-start-" + packageName).start();
         } catch (Exception e) {
             Log.e(TAG, "start app failed: " + packageName, e);
         }
