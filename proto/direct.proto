@@ -1,0 +1,201 @@
+// Kulua direct UDP 协议 —— 唯一事实来源。
+//
+// kulua-server（phone）↔ daemon / fusion-viewer（PC）直接通信的线协议。
+// 每个 UDP datagram 恰好是一个 Frame（protobuf 二进制），datagram 边界即消息边界。
+// 用 protoc 生成 Java（--java_out=lite），用 prost-build 生成 Rust。
+//
+// 可靠性与分片语义见 docs/direct-udp-protocol.md。
+
+syntax = "proto3";
+
+package kulua.direct;
+
+// 数据报外层：流 + 类型 + 序号 + 分片信息 + 负载。
+message Frame {
+  // 逻辑流（对应原「连接类型」握手字节在一条 UDP 端口上的多路复用）。
+  enum Stream {
+    CTRL = 0;   // 控制流（可靠、有序、双向）
+    AUDIO = 1;  // 音频流（phone → PC，尽力而为）
+    VIDEO = 2;  // 视频流（phone → PC managed by viewer，尽力而为）
+  }
+
+  // 帧类型。DATA 为业务负载（control 或 media 分片）；其余为连接/控制面。
+  enum Type {
+    DATA = 0;
+    ACK = 1;        // control 累积确认（不回 seq，天然抗丢）
+    HELLO = 2;      // PC → phone：打开会话（携带 scid）
+    HELLO_ACK = 3;  // phone → PC：回执（携带 codec 状态）
+    HEARTBEAT = 4;  // PC → phone 保活（也用于 NAT 映射保鲜）
+    BYE = 5;        // 关闭会话
+  }
+
+  Stream stream = 1;
+  Type type = 2;
+  // 每流单调递增发送序号：control 用于 ACK/去重/窗口滑动，media 用于排序与去重。
+  uint32 seq = 3;
+  // 分片归属：同一消息的所有分片共享一个 msg_id（配合 frag/frag_total 重装）。
+  uint32 msg_id = 4;
+  // 分片索引（0 起）；单包完整消息 = 0。
+  uint32 frag = 5;
+  // 总分片数（0 表示单包完整；DATA 分片消息中首片给出真实总数）。
+  uint32 frag_total = 6;
+
+  // ↓ 以下字段仅在 media DATA 的首分片（frag == 0）有效，后续分片忽略。
+  // PTS（微秒）。config/keyframe 标志沿用 scrcpy 帧头语义。
+  uint64 media_pts = 7;
+  uint32 media_flags = 8; // bit0=config, bit1=keyframe, bit2=session(预留)
+
+  oneof payload {
+    // 负载字节：control DATA（可靠流，重装后为 CtrlMsg）或 media 分片（audio/video）。
+    bytes data = 10;
+    // ACK：确认到该序号（含）。
+    uint32 ack_seq = 12;
+    Hello hello = 13;
+    HelloAck hello_ack = 14;
+  }
+}
+
+// 会话打开请求（PC → phone）。scid 用于会话隔离（与 kill_by_scid 对齐）。
+message Hello {
+  string scid = 1; // 8 位小写 hex（如 "4b4c6a2f"），须与 phone 自身一致
+  bool audio = 2;  // 请求音频流（daemon=true；fusion-viewer=false）
+}
+
+// 会话打开回执（phone → PC）。
+message HelloAck {
+  string scid = 1;            // 回显
+  uint32 audio_codec = 2;     // 音频 codec id（0=禁用 / 4B ASCII id，如 "opus"）
+  uint32 video_codec = 3;     // 视频 codec id（"h264"）；未创建显示器时可不填
+}
+
+// 所有 control 命令 / 服务器事件（可靠 DATA 的负载）。
+message CtrlMsg {
+  oneof msg {
+    // ── PC → phone：输入注入 / 剪贴板 / 显示器管理 ──
+    InjectKeycode inject_keycode = 1;
+    InjectText inject_text = 2;
+    InjectTouch inject_touch = 3;
+    InjectScroll inject_scroll = 4;
+    BackOrScreenOn back_or_screen_on = 5;
+    SetClipboard set_clipboard = 6;
+    StartApp start_app = 7;
+    ResizeDisplay resize_display = 8;
+    CreateDisplay create_display = 9;
+    DestroyDisplay destroy_display = 10;
+
+    // ── PC → phone：配置 ──
+    SetAudioCodec set_audio_codec = 30; // 音频编码热切换（不重建会话）
+
+    // ── phone → PC：剪贴板 / 确认 / 握手结果 ──
+    ClipboardChanged clipboard_changed = 21;
+    AckClipboard ack_clipboard = 22;
+    MediaConfig media_config = 23;     // 音频/视频 config 帧（可靠投递）
+    AudioReady audio_ready = 24;       // 音频就绪（首连 / codec 热切换后回执）
+    DisplayReady display_ready = 25;   // 视频显示器创建结果
+  }
+}
+
+message SetAudioCodec {
+  uint32 codec = 1; // 0=raw 1=opus 2=aac 3=flac（与 session proto 的索引一致）
+}
+
+// 音频/视频 config 帧（AAC AudioSpecificConfig / FLAC STREAMINFO / H.264 SPS+PPS）。
+// 走可靠 control 流，确保解码器可在首帧前初始化。
+message MediaConfig {
+  uint32 stream = 1; // Frame.Stream 值（AUDIO=1 / VIDEO=2）
+  bytes data = 2;    // config 原始字节（同原 12B 帧头 bit62 携带的内容）
+}
+
+// 音频就绪（server → PC）：HELLO_ACK 已带初始 codec_id；
+// 这里用于 SetAudioCodec 热切换后的再次回执。
+message AudioReady {
+  uint32 codec_id = 1; // 4B ASCII codec id（0=禁用）
+}
+
+message InjectKeycode {
+  uint32 display_id = 1; // 0 = 实体屏，>0 = 虚拟显示器（server 内部 id）
+  uint32 action = 2;     // KeyEvent.ACTION_DOWN/UP
+  uint32 keycode = 3;    // android.view.KeyEvent.KEYCODE_*
+  uint32 repeat = 4;
+  uint32 meta_state = 5; // KeyEvent.getMetaState()
+}
+
+message InjectText {
+  uint32 display_id = 1;
+  string text = 2;       // UTF-8
+}
+
+message InjectTouch {
+  uint32 display_id = 1;
+  uint32 action = 2;                // MotionEvent.ACTION_*
+  uint64 pointer_id = 3;            // scrcpy 约定：u64::MAX = 鼠标
+  sint32 x = 4;                     // 设备物理像素坐标
+  sint32 y = 5;
+  uint32 screen_width = 6;          // 当前视频分辨率（压力归一化用）
+  uint32 screen_height = 7;
+  float pressure = 8;               // 0.0 ~ 1.0（原 u16 定点换算为 float）
+  uint32 action_button = 9;
+  uint32 buttons = 10;
+}
+
+message InjectScroll {
+  uint32 display_id = 1;
+  sint32 x = 2;
+  sint32 y = 3;
+  uint32 screen_width = 4;
+  uint32 screen_height = 5;
+  float hscroll = 6;               // 滚动量（像素），-16..16
+  float vscroll = 7;
+  uint32 buttons = 8;
+}
+
+message BackOrScreenOn {
+  uint32 display_id = 1;
+  uint32 action = 2;
+}
+
+message SetClipboard {
+  uint64 sequence = 1;
+  bool paste = 2;
+  string text = 3;
+}
+
+message StartApp {
+  uint32 display_id = 1;
+  string package = 2;
+}
+
+message ResizeDisplay {
+  uint32 display_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+}
+
+message CreateDisplay {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 dpi = 3;
+}
+
+message DestroyDisplay {
+  uint32 display_id = 1;
+}
+
+// ── phone → PC ──
+
+message ClipboardChanged {
+  string text = 1;
+}
+
+message AckClipboard {
+  uint64 sequence = 1;
+}
+
+// 视频显示器创建完成（server → PC viewer）。
+message DisplayReady {
+  uint32 display_id = 1;   // server 内部显示器 id（注入/RESIZE/START_APP 用）
+  uint32 codec_id = 2;     // 4B ASCII（"h264"）
+  uint32 width = 3;        // 实际创建尺寸
+  uint32 height = 4;
+  uint32 dpi = 5;
+}

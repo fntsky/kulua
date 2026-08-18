@@ -1,0 +1,12 @@
+[package]
+name = "kulua-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Kulua direct UDP 协议：protobuf 生成 + 传输层（分片/ACK/重传/多流）"
+
+[dependencies]
+prost = { version = "0.13", features = ["derive"] }
+tokio = { version = "1.52", features = ["net", "time", "sync", "rt", "macros", "io-util", "rt-multi-thread"] }
+
+[build-dependencies]
+prost-build = "0.13"
