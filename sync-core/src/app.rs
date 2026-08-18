@@ -2,7 +2,9 @@ use crate::adb_cmd::{AdbCmd, AdbOps};
 use crate::ipc::types::SessionSummary;
 use crate::notification::{self, NotifInfo};
 use crate::session;
-use crate::session::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_RUNNING, SESSION_STATE_STOPPED};
+use crate::session::{
+    SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_RUNNING, SESSION_STATE_STOPPED,
+};
 use crate::types::{Device, DeviceAddrKind, DeviceIdentity, DeviceState};
 use crate::wireless_pair;
 use std::collections::{HashMap, VecDeque};
@@ -717,8 +719,8 @@ impl Core {
             return Err(format!("非法包名: {}", package_name));
         }
 
-        // viewer 不再自行部署 server：必须通过 session 的 ADB forward 端口连接
-        // 已部署的 kulua-server（单进程多显示器架构）。session 未运行则无法连接。
+        // viewer 连接模式：必须通过 session 已部署的 kulua-server（UDP 直连端口）
+        // 连接。session 未运行则无法连接。
         let port = self
             .devices
             .get(&uuid)
@@ -726,6 +728,10 @@ impl Core {
             .filter(|s| s.state() == crate::session::SESSION_STATE_RUNNING)
             .map(|s| s.port)
             .ok_or_else(|| "设备会话未运行，请先开启会话".to_string())?;
+
+        // 直连地址 = phone 的 Wi-Fi IP:port（无 adb forward）。USB 且无 IP 时失败。
+        let addr = crate::scrcpy::resolve_device_ip(self.adb_cmd.as_ref(), &device.serial, port)
+            .ok_or_else(|| "无法解析设备直连地址：请通过 Wi-Fi 连接设备".to_string())?;
 
         // 虚拟显示器是 Android 10+（API 29）能力，先校验再拉起，避免窗口秒退
         let sdk = self
@@ -757,7 +763,7 @@ impl Core {
             .map(|a| a.label.clone())
             .unwrap_or_default();
         self.fusion
-            .open_window(device.serial.clone(), package_name, label, port)
+            .open_window(device.serial.clone(), package_name, label, addr)
     }
 
     fn on_notification(&mut self, notif: NotifInfo) {
@@ -1471,7 +1477,13 @@ mod tests {
 
         // 把假 handle 的 restart 通道换成可观察的
         {
-            let handle = core.devices.get_mut(&device.uuid).unwrap().session.as_mut().unwrap();
+            let handle = core
+                .devices
+                .get_mut(&device.uuid)
+                .unwrap()
+                .session
+                .as_mut()
+                .unwrap();
             handle.audio_restart_tx = restart_tx;
         }
 

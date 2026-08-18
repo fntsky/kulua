@@ -119,13 +119,7 @@ impl Handle {
             crate::scrcpy::kill_by_scid(adb, &self.device.serial, self.port);
         }
 
-        // (4) 清理 ADB 转发
-        let _ = adb.run(&[
-            "-s",
-            &self.device.serial,
-            "forward",
-            "--remove",
-            &format!("tcp:{}", self.port),
-        ]);
+        // (4) session 主循环退出时会自己 server.stop()（kill_by_scid）收尾；
+        //     此处兜底：若 task 已结束不再需要。本版无 adb forward，无需移除转发。
     }
 }

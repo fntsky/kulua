@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use prost::Message;
 
-use crate::codec::{decode_ctrl, encode_ctrl, AssembledMedia, MediaReassembler};
-use crate::generated::{ctrl_msg, frame, CtrlMsg, Frame, Hello, HelloAck};
+use crate::codec::{AssembledMedia, MediaReassembler, decode_ctrl, encode_ctrl};
+use crate::generated::{CtrlMsg, Frame, Hello, HelloAck, ctrl_msg, frame};
 use crate::reliable::{ReliableReceiver, ReliableSender};
 
 /// 会话事件。
@@ -74,7 +74,9 @@ impl UdpSession {
         socket
             .set_read_timeout(Some(Duration::from_millis(200)))
             .ok();
-        socket.connect(peer).map_err(|e| format!("connect {peer}: {e}"))?;
+        socket
+            .connect(peer)
+            .map_err(|e| format!("connect {peer}: {e}"))?;
 
         let (ev_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let closed = Arc::new(AtomicBool::new(false));
@@ -145,12 +147,7 @@ impl UdpSession {
                             match maybe {
                                 Ok(frame) => {
                                     for evt in Self::dispatch(
-                                        &frame,
-                                        &state,
-                                        &ctrl_tx,
-                                        &ctrl_rx,
-                                        &audio_rx,
-                                        &video_rx,
+                                        &frame, &state, &ctrl_tx, &ctrl_rx, &audio_rx, &video_rx,
                                     ) {
                                         let _ = ev_tx.send(evt);
                                     }
@@ -162,6 +159,15 @@ impl UdpSession {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                        // 连接式 UDP：对端未绑定端口（server 尚在冷启动）时会收到
+                        // ICMP 端口不可达 → Windows 上表现为 ConnectionReset /
+                        // ConnectionRefused。这在 HELLO 握手重试期是正常的，忽略。
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::ConnectionReset
+                                || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+                        {
+                            continue;
+                        }
                         Err(e) => {
                             if !closed.load(Ordering::SeqCst) {
                                 let _ = ev_tx.send(Event::Error(format!("udp recv: {e}")));
@@ -311,7 +317,9 @@ impl UdpSession {
     /// 发送 HEARTBEAT（保活；phone 把任意 datagram 都视为存活）。
     pub fn send_heartbeat(&self) -> Result<(), String> {
         let wire = encode_heartbeat().map_err(|e| e)?;
-        self.socket.send(&wire).map_err(|e| format!("udp send: {e}"))?;
+        self.socket
+            .send(&wire)
+            .map_err(|e| format!("udp send: {e}"))?;
         Ok(())
     }
 

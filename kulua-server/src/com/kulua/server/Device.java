@@ -9,6 +9,8 @@ import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 
+import java.io.IOException;
+
 /**
  * 设备操作：输入注入与应用启动（shell 权限，app_process 下可用）。
  *

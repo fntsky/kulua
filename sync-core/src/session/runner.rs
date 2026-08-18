@@ -1,85 +1,79 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot};
+
+use kulua_proto::codec::AssembledMedia;
+use kulua_proto::generated::{HelloAck, ctrl_msg};
+use kulua_proto::session::{Event, UdpSession};
 
 use crate::adb_cmd::AdbOps;
+use crate::audio_player::AUDIO_BUFFER_MAX_MS;
 use crate::notification::{self, NotifInfo};
 use crate::scrcpy;
 use crate::types::Device;
 
 use super::handle::{SESSION_STATE_CONNECTING, SESSION_STATE_FAILED, SESSION_STATE_RUNNING};
-use super::proto::{audio_codec_name, build_clipboard_frame, read_device_message};
-use crate::audio_player::AUDIO_BUFFER_MAX_MS;
+use super::proto::audio_codec_name;
 
-/// 连接类型握手字节（与 kulua-server ConnectionManager 一致）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionType {
-    Control = 0x01,
-    Audio = 0x02,
-}
-
-/// 剪贴板主循环的退出原因。
-enum ClipboardExit {
-    /// 编码热切换：外层重建 audio 连接（session 不重启）
-    RestartAudio,
-    /// session 停止
+/// 剪贴板主循环退出原因。
+enum SessionExit {
     Stop,
 }
 
-/// 单个设备的完整 session。
+/// 音频任务输入事件。
+enum AudioEvent {
+    /// 音频编码切换（HelloAck 初始 codec / SetAudioCodec 后的 AudioReady）。
+    Codec(u32),
+    /// AAC AudioSpecificConfig / FLAC STREAMINFO（可靠 MediaConfig）。
+    Config(Vec<u8>),
+    /// 一帧编码音频。
+    Frame(AssembledMedia),
+}
+
+/// 单个设备的完整 session（UDP 直连版）。
 ///
-/// 包含部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 通知轮询 + 音频播放的完整生命周期。
-/// 配置选项（`clipboard_enabled` / `notification_enabled` / `audio_enabled`）是共享原子标志，
-/// Core 可通过 Handle 随时调整。音频切换需要重启 session（redeploy scrcpy）。
+/// 部署 kulua-server（phone 绑定网络 UDP 端口）→ 局域网直连（IP:port）→
+/// 双向剪贴板 I/O + 通知轮询 + 音频播放（复用 same UDP 会话的多路流）。
 pub struct Session {
     adb: Arc<dyn AdbOps>,
     device: Device,
     jar_path: String,
     port: u16,
-    clip_sub: broadcast::Receiver<String>,
-    phone_clip_tx: mpsc::Sender<String>,
-    notif_tx: mpsc::Sender<NotifInfo>,
-    stop_rx: Option<oneshot::Receiver<()>>,
+    clip_sub: tokio::sync::broadcast::Receiver<String>,
+    phone_clip_tx: tokio::sync::mpsc::Sender<String>,
+    notif_tx: tokio::sync::mpsc::Sender<NotifInfo>,
+    stop_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     clipboard_enabled: Arc<AtomicBool>,
     notification_enabled: Arc<AtomicBool>,
     audio_enabled: Arc<AtomicBool>,
-    /// 音量百分比（0-100）
     volume: Arc<AtomicU16>,
-    /// session 生命周期状态（与 Handle 共享，阶段边界写入）
     session_state: Arc<AtomicU8>,
-    /// 音频缓冲延迟（ms），audio_task 写，Core 读推 UI
     audio_latency: Arc<AtomicU64>,
-    /// 当前音频编码器（握手索引：0=raw 1=opus 2=aac 3=flac）。
-    /// Core 修改后发 restart 信号，session 重连 audio 即热切换编码（不重启 session）
     audio_codec: Arc<AtomicU8>,
-    /// Core → session 的音频重启信号（编码变更时触发，重连 audio 连接）
-    audio_restart_rx: Option<mpsc::Receiver<()>>,
-    device_name_tx: Option<mpsc::Sender<(String, String)>>,
-    /// scrcpy 编码参数（部署 server 时使用，配置变更后新会话生效）
+    audio_restart_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    device_name_tx: Option<tokio::sync::mpsc::Sender<(String, String)>>,
     scrcpy_params: crate::settings::ScrcpyParams,
 }
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         adb: Arc<dyn AdbOps>,
         device: Device,
         jar_path: String,
         port: u16,
-        clip_sub: broadcast::Receiver<String>,
-        phone_clip_tx: mpsc::Sender<String>,
-        notif_tx: mpsc::Sender<NotifInfo>,
-        stop_rx: oneshot::Receiver<()>,
+        clip_sub: tokio::sync::broadcast::Receiver<String>,
+        phone_clip_tx: tokio::sync::mpsc::Sender<String>,
+        notif_tx: tokio::sync::mpsc::Sender<NotifInfo>,
+        stop_rx: tokio::sync::oneshot::Receiver<()>,
         clipboard_enabled: Arc<AtomicBool>,
         notification_enabled: Arc<AtomicBool>,
         audio_enabled: Arc<AtomicBool>,
         volume: Arc<AtomicU16>,
-        device_name_tx: mpsc::Sender<(String, String)>,
+        device_name_tx: tokio::sync::mpsc::Sender<(String, String)>,
         session_state: Arc<AtomicU8>,
         audio_latency: Arc<AtomicU64>,
         audio_codec: Arc<AtomicU8>,
-        audio_restart_rx: mpsc::Receiver<()>,
+        audio_restart_rx: tokio::sync::mpsc::Receiver<()>,
         scrcpy_params: crate::settings::ScrcpyParams,
     ) -> Self {
         session_state.store(SESSION_STATE_CONNECTING, Ordering::SeqCst);
@@ -105,11 +99,11 @@ impl Session {
         }
     }
 
-    /// 运行 session 主循环：部署 scrcpy → TCP 连接 → 双向剪贴板 I/O + 音频帧 + 通知轮询。
+    /// 运行 session 主循环：部署 kulua-server → UDP 直连 → 双向剪贴板 + 音频。
     pub async fn run(&mut self) {
-        // 启动计时（debug 诊断）：`KULUA_TIMING=1` 时打印每阶段耗时，
-        // 用于定位 session 启动慢的瓶颈（部署 / 设备名 / 连接握手）
-        let timing = std::env::var("KULUA_TIMING").map(|v| v == "1").unwrap_or(false);
+        let timing = std::env::var("KULUA_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let t0 = std::time::Instant::now();
         let mark = |label: &str| {
             if timing {
@@ -118,10 +112,11 @@ impl Session {
         };
 
         let mut stop_rx = self.stop_rx.take().expect("run can only be called once");
-        let port = self.port;
         let audio_enabled = self.audio_enabled.load(Ordering::SeqCst);
+        let port = self.port;
+        let serial = self.device.serial.clone();
 
-        // 1. 部署 scrcpy-server（带音频开关 + 编码参数）
+        // 1. 部署 kulua-server（phone 绑定网络 UDP 端口）
         let adb = self.adb.clone();
         let device = self.device.clone();
         let jar_path = self.jar_path.clone();
@@ -132,18 +127,16 @@ impl Session {
                 &device,
                 &jar_path,
                 port,
-                audio_enabled,
                 scrcpy_params,
             )
         })
         .await;
-        mark("deploy（adb push/forward/spawn）");
+        mark("deploy（adb push/spawn app_process）");
 
         let mut server = match server {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 eprintln!("scrcpy deploy failed for {}: {:?}", self.device.serial, e);
-                // 判死：不再降级 notification-only（见 docs/session-state-design.md）
                 self.session_state
                     .store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 return;
@@ -155,363 +148,97 @@ impl Session {
                 return;
             }
         };
-        println!(
-            "kulua-server alive on {} (port {}, audio={})",
-            self.device.serial, self.port, audio_enabled
-        );
+        println!("kulua-server launching on {} (udp port={})", serial, port);
 
-        // 设备名：kulua-server 不发送设备元数据（官方 send_device_meta 已废弃），
-        // 改用 `getprop ro.product.model` 获取（一次 shell 往返，仅当 name 为空时）
+        // 2. 设备名（无 adb forward 后 server 不再发元数据；getprop 获取）
         if self.device.name.is_empty() {
             let adb = self.adb.clone();
-            let serial = self.device.serial.clone();
             let serial_for_closure = serial.clone();
             let tx = self.device_name_tx.take();
             if tx.is_some() {
                 let result = tokio::task::spawn_blocking(move || {
-                    adb.run(&["-s", &serial_for_closure, "shell", "getprop", "ro.product.model"])
+                    adb.run(&[
+                        "-s",
+                        &serial_for_closure,
+                        "shell",
+                        "getprop",
+                        "ro.product.model",
+                    ])
                 })
                 .await;
                 if let Ok(Ok(output)) = result {
                     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !name.is_empty() {
                         println!("Device name: {} ({})", name, serial);
-                        let _ = tx.unwrap().send((serial, name)).await;
+                        let _ = tx.unwrap().send((serial.clone(), name)).await;
                     }
                 }
             }
         }
         mark("设备名 getprop");
 
-        if !audio_enabled {
-            // 音频未启用：单连接 control-only
-            self.run_control_only(&mut server, stop_rx).await;
-            println!("Session {} cleaned up", self.device.serial);
-            return;
-        }
-
-        // ── 音频启用：双连接架构（audio 可热重连，编码切换不重启 session）──
-
-        // 先连 control socket（顺序无关，server 每连接独立线程）
-        let (control_stream, _) = self
-            .connect_socket(port, &mut server, &mut stop_rx, ConnectionType::Control, None)
-            .await;
-        let Some(control_stream) = control_stream else {
-            return;
-        };
-        // 控制通道禁用 Nagle（官方默认行为）
-        let _ = control_stream.set_nodelay(true);
-        mark("control 连接（含重试）");
-
-        // 启动通知轮询
-        let notif_stop = Arc::new(AtomicBool::new(false));
-        notification::spawn_notification_poller_tokio(
-            self.adb.clone(),
-            self.device.clone(),
-            self.notif_tx.clone(),
-            notif_stop.clone(),
-            self.notification_enabled.clone(),
-        );
-
-        let (mut control_reader, mut control_writer) = tokio::io::split(control_stream);
-
-        // audio 可重连循环：编码热切换（Core 发 restart 信号）或 audio 连接断开时
-        // 重建 audio 连接（带当前 codec 握手字节），control/剪贴板/通知不受影响。
-        // run_clipboard_io 同时监听 restart 信号，返回 Restart 指示外层重建。
-        let mut audio_restart_rx = self.audio_restart_rx.take().expect("restart rx");
-        let audio_codec = self.audio_codec.clone();
-        let mut audio_task: Option<tokio::task::JoinHandle<()>> = None;
-        loop {
-            // 重建 audio 连接（codec 索引来自共享原子，Core 热更新后重连即用新编码）
-            let codec_byte = audio_codec.load(Ordering::SeqCst);
-            let (audio_stream, audio_codec_id) = self
-                .connect_socket(
-                    port,
-                    &mut server,
-                    &mut stop_rx,
-                    ConnectionType::Audio,
-                    Some(codec_byte),
-                )
-                .await;
-            let Some(audio_stream) = audio_stream else {
-                break; // 连接失败（stop 或判死）
-            };
-            // 启用 TCP_NODELAY 及时检测断连
-            let _ = audio_stream.set_nodelay(true);
-            mark("audio 连接 + codec id");
-
-            // connect_socket 已读 codec ID（Audio 连接首 4 字节）
-            let Some(codec_id) = audio_codec_id else {
-                break;
-            };
-            if codec_id == 0 {
-                println!("Audio stream disabled by device, continuing without audio");
-                break;
-            } else if codec_id == 1 {
-                eprintln!("Audio stream configuration error on {}", self.device.serial);
-                break;
-            } else {
-                println!(
-                    "Audio codec: {} (0x{:08x}) from {}",
-                    audio_codec_name(codec_id),
-                    codec_id,
-                    self.device.serial
-                );
-            }
-
-            // 握手完成（双 socket + 设备名 + codec header）→ running
-            // （首次进入时置位；audio 重连循环内重复置位无害）
-            self.session_state
-                .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
-
-            // 启动当前连接的音频读取任务（abort 旧任务释放旧连接）
-            if let Some(prev) = audio_task.take() {
-                prev.abort();
-            }
-            audio_task = Some(spawn_audio_task(
-                audio_stream,
-                codec_id,
-                self.device.serial.clone(),
-                self.volume.clone(),
-                self.audio_latency.clone(),
-            ));
-            mark("audio 读取任务已启动");
-
-            // 双向剪贴板 I/O：内部监听 stop / audio-restart 信号
-            match self
-                .run_clipboard_io(
-                    &mut control_reader,
-                    &mut control_writer,
-                    &mut stop_rx,
-                    &mut audio_restart_rx,
-                    self.device.serial.clone(),
-                )
-                .await
-            {
-                ClipboardExit::RestartAudio => {
-                    println!(
-                        "[{}] audio restart requested (codec hot-swap), reconnecting",
-                        self.device.serial
-                    );
-                    continue; // 重建 audio 连接
-                }
-                ClipboardExit::Stop => break,
-            }
-        }
-        // 清理 audio 任务
-        if let Some(task) = audio_task {
-            task.abort();
-        }
-
-        // 8. 清理（模仿官方关闭流程）
-        //    退出后 control_reader/writer 已释放 → control socket 关闭
-        //    → server 侧 ControlChannel.recv() 收到 IOException
-
-        // (a) 停通知轮询
-        notif_stop.store(true, Ordering::SeqCst);
-
-        // (b) 1s 看门狗：给 server 时间检测 socket 断开 → 走 Java finally → 进程退出
-        let mut exited = server.try_wait();
-        if exited.is_none() {
-            // 等 1s，每 100ms 检查一次
-            for _ in 0..10 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                exited = server.try_wait();
-                if exited.is_some() {
-                    break;
-                }
-            }
-        }
-
-        // (c) 看门狗超时 → force kill（同官方 watchdog 超时后 kill(SIGKILL)）
-        if exited.is_none() {
-            eprintln!(
-                "server {} did not exit after socket shutdown, force killing",
-                self.device.serial
-            );
-            server.stop(self.adb.as_ref());
-        }
-
-        println!("Session {} cleaned up", self.device.serial);
-    }
-
-    /// 连接到 kulua-server ADB forward 端口，完成类型握手 + 就绪验证。
-    ///
-    /// 流程：连接 → 写类型字节（0x01=control / 0x02=audio）→ audio 再写 1B
-    /// codec 索引（0=raw 1=opus 2=aac 3=flac，热切换编码用）→
-    /// 读就绪数据（control 读 1B 就绪字节；audio 读 4B codec id）。
-    ///
-    /// 为什么必须读验证：adb forward 的 TCP 连接在 server 冷启动（app_process
-    /// 1~3s）期间可能短暂成功——数据只进 adb 缓冲，server 尚未 accept；若只看
-    /// 写成功就返回，后续读会失败且无法重试。读就绪数据失败 → drop 重试整个流程。
-    ///
-    /// 返回 (stream, codec_id)：audio 连接 codec_id = Some(读到的 4B)，
-    /// control 连接为 None。
-    async fn connect_socket(
-        &self,
-        port: u16,
-        server: &mut scrcpy::ScrcpyServer,
-        stop_rx: &mut oneshot::Receiver<()>,
-        conn_type: ConnectionType,
-        audio_codec_byte: Option<u8>,
-    ) -> (Option<TcpStream>, Option<u32>) {
-        // 最多重试 20 次（500ms 间隔 = 10s），超时判死写 failed（docs/session-state-design.md §3.3）
-        let mut attempts: u8 = 0;
-        loop {
-            match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-                Ok(mut s) => {
-                    // 写握手字节（audio 连接附 codec 索引：热切换编码不重启 session）
-                    let handshake: &[u8] = match audio_codec_byte {
-                        Some(codec_byte) => &[conn_type as u8, codec_byte],
-                        None => &[conn_type as u8],
-                    };
-                    let write_result = tokio::select! {
-                        _ = &mut *stop_rx => {
-                            server.stop(self.adb.as_ref());
-                            return (None, None);
-                        }
-                        r = s.write_all(handshake) => r,
-                    };
-                    if write_result.is_err() {
-                        drop(s);
-                    } else {
-                        // 读就绪验证（control 1B / audio 4B codec id）
-                        let read_result = tokio::select! {
-                            _ = &mut *stop_rx => {
-                                server.stop(self.adb.as_ref());
-                                return (None, None);
-                            }
-                            r = async {
-                                match conn_type {
-                                    ConnectionType::Control => {
-                                        let mut buf = [0u8; 1];
-                                        s.read_exact(&mut buf).await.map(|_| None)
-                                    }
-                                    ConnectionType::Audio => {
-                                        let mut buf = [0u8; 4];
-                                        s.read_exact(&mut buf).await
-                                            .map(|_| Some(u32::from_be_bytes(buf)))
-                                    }
-                                }
-                            } => r,
-                        };
-                        match read_result {
-                            Ok(codec_id) => return (Some(s), codec_id),
-                            Err(_) => drop(s), // server 未就绪，重试
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-            attempts += 1;
-            if attempts >= 20 {
+        // 3. 解析 phone 直连地址（serial IP 优先，USB 走 ip route）
+        let addr_string = match scrcpy::resolve_device_ip(self.adb.as_ref(), &serial, port) {
+            Some(a) => a,
+            None => {
                 eprintln!(
-                    "[{}] connect timeout after {} attempts (10s), giving up",
-                    self.device.serial, attempts
+                    "[{}] 无法解析设备 UDP 直连地址（需要 Wi-Fi；serial/IP 均无），判死",
+                    serial
                 );
                 self.session_state
                     .store(SESSION_STATE_FAILED, Ordering::SeqCst);
                 server.stop(self.adb.as_ref());
-                return (None, None);
+                return;
             }
-            // 连接失败或握手/验证失败，等 500ms 或 stop 信号
-            tokio::select! {
-                _ = &mut *stop_rx => {
-                    server.stop(self.adb.as_ref());
-                    return (None, None);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            }
-        }
-    }
-
-    /// 控制通道的剪贴板双向 I/O。
-    ///
-    /// 同时监听 `audio_restart_rx`：编码热切换时 Core 发重启信号，
-    /// 返回 `ClipboardExit::RestartAudio` 让外层重建 audio 连接
-    /// （session/control/剪贴板不重启）。
-    async fn run_clipboard_io(
-        &mut self,
-        control_reader: &mut (impl AsyncReadExt + Unpin),
-        control_writer: &mut (impl AsyncWriteExt + Unpin),
-        stop_rx: &mut oneshot::Receiver<()>,
-        audio_restart_rx: &mut mpsc::Receiver<()>,
-        serial: String,
-    ) -> ClipboardExit {
-        eprintln!("[{}] run_clipboard_io ENTER", serial);
-        let clipboard_enabled = self.clipboard_enabled.clone();
-        let phone_clip_tx = self.phone_clip_tx.clone();
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut *stop_rx => {
-                    eprintln!("[{}] BREAK: stop_rx fired", serial);
-                    return ClipboardExit::Stop;
-                }
-                _ = audio_restart_rx.recv() => {
-                    eprintln!("[{}] BREAK: audio restart signal", serial);
-                    return ClipboardExit::RestartAudio;
-                }
-                result = self.clip_sub.recv() => {
-                    match result {
-                        Ok(text) if clipboard_enabled.load(Ordering::SeqCst) => {
-                            let msg = build_clipboard_frame(&text);
-                            if control_writer.write_all(&msg).await.is_err() {
-                                eprintln!("[{}] BREAK: write_all error", serial);
-                                return ClipboardExit::Stop;
-                            }
-                        }
-                        Ok(_) => {
-                            eprintln!("[{}] clip_sub.recv Ok(_) clipboard disabled, continue", serial);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            eprintln!("[{}] BREAK: clip_sub Closed", serial);
-                            return ClipboardExit::Stop;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            eprintln!("[{}] clip_sub lagged by {}", serial, n);
-                        }
-                    }
-                }
-                result = read_device_message(control_reader) => {
-                    match result {
-                        Ok(Some(text)) => {
-                            if clipboard_enabled.load(Ordering::SeqCst) {
-                                println!("Phone clipboard from {}: {}", serial, text);
-                                if phone_clip_tx.send(text).await.is_err() {
-                                    eprintln!("[{}] BREAK: phone_clip_tx send error", serial);
-                                    return ClipboardExit::Stop;
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(()) => {
-                            eprintln!("[{}] BREAK: read_device_message error", serial);
-                            return ClipboardExit::Stop;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// 音频未启用时：单连接 control-only
-    async fn run_control_only(
-        &mut self,
-        server: &mut scrcpy::ScrcpyServer,
-        mut stop_rx: oneshot::Receiver<()>,
-    ) {
-        // 只需要 1 个 socket（control）
-        let (stream, _) = self
-            .connect_socket(self.port, server, &mut stop_rx, ConnectionType::Control, None)
-            .await;
-        let Some(stream) = stream else {
-            return;
         };
-        // 握手成功（control 类型字节已发送）→ running
-        self.session_state
-            .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+        let peer: std::net::SocketAddr = match addr_string.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[{}] 非法直连地址 {addr_string}: {e}", serial);
+                self.session_state
+                    .store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                server.stop(self.adb.as_ref());
+                return;
+            }
+        };
+        let scid = scrcpy::scid_hex(port);
+
+        // 4. UDP 握手（含冷启动重试，同旧 TCP 重试语义）
+        let want_audio = audio_enabled;
+        let peer2 = peer;
+        let scid2 = scid.clone();
+        let udp =
+            tokio::task::spawn_blocking(move || UdpSession::connect(peer2, &scid2, want_audio))
+                .await;
+        let mut udp = match udp {
+            Ok(Ok(s)) => s,
+            _ => {
+                eprintln!("[{}] UDP 直连 {peer} 失败（握手超时）", serial);
+                self.session_state
+                    .store(SESSION_STATE_FAILED, Ordering::SeqCst);
+                server.stop(self.adb.as_ref());
+                return;
+            }
+        };
+        mark("UDP 握手（HELLO/HELLO_ACK）");
+        println!("[{}] UDP 直连已就绪 @ {peer}", serial);
+
+        // HELLO_ACK 携带初始 codec 状态
+        let hello_ack: HelloAck = udp.hello_ack().unwrap_or_default();
+        let initial_codec_id = hello_ack.audio_codec;
+        if want_audio {
+            if initial_codec_id == 0 {
+                println!("Audio stream disabled by device, continuing without audio");
+            } else {
+                println!(
+                    "Audio codec: {} (0x{:08x}) from {}",
+                    audio_codec_name(initial_codec_id),
+                    initial_codec_id,
+                    serial
+                );
+            }
+        }
+        mark("codec 初始信息");
 
         // 启动通知轮询
         let notif_stop = Arc::new(AtomicBool::new(false));
@@ -522,145 +249,224 @@ impl Session {
             notif_stop.clone(),
             self.notification_enabled.clone(),
         );
-        let (mut control_reader, mut control_writer) = tokio::io::split(stream);
-        // control-only 无音频，restart 信号不会到来（mpsc 无人发送，select 永不触发）
-        let (_restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
-        self.run_clipboard_io(
-            &mut control_reader,
-            &mut control_writer,
-            &mut stop_rx,
-            &mut restart_rx,
-            self.device.serial.clone(),
-        )
-        .await;
 
+        // 主循环：control（可靠双向）+ audio（尽力而为）+ 心跳 + 音频热切换
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<AudioEvent>(64);
+        let audio_task = spawn_audio_task(
+            audio_rx,
+            serial.clone(),
+            self.volume.clone(),
+            self.audio_latency.clone(),
+        );
+        if want_audio && initial_codec_id != 0 {
+            let _ = audio_tx.send(AudioEvent::Codec(initial_codec_id)).await;
+        }
+
+        // 握手全部完成 → running
+        self.session_state
+            .store(SESSION_STATE_RUNNING, Ordering::SeqCst);
+
+        let mut audio_restart_rx = self.audio_restart_rx.take().expect("restart rx");
+        let audio_codec = self.audio_codec.clone();
+        let clipboard_enabled = self.clipboard_enabled.clone();
+        let phone_clip_tx = self.phone_clip_tx.clone();
+
+        let exit_reason = loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    break SessionExit::Stop;
+                }
+                _ = audio_restart_rx.recv() => {
+                    // 音频编码热切换：Core 改 audio_codec 原子并触发本信号。
+                    // 发送 SetAudioCodec，phone 重起捕获后回 AudioReady（主循环会转发给 audio_task）。
+                    if audio_enabled {
+                        let codec_byte = audio_codec.load(Ordering::SeqCst);
+                        println!("[audio] codec hot-swap request (index {})", codec_byte);
+                        if udp.send_ctrl(&kulua_proto::session::msgs::set_audio_codec(codec_byte as u32)).is_ok() {
+                            continue;
+                        } else {
+                            eprintln!("[audio] SetAudioCodec 发送失败，会话终止");
+                            break SessionExit::Stop;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                evt = udp.recv() => {
+                    match evt {
+                        Some(Event::Control(msg)) => match msg.msg {
+                            Some(ctrl_msg::Msg::ClipboardChanged(c)) => {
+                                if clipboard_enabled.load(Ordering::SeqCst) {
+                                    println!("Phone clipboard from {}: {}", serial, c.text);
+                                    if phone_clip_tx.send(c.text).await.is_err() {
+                                        break SessionExit::Stop;
+                                    }
+                                }
+                            }
+                            Some(ctrl_msg::Msg::MediaConfig(cfg)) => {
+                                // cfg.stream: 0=CTRL 1=AUDIO 2=VIDEO（AUDIO=1）
+                                if want_audio && cfg.stream == 1 {
+                                    let _ = audio_tx.send(AudioEvent::Config(cfg.data)).await;
+                                }
+                            }
+                            Some(ctrl_msg::Msg::AudioReady(ar)) => {
+                                if want_audio && ar.codec_id != 0 {
+                                    println!("Audio codec: {} (0x{:08x})", audio_codec_name(ar.codec_id), ar.codec_id);
+                                    let _ = audio_tx.send(AudioEvent::Codec(ar.codec_id)).await;
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some(Event::Audio(frame)) => {
+                            let _ = audio_tx.send(AudioEvent::Frame(frame)).await;
+                        }
+                        Some(Event::Video(_)) => {}
+                        Some(Event::Error(e)) => {
+                            eprintln!("[{}] UDP 会话错误: {}", serial, e);
+                            break SessionExit::Stop;
+                        }
+                        Some(Event::Closed) | None => {
+                            eprintln!("[{}] UDP 会话已关闭（对端 BYE/消失）", serial);
+                            break SessionExit::Stop;
+                        }
+                        Some(Event::Connected) => {}
+                    }
+                }
+                result = self.clip_sub.recv() => {
+                    match result {
+                        Ok(text) if clipboard_enabled.load(Ordering::SeqCst) => {
+                            if let Err(e) = udp.send_ctrl(&kulua_proto::session::msgs::set_clipboard(0, false, &text)) {
+                                eprintln!("[{}] set_clipboard 发送失败: {}，终止", serial, e);
+                                break SessionExit::Stop;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break SessionExit::Stop;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("[{}] clip_sub lagged by {}", serial, n);
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── 清理 ──
+        audio_task.abort();
         notif_stop.store(true, Ordering::SeqCst);
+
+        match exit_reason {
+            SessionExit::Stop => {
+                println!("[{}] 关闭 UDP 会话（BYE）", serial);
+                udp.close();
+            }
+        }
+
+        // 强制清理远端进程（kill_by_scid，可靠收尾）
         server.stop(self.adb.as_ref());
+        println!("Session {} cleaned up", serial);
     }
 }
 
-/// 启动音频读取任务（独立 tokio 任务，负责读帧 + 解码 + 播放）。
+/// 启动音频播放任务（读通道，config/codec/frame 事件驱动）。
 ///
-/// 与旧实现的内联逻辑一致：config 包（bit62）先捕获，首个音频帧后惰性创建
-/// 解码器；opus/aac/flac 走各自解码器，未知 codec 只读丢弃。
-/// 返回 JoinHandle，调用方在重连/退出时 abort。
+/// 与旧实现逻辑一致：Codec 切换重置解码器；Config（可靠 MediaConfig）先于
+/// 首帧捕获；opus/aac/flac 走各自解码器，未知 codec 只读丢弃。
 fn spawn_audio_task(
-    audio_stream: TcpStream,
-    codec_id: u32,
+    mut rx: tokio::sync::mpsc::Receiver<AudioEvent>,
     serial: String,
     volume: Arc<AtomicU16>,
     latency: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
-    let (mut audio_reader, _audio_writer) = tokio::io::split(audio_stream);
-    if crate::audio_player::AudioCodec::from_codec_id(codec_id).is_none() {
-        // 未知 codec → 只读取丢弃（无法播放）
-        return tokio::spawn(async move {
-            let mut header = [0u8; 12];
-            while audio_reader.read_exact(&mut header).await.is_ok() {
-                let frame_size =
-                    u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
-                if frame_size == 0 || frame_size > 10_000_000 {
-                    break;
-                }
-                let mut _frame = vec![0u8; frame_size];
-                if audio_reader.read_exact(&mut _frame).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    // 已知 codec → 解码播放
-    let codec = crate::audio_player::AudioCodec::from_codec_id(codec_id).unwrap();
     tokio::spawn(async move {
-        // codec config 包（bit 62）：AAC 的 AudioSpecificConfig / FLAC 的 STREAMINFO，
-        // 必须先于首帧捕获；OPUS/RAW 无配置包
+        let mut codec_id: u32 = 0;
         let mut codec_config: Option<Vec<u8>> = None;
         let mut player: Option<crate::audio_player::AudioPlayer> = None;
         let mut last_vol = volume.load(Ordering::Relaxed);
         let mut log_timer = tokio::time::Instant::now();
-        loop {
-            // 12-byte frame header: 8B PTS/flags + 4B size (big-endian)
-            let mut header = [0u8; 12];
-            if audio_reader.read_exact(&mut header).await.is_err() {
-                break;
-            }
 
-            let pts_raw = u64::from_be_bytes(<[u8; 8]>::try_from(&header[..8]).unwrap());
-            let frame_size =
-                u32::from_be_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap()) as usize;
-
-            // 检查 session 元数据标记（bit 63）
-            if (pts_raw >> 63) & 1 != 0 {
-                continue;
-            }
-
-            // 安全检查
-            if frame_size == 0 || frame_size > 10_000_000 {
-                break;
-            }
-
-            let mut frame_data = vec![0u8; frame_size];
-            if audio_reader.read_exact(&mut frame_data).await.is_err() {
-                break;
-            }
-
-            // codec config 包（bit 62）：仅在解码器创建前捕获一次
-            if (pts_raw >> 62) & 1 != 0 {
-                if player.is_none() {
-                    codec_config = Some(frame_data);
-                }
-                continue;
-            }
-
-            // 首个正常音频帧 → 惰性创建解码器（此时 config 已就绪）
-            if player.is_none() {
-                let p = match crate::audio_player::AudioPlayer::new(
-                    codec,
-                    codec_config.as_deref(),
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!(
-                            "[audio] failed to init {} player on {serial}: {e}",
-                            codec.name()
-                        );
-                        return;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AudioEvent::Codec(cid) => {
+                    codec_id = cid;
+                    player = None;
+                    if let Some(ok) = crate::audio_player::AudioCodec::from_codec_id(cid) {
+                        if ok.name() != "OPUS" && ok.name() != "RAW" {
+                            // 需要 config 的 codec：保留最近 config（新 config 即将到来或已在）
+                            // 保持不变即可；旧 config 会在首个新配置帧到达时被替换。
+                        } else {
+                            codec_config = None;
+                        }
+                    } else {
+                        codec_config = None;
                     }
-                };
-                // 初始音量
-                p.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
-                player = Some(p);
-            }
-            let player = player.as_mut().unwrap();
+                }
+                AudioEvent::Config(data) => {
+                    codec_config = Some(data);
+                }
+                AudioEvent::Frame(frame) => {
+                    // 会话元数据帧（预留）忽略
+                    if (frame.flags >> 2) & 1 != 0 {
+                        continue;
+                    }
+                    // 帧内 config 标志（防御：某些实现可能仍内联 config）
+                    if frame.flags & 1 != 0 {
+                        codec_config = Some(frame.data.clone());
+                        continue;
+                    }
+                    // 首个正常音频帧 → 惰性创建解码器（此时 config 已就绪，如需要）
+                    if player.is_none() {
+                        let Some(codec) = crate::audio_player::AudioCodec::from_codec_id(codec_id)
+                        else {
+                            eprintln!("[audio] unknown codec id 0x{:08x} on {serial}", codec_id);
+                            continue;
+                        };
+                        let p = match crate::audio_player::AudioPlayer::new(
+                            codec,
+                            codec_config.as_deref(),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "[audio] failed to init {} player on {serial}: {e}",
+                                    codec.name()
+                                );
+                                continue;
+                            }
+                        };
+                        p.set_volume(volume.load(Ordering::Relaxed) as f32 / 100.0);
+                        player = Some(p);
+                    }
+                    let player = player.as_mut().unwrap();
 
-            // 同步音量变更
-            let cur = volume.load(Ordering::Relaxed);
-            if cur != last_vol {
-                player.set_volume(cur as f32 / 100.0);
-                last_vol = cur;
-            }
+                    // 同步音量
+                    let cur = volume.load(Ordering::Relaxed);
+                    if cur != last_vol {
+                        player.set_volume(cur as f32 / 100.0);
+                        last_vol = cur;
+                    }
 
-            // 正常音频帧 → 解码播放
-            // 积压超过阈值 → 丢帧清空，防止延迟永久累积（rodio 队列无上限）
-            if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
-                eprintln!(
-                    "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
-                    player.buffer_ms()
-                );
-                player.clear();
-            }
-            if let Err(e) = player.feed_frame(&frame_data) {
-                eprintln!("[audio] {} decode error on {serial}: {e}", codec.name());
-            } else {
-                // 上报播放队列积压（缓冲延迟，ms）
-                latency.store(player.buffer_ms(), Ordering::Relaxed);
-            }
+                    // 积压超阈值 → 丢帧清空
+                    if player.buffer_ms() > AUDIO_BUFFER_MAX_MS {
+                        eprintln!(
+                            "[audio] {serial} buffer {}ms exceeded limit, flushing backlog",
+                            player.buffer_ms()
+                        );
+                        player.clear();
+                    }
+                    if let Err(e) = player.feed_frame(&frame.data) {
+                        eprintln!("[audio] decode error on {serial}: {e}");
+                    } else {
+                        latency.store(player.buffer_ms(), Ordering::Relaxed);
+                    }
 
-            // 诊断打点：每 5s 打印一次缓冲延迟
-            if log_timer.elapsed() >= Duration::from_secs(5) {
-                eprintln!("[audio] {serial} buffer: {} ms", player.buffer_ms());
-                log_timer = tokio::time::Instant::now();
+                    if log_timer.elapsed() >= Duration::from_secs(5) {
+                        eprintln!("[audio] {serial} buffer: {} ms", player.buffer_ms());
+                        log_timer = tokio::time::Instant::now();
+                    }
+                }
             }
         }
     })

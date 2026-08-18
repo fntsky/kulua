@@ -12,3 +12,4 @@ softbuffer = "0.4"
 # 仅 avcodec（avutil 为隐式依赖；YUV→RGB 手写转换，不需要 swscale）
 ffmpeg-sys-next = { version = "7", default-features = false, features = ["avcodec"] }
 md-5 = "0.10"
+kulua-proto = { path = "../kulua-proto" }

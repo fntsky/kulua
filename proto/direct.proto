@@ -10,6 +10,10 @@ syntax = "proto3";
 
 package kulua.direct;
 
+// Java 每个 message 一个文件，便于 javac/d8 处理。
+option java_multiple_files = true;
+option java_package = "kulua.direct";
+
 // 数据报外层：流 + 类型 + 序号 + 分片信息 + 负载。
 message Frame {
   // 逻辑流（对应原「连接类型」握手字节在一条 UDP 端口上的多路复用）。

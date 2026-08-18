@@ -25,12 +25,6 @@ pub trait AdbOps: Send + Sync {
     ) -> Result<(), AdbError>;
     fn connect(&self, addr: &str) -> Result<(), AdbError>;
     fn push(&self, device: &Device, local: &str, remote: &str) -> Result<(), AdbError>;
-    fn forward(
-        &self,
-        device: &Device,
-        local_port: u16,
-        remote_abstract: &str,
-    ) -> Result<(), AdbError>;
     fn spawn_shell(
         &self,
         device: &Device,
@@ -127,23 +121,6 @@ impl AdbOps for AdbCmd {
         }
 
         // exit code == 0 即成功
-        Ok(())
-    }
-
-    fn forward(
-        &self,
-        device: &Device,
-        local_port: u16,
-        remote_abstract: &str,
-    ) -> Result<(), AdbError> {
-        let serial = &device.serial.as_str();
-        let _ = self.run(&[
-            "-s",
-            serial,
-            "forward",
-            &format!("tcp:{}", local_port),
-            &format!("localabstract:{}", remote_abstract),
-        ])?;
         Ok(())
     }
 
@@ -269,7 +246,6 @@ pub mod mock {
         pub fail_wireless_pair: bool,
         pub fail_connect: bool,
         pub fail_push: bool,
-        pub fail_forward: bool,
         /// Track which methods were called (for assertions)
         pub calls: Mutex<Vec<&'static str>>,
         /// Dummy successful output for `run()`
@@ -291,7 +267,6 @@ pub mod mock {
                 fail_wireless_pair: false,
                 fail_connect: false,
                 fail_push: false,
-                fail_forward: false,
                 calls: Mutex::new(vec![]),
                 default_output: std::process::Output {
                     status,
@@ -348,20 +323,6 @@ pub mod mock {
             self.calls.lock().unwrap().push("push");
             if self.fail_push {
                 Err(AdbError::CommandFailed("mock: push failed".into()))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn forward(
-            &self,
-            _device: &Device,
-            _local_port: u16,
-            _remote_abstract: &str,
-        ) -> Result<(), AdbError> {
-            self.calls.lock().unwrap().push("forward");
-            if self.fail_forward {
-                Err(AdbError::CommandFailed("mock: forward failed".into()))
             } else {
                 Ok(())
             }

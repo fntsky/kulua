@@ -1709,6 +1709,7 @@ name = "fusion-viewer"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-sys-next",
+ "kulua-proto",
  "md-5",
  "softbuffer",
  "winit",
@@ -5425,6 +5426,7 @@ dependencies = [
  "clipboard-win",
  "futures",
  "image",
+ "kulua-proto",
  "mdns-sd",
  "notify-rust",
  "opus",

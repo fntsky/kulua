@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use prost::Message;
 
 use crate::codec::MAX_FRAGMENT;
-use crate::generated::{frame, Frame};
+use crate::generated::{Frame, frame};
 
 /// control 滑动窗口大小（未确认分片上限）。
 pub const WINDOW: usize = 32;
@@ -192,7 +192,11 @@ impl ReliableReceiver {
         if frame.seq < self.next_seq {
             return Vec::new(); // 重复
         }
-        let total = if frame.frag_total == 0 { 1 } else { frame.frag_total };
+        let total = if frame.frag_total == 0 {
+            1
+        } else {
+            frame.frag_total
+        };
         if frame.frag >= total {
             return Vec::new();
         }

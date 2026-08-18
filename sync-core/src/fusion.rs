@@ -108,15 +108,14 @@ impl FusionManager {
 
     /// 构建 fusion-viewer 命令行参数（纯函数，便于单测）。
     ///
-    /// 设计决策（见 docs/fusion-mode-plan.md 阶段 4 自研方案）：
+    /// `addr` 为 `ip:port`（phone 直连地址，UDP）：
     /// - daemon session 统一部署 kulua-server（单进程多显示器），viewer 连接模式：
-    ///   `--connect <port>` 连接 session 的 ADB forward 端口，video 连接携带
-    ///   显示器创建参数，不重复部署 server
+    ///   `--connect <addr>` 直连 session 的 UDP 端口，CreateDisplay 携带显示器参数
     /// - 音频/剪贴板继续由 Kulua session 负责（viewer 只做视频 + 输入注入）
-    pub fn build_args(port: u16, package: &str, label: &str) -> Vec<String> {
+    pub fn build_args(addr: &str, package: &str, label: &str) -> Vec<String> {
         let mut args = vec![
             "--connect".to_string(),
-            port.to_string(),
+            addr.to_string(),
             "--package".to_string(),
             package.to_string(),
         ];
@@ -129,18 +128,18 @@ impl FusionManager {
 
     /// 为指定设备打开一个应用的融合窗口，返回窗口 id。
     ///
-    /// `port` 为设备 session 的 ADB forward 端口（viewer 通过它连接 kulua-server）。
+    /// `addr` 为 phone 的直连地址（`ip:port`，由 Core 解析）。
     pub fn open_window(
         &mut self,
         serial: String,
         package_name: String,
         label: String,
-        port: u16,
+        addr: String,
     ) -> Result<u64, String> {
         let exe = Self::find_viewer_exe().ok_or(
             "未找到 fusion-viewer.exe：请将其放入 daemon 同目录，或设置 FUSION_VIEWER_EXE 环境变量",
         )?;
-        self.open_window_with_exe(&exe, serial, package_name, label, port)
+        self.open_window_with_exe(&exe, serial, package_name, label, addr)
     }
 
     /// 使用指定 fusion-viewer 路径打开融合窗口（`open_window` 的内部实现，测试用）。
@@ -150,9 +149,9 @@ impl FusionManager {
         serial: String,
         package_name: String,
         label: String,
-        port: u16,
+        addr: String,
     ) -> Result<u64, String> {
-        let args = Self::build_args(port, &package_name, &label);
+        let args = Self::build_args(&addr, &package_name, &label);
         let child = std::process::Command::new(exe)
             .args(&args)
             .spawn()
@@ -279,12 +278,12 @@ mod tests {
 
     #[test]
     fn build_args_contains_viewer_flags() {
-        let args = FusionManager::build_args(27183, "com.android.settings", "设置");
+        let args = FusionManager::build_args("192.168.1.5:27183", "com.android.settings", "设置");
         assert_eq!(
             args,
             vec![
                 "--connect",
-                "27183",
+                "192.168.1.5:27183",
                 "--package",
                 "com.android.settings",
                 "--label",
@@ -292,10 +291,10 @@ mod tests {
             ]
         );
         // 空 label 不传 --label
-        let no_label = FusionManager::build_args(27183, "pkg", "");
+        let no_label = FusionManager::build_args("192.168.1.5:27183", "pkg", "");
         assert_eq!(
             no_label,
-            vec!["--connect", "27183", "--package", "pkg"]
+            vec!["--connect", "192.168.1.5:27183", "--package", "pkg"]
         );
     }
 
@@ -308,14 +307,14 @@ mod tests {
             "serial-1".into(),
             "com.android.settings".into(),
             "设置".into(),
-            27183,
+            "192.168.1.5:27183".into(),
         );
         let id2 = manager.open_window_with_exe(
             &dummy_exe(),
             "serial-1".into(),
             "com.android.chrome".into(),
             "Chrome".into(),
-            27183,
+            "192.168.1.5:27183".into(),
         );
         assert!(id1.is_ok(), "dummy exe 应能启动: {:?}", id1);
         assert!(id2.is_ok());
@@ -344,7 +343,7 @@ mod tests {
             "serial".into(),
             "com.android.settings".into(),
             "设置".into(),
-            27183,
+            "192.168.1.5:27183".into(),
         );
         assert!(result.is_err(), "exe 不存在应返回错误");
         assert!(manager.windows_info().is_empty());

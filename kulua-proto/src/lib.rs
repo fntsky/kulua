@@ -9,3 +9,6 @@ pub mod codec;
 pub mod generated;
 pub mod reliable;
 pub mod session;
+
+/// 再导出 prost，供下游（fusion-viewer 等）直接编码/解码。
+pub use prost;

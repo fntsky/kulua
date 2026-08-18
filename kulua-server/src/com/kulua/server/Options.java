@@ -6,8 +6,11 @@ import java.util.Map;
 /** 启动参数解析（与 scrcpy server 风格一致：`key=value` 空格分隔）。 */
 public final class Options {
 
-    /** scid（16 进制字符串），socket 名为 scrcpy_<scid> */
+    /** scid（16 进制字符串），会话隔离标识 + 自定义协议字段 */
     public String scid = "4b4c0000";
+
+    /** UDP 直连端口（phone 绑定的 Wi-Fi 网络端口） */
+    public int port = 27183;
 
     /** 一次性模式：枚举可启动应用后退出（apps.rs 解析输出） */
     public boolean listApps;
@@ -34,6 +37,14 @@ public final class Options {
         String scid = map.get("scid");
         if (scid != null) {
             options.scid = scid;
+        }
+        String portStr = map.get("port");
+        if (portStr != null) {
+            try {
+                options.port = Integer.parseInt(portStr);
+            } catch (NumberFormatException ignored) {
+                // 非法端口忽略，用默认
+            }
         }
         options.listApps = "true".equals(map.get("list_apps"));
         String audioCodec = map.get("audio_codec");

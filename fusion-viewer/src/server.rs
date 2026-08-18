@@ -1,26 +1,30 @@
-//! kulua-server 连接（连接模式客户端，不部署 server）。
+//! kulua-server 连接（UDP 直连客户端）。
 //!
-//! 架构（阶段 4）：server 由 daemon session 统一部署（`kulua-server.jar`），
-//! viewer 只负责连接：
-//! - control socket：握手字节 0x01 → 控制通道（输入注入 / START_APP / RESIZE）
-//! - video socket：握手字节 0x03 + 6B 创建请求（width u16be, height u16be, dpi u16be）
-//!   → server 创建虚拟显示器 → 回 4B displayId（u32be）+ 4B codecId（ASCII）→ 帧流
-//! 窗口关闭只断 socket（server 由 session 管理，不 kill、不删 forward）。
+//! 架构（阶段 5）：server 由 daemon session 统一部署（`kulua-server.jar`，绑定
+//! phone 网络 UDP 端口），viewer 只负责连接：
+//! - HELLO{scid, audio=false} → HELLO_ACK 握手（scid 由端口确定，与 server 一致）
+//! - 发送 `CtrlMsg.create_display{WxH/DPI}` → 收 `DisplayReady{display_id, codec_id}`
+//! - 视频帧 / 控制事件经同一个 UdpSession 的流多路复用（stream=VIDEO / CTRL）
+//! 窗口关闭只 close 会话（server 由 session 管理，不 kill）。
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
-/// 连接类型握手字节（与 kulua-server ConnectionManager 一致）。
-pub const TYPE_CONTROL: u8 = 0x01;
-pub const TYPE_VIDEO: u8 = 0x03;
+use kulua_proto::generated::{CtrlMsg, ctrl_msg};
+use kulua_proto::session::{Event, UdpSession};
 
-/// 已连接的 viewer 会话：持有 control + video 两个 socket。
+/// scid 前缀（与 sync-core/src/scrcpy.rs 的 SCID_PREFIX 一致）：0x4B4C << 16。
+pub const SCID_PREFIX: u32 = 0x4B4C_0000;
+
+/// 由 UDP 端口推导确定性 scid（与 daemon 一致，无需额外传入）。
+pub fn scid_for_port(port: u16) -> String {
+    format!("{:08x}", SCID_PREFIX | u32::from(port))
+}
+
+/// 已连接的 viewer 会话：持有 UDP 会话 + server 分配的虚拟显示器 id。
 pub struct ViewerSession {
-    /// 控制 socket（写控制消息）
-    pub control: TcpStream,
-    /// 视频 socket（交给视频读取线程，只能取一次）
-    video: Option<TcpStream>,
+    /// UDP 会话（事件流：Video / Control；send_ctrl 注入输入）
+    pub session: UdpSession,
     /// server 分配的虚拟显示器 id（输入注入/RESIZE/START_APP 用）
     pub display_id: u32,
     /// 视频 codec id（4B ASCII，如 "h264"）
@@ -30,67 +34,63 @@ pub struct ViewerSession {
 impl ViewerSession {
     /// 连接已有 kulua-server 并创建虚拟显示器。
     ///
-    /// 阻塞直到 control + video 两个 socket 都握手成功（或超时失败）。
-    pub fn connect(port: u16, display: &str) -> Result<Self, String> {
+    /// 阻塞直到 HELLO 握手 + DisplayReady 都完成（或超时失败）。
+    pub fn connect(addr: SocketAddr, display: &str) -> Result<Self, String> {
         let (width, height, dpi) = parse_display(display)?;
+        let scid = scid_for_port(addr.port());
+        let mut session = UdpSession::connect(addr, &scid, false)
+            .map_err(|e| format!("连接 {addr} 失败: {e}"))?;
 
-        // 1. 连接 control socket 并写握手字节（类型声明）
-        let control = connect_with_retry(port, 20, "控制通道")
-            .ok_or_else(|| format!("连接控制通道失败（端口 {}）", port))?;
-        let mut control = control;
-        control
-            .write_all(&[TYPE_CONTROL])
-            .map_err(|e| format!("控制通道握手失败: {}", e))?;
-        let _ = control.set_nodelay(true);
+        // 发送 CreateDisplay（可靠 control）→ phone 创建虚拟显示器 + 编码器
+        session
+            .send_ctrl(&super::control::create_display(
+                width as u32,
+                height as u32,
+                dpi as u32,
+            ))
+            .map_err(|e| format!("CreateDisplay 发送失败: {e}"))?;
 
-        // 2. 连接 video socket：握手字节 + 创建请求 → 读 displayId + codecId
-        //    注意：adb forward 监听器一建立就能 accept 本地 TCP，但 server
-        //    （app_process）需要 1~3 秒才监听 localabstract socket；此时连接会
-        //    被 adb 转发层直接断开 → 握手读失败。因此要重试整个流程
-        //    （与 session 的 connect_socket 行为一致）。
-        let start = std::time::Instant::now();
-        let (video, display_id, codec_id) = loop {
-            match connect_video_with_create(port, width, height, dpi) {
-                Ok(result) => break result,
-                Err(e) => {
-                    if start.elapsed() > Duration::from_secs(15) {
-                        return Err(format!("15s 内未收到 video 握手: {}", e));
+        // 等待 DisplayReady（5s 超时）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match session.try_recv() {
+                Some(Event::Control(msg)) => {
+                    if let Some(ctrl_msg::Msg::DisplayReady(d)) = msg.msg {
+                        println!(
+                            "[viewer] 虚拟显示器 #{} 已创建 ({}x{}@{})",
+                            d.display_id, d.width, d.height, d.dpi
+                        );
+                        return Ok(ViewerSession {
+                            session,
+                            display_id: d.display_id,
+                            codec_id: d.codec_id,
+                        });
                     }
-                    eprintln!("[viewer] 视频通道握手失败（重试）: {}", e);
-                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Some(Event::Error(e)) => return Err(format!("会话错误: {e}")),
+                Some(Event::Closed) => return Err("会话被关闭".into()),
+                Some(_) => {}
+                None => {
+                    if Instant::now() >= deadline {
+                        session.close();
+                        return Err("等待 DisplayReady 超时（server/网络异常？）".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
-        };
-        println!(
-            "[viewer] 虚拟显示器 #{} 已创建 ({}x{}@{})",
-            display_id, width, height, dpi
-        );
-
-        Ok(ViewerSession {
-            control,
-            video: Some(video),
-            display_id,
-            codec_id,
-        })
+        }
     }
 
-    /// 取出视频 socket（只能取一次，交给视频读取线程）。
-    pub fn take_video(&mut self) -> Option<TcpStream> {
-        self.video.take()
+    /// 发送一条 control 指令（可靠）。
+    pub fn send_ctrl(&mut self, msg: &CtrlMsg) -> Result<(), String> {
+        self.session
+            .send_ctrl(msg)
+            .map_err(|e| format!("控制通道写入失败: {e}"))
     }
 
-    /// 发送一条控制消息。
-    pub fn send(&mut self, msg: &[u8]) -> Result<(), String> {
-        self.control
-            .write_all(msg)
-            .map_err(|e| format!("控制通道写入失败: {}", e))
-    }
-
-    /// 发送 RESIZE_DISPLAY（弹性显示器尺寸变化）。
-    pub fn resize_display(&mut self, width: u16, height: u16) -> Result<(), String> {
-        self.send(&crate::control::resize_display(
-            self.display_id, width, height,
-        ))
+    /// 取出底层 UDP 会话（把事件消费交给主循环）。
+    pub fn into_inner(self) -> UdpSession {
+        self.session
     }
 }
 
@@ -102,14 +102,8 @@ pub fn parse_display(display: &str) -> Result<(u16, u16, u16), String> {
     let (w, h) = size_part
         .split_once('x')
         .ok_or_else(|| format!("非法显示器规格（应为 WxH/DPI）: {}", display))?;
-    let width: u16 = w
-        .trim()
-        .parse()
-        .map_err(|_| format!("非法宽度: {}", w))?;
-    let height: u16 = h
-        .trim()
-        .parse()
-        .map_err(|_| format!("非法高度: {}", h))?;
+    let width: u16 = w.trim().parse().map_err(|_| format!("非法宽度: {}", w))?;
+    let height: u16 = h.trim().parse().map_err(|_| format!("非法高度: {}", h))?;
     let dpi: u16 = dpi_part
         .trim()
         .parse()
@@ -120,71 +114,16 @@ pub fn parse_display(display: &str) -> Result<(u16, u16, u16), String> {
     Ok((width, height, dpi))
 }
 
-/// 连接 video socket，完成创建虚拟显示器的握手。
-///
-/// 返回 (socket, displayId, codecId)。返回 Err 表示连接被断开
-/// （server 尚未监听 / 已崩溃），调用方应重试。
-fn connect_video_with_create(
-    port: u16,
-    width: u16,
-    height: u16,
-    dpi: u16,
-) -> Result<(TcpStream, u32, u32), String> {
-    let mut stream = connect_with_retry(port, 4, "视频通道")
-        .ok_or_else(|| format!("连接 127.0.0.1:{} 失败", port))?;
-
-    // 握手：类型字节 + 6B 创建请求（全部大端）
-    let mut request = [0u8; 7];
-    request[0] = TYPE_VIDEO;
-    request[1..3].copy_from_slice(&width.to_be_bytes());
-    request[3..5].copy_from_slice(&height.to_be_bytes());
-    request[5..7].copy_from_slice(&dpi.to_be_bytes());
-    stream
-        .write_all(&request)
-        .map_err(|e| format!("video 握手写入失败: {}", e))?;
-
-    // server 先回 4B displayId，再回 4B codecId
-    // 3s 超时防止 server 半死不活时永久阻塞
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let mut display_buf = [0u8; 4];
-    stream
-        .read_exact(&mut display_buf)
-        .map_err(|e| format!("读取 displayId 失败: {}", e))?;
-    let display_id = u32::from_be_bytes(display_buf);
-
-    let mut codec_buf = [0u8; 4];
-    stream
-        .read_exact(&mut codec_buf)
-        .map_err(|e| format!("读取 codecId 失败: {}", e))?;
-    let codec_id = u32::from_be_bytes(codec_buf);
-    let _ = stream.set_read_timeout(None);
-
-    let _ = stream.set_nodelay(true);
-    Ok((stream, display_id, codec_id))
-}
-
-/// 带重试的本地端口连接。
-fn connect_with_retry(port: u16, attempts: u32, what: &str) -> Option<TcpStream> {
-    for _ in 0..attempts {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => return Some(stream),
-            Err(e) => {
-                eprintln!("[viewer] 连接{}失败（重试）: {}", what, e);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kulua_proto::generated::frame::{self, Payload};
+    use kulua_proto::prost::Message;
 
     #[test]
-    fn type_constants_match_kulua_server() {
-        assert_eq!(TYPE_CONTROL, 0x01);
-        assert_eq!(TYPE_VIDEO, 0x03);
+    fn scid_for_port_matches_daemon_formula() {
+        assert_eq!(scid_for_port(27183), "4b4c6a2f");
+        assert_eq!(scid_for_port(0), "4b4c0000");
     }
 
     #[test]
@@ -205,69 +144,101 @@ mod tests {
         assert!(parse_display("1280x960/abc").is_err(), "非数字 DPI");
     }
 
-    /// 模拟 kulua-server 的 mock：接受两个连接（control + video），
-    /// 按真实 server 的字节布局回应，并记录收到的握手数据。
-    ///
-    /// 这个测试验证 viewer 的握手字节布局与 kulua-server 完全一致——
-    /// 若两侧布局不匹配（如字段顺序/大小端错误），握手会失败或读到错误数据。
+    /// 模拟 kulua-server 的 mock（UDP）：HELLO 回 HELLO_ACK，CreateDisplay 回
+    /// DisplayReady。验证 viewer 的握手与 server 完全一致（scid/message 编码）。
     #[test]
     fn connect_handshake_matches_kulua_server_protocol() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
+        use std::net::UdpSocket as StdUdpSocket;
+        use std::sync::mpsc;
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listen = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = listen.local_addr().unwrap().port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        // mock server 线程：模拟 ConnectionManager（每连接独立线程）
-        // viewer 的连接顺序：先 control 后 video
-        let server = std::thread::spawn(move || {
-            // ── control 连接：读 1B 类型 ──
-            let (mut control, _) = listener.accept().unwrap();
-            let mut type_buf = [0u8; 1];
-            control.read_exact(&mut type_buf).unwrap();
-            assert_eq!(type_buf[0], TYPE_CONTROL, "control 握手类型应为 0x01");
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // 等待第一个 HELLO
+            let mut buf = vec![0u8; 2048];
+            let (n, src) = listen.recv_from(&mut buf).unwrap();
+            let hello = kulua_proto::generated::Frame::decode(&buf[..n]).unwrap();
+            assert_eq!(frame::Type::try_from(hello.r#type), Ok(frame::Type::Hello));
+            let hello_scid = match &hello.payload {
+                Some(Payload::Hello(h)) => h.scid.clone(),
+                _ => panic!("expected HELLO payload"),
+            };
+            assert_eq!(hello_scid, scid_for_port(port));
+            // 回 HELLO_ACK
+            let ack = kulua_proto::generated::Frame {
+                stream: frame::Stream::Ctrl as i32,
+                r#type: frame::Type::HelloAck as i32,
+                seq: 0,
+                msg_id: 0,
+                frag: 0,
+                frag_total: 0,
+                media_pts: 0,
+                media_flags: 0,
+                payload: Some(Payload::HelloAck(kulua_proto::generated::HelloAck {
+                    scid: scid_for_port(port),
+                    audio_codec: 0,
+                    video_codec: 0x68323634,
+                })),
+            };
+            let mut wire = Vec::with_capacity(64);
+            Message::encode(&ack, &mut wire).unwrap();
+            listen.send_to(&wire, src).unwrap();
 
-            // ── video 连接：读 1B 类型 + 6B 创建请求 → 回 4B displayId + 4B codecId ──
-            let (mut video, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 7];
-            video.read_exact(&mut buf).unwrap();
-            assert_eq!(buf[0], TYPE_VIDEO, "video 握手类型应为 0x03");
-            // 创建请求：width u16be, height u16be, dpi u16be
-            let width = u16::from_be_bytes([buf[1], buf[2]]);
-            let height = u16::from_be_bytes([buf[3], buf[4]]);
-            let dpi = u16::from_be_bytes([buf[5], buf[6]]);
-            // 回 4B displayId（大端）+ 4B codecId（"h264"）
-            video.write_all(&42u32.to_be_bytes()).unwrap();
-            video.write_all(b"h264").unwrap();
-            // 不做阻塞读：viewer 的 session 直到测试函数结束才 drop，
-            // 阻塞等 EOF 会导致 join 死锁
-
-            (width, height, dpi)
+            // 等待 CreateDisplay（control DATA）→ 回 DisplayReady
+            loop {
+                let (n, _) = listen.recv_from(&mut buf).unwrap();
+                let frame = kulua_proto::generated::Frame::decode(&buf[..n]).unwrap();
+                if frame::Type::try_from(frame.r#type) == Ok(frame::Type::Data)
+                    && frame::Stream::try_from(frame.stream) == Ok(frame::Stream::Ctrl)
+                {
+                    let Some(Payload::Data(data)) = &frame.payload else {
+                        continue;
+                    };
+                    let ctrl = CtrlMsg::decode(data.as_slice()).unwrap();
+                    if let Some(ctrl_msg::Msg::CreateDisplay(cd)) = ctrl.msg {
+                        let ready = kulua_proto::generated::Frame {
+                            stream: frame::Stream::Ctrl as i32,
+                            r#type: frame::Type::Data as i32,
+                            seq: 1,
+                            msg_id: 1,
+                            frag: 0,
+                            frag_total: 0,
+                            media_pts: 0,
+                            media_flags: 0,
+                            payload: Some(Payload::Data(
+                                CtrlMsg {
+                                    msg: Some(ctrl_msg::Msg::DisplayReady(
+                                        kulua_proto::generated::DisplayReady {
+                                            display_id: 42,
+                                            codec_id: 0x68323634,
+                                            width: cd.width,
+                                            height: cd.height,
+                                            dpi: cd.dpi,
+                                        },
+                                    )),
+                                }
+                                .encode_to_vec(),
+                            )),
+                        };
+                        let mut w = Vec::with_capacity(64);
+                        Message::encode(&ready, &mut w).unwrap();
+                        listen.send_to(&w, src).unwrap();
+                        done_tx.send((cd.width, cd.height, cd.dpi)).unwrap();
+                        break;
+                    }
+                }
+            }
         });
 
-        // viewer 连接
-        let session = ViewerSession::connect(port, "1280x960/160").unwrap();
+        let session = ViewerSession::connect(addr, "1280x960/160").unwrap();
         assert_eq!(session.display_id, 42);
-        assert_eq!(session.codec_id, u32::from_be_bytes(*b"h264"));
-
-        // 验证 server 侧收到的创建请求
-        let (width, height, dpi) = server.join().unwrap();
-        assert_eq!((width, height, dpi), (1280, 960, 160));
-    }
-
-    /// viewer 连接失败时应返回 Err（server 未监听）。
-    ///
-    /// 标记 ignore：connect 会对未监听端口完整重试（20×250ms + video 15s），
-    /// 单测耗时 ~45s 不划算；失败路径由 `connect_handshake_matches_*` 的
-    /// 反例覆盖（mock 不回码流 → connect 超时失败）。
-    #[test]
-    #[ignore = "connect 重试链耗时 ~45s，失败路径由握手 mock 反例覆盖"]
-    fn connect_to_closed_port_fails() {
-        use std::net::TcpListener;
-        // 绑定后立即释放，保证端口无人监听
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(ViewerSession::connect(port, "1280x960/160").is_err());
+        assert_eq!(session.codec_id, 0x68323634);
+        let (w, h, dpi) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!((w, h, dpi), (1280, 960, 160));
     }
 }

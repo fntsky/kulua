@@ -13,25 +13,31 @@
 │  │  GUI      │◄───────────►│   daemon   │            │
 │  │ (Tauri)   │ Protobuf    │  (Rust)    │            │
 │  └──────────┘              └──────┬─────┘            │
-│                                    │                  │
-│                           ┌────────┴────────┐        │
-│                           │ adb / kulua-     │        │
-│                           │ server           │        │
-│                           │ clipboard sync   │        │
-│                           │ notification sync│        │
-│                           │ device mgmt      │        │
-│                           └────────┬────────┘        │
-│                                    │                  │
-│                          Wi-Fi / USB                  │
+│                                   │                  │
+│                          ┌────────┴────────┐        │
+│                          │ session/udp     │        │
+│                          │ (UDP 直连客户端) │        │
+│                          │ clipboard sync  │        │
+│                          │ notification sync│       │
+│                          │ device mgmt     │        │
+│                          └────────┬────────┘        │
+│                                   │                  │
+│                       Wi-Fi UDP（phone IP:port 直连） │
 ├──────────────────────────────────────────────────────┤
 │                      Phone                            │
 │            ┌──────────────────────────┐               │
-│            │  kulua-server (via adb)  │               │
+│            │  kulua-server via app_process │          │
+│            │  UDP 端口监听（control/audio/video）       │
 │            │  clipboard listener      │               │
 │            │  notification forward    │               │
 │            └──────────────────────────┘               │
 └──────────────────────────────────────────────────────┘
 ```
+
+> **直连协议**：daemon / 融合窗口与手机上的 `kulua-server` 通过 **UDP 网络端口直连**
+> (phone 绑定 Wi-Fi IP 端口，无 `adb forward`)，线协议由 `proto/direct.proto`
+> (protobuf) 定义：control 流可靠（滑动窗口 + ACK + 重传），audio/video 尽力而为
+> （分片 + 容忍丢包）。详见 `docs/direct-udp-protocol.md`。
 
 ## Features
 
@@ -62,10 +68,11 @@ Core (device mgmt + session orchestration)
 
 | Module | Responsibility |
 |--------|---------------|
-| `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `forward`, `shell`, `getprop`） |
+| `adb_cmd` | ADB CLI 进程调用（`devices`, `pair`, `push`, `shell`, `getprop`） |
 | `app` / `Core` | 设备发现、身份合并、连接调度、Session 编排 |
-| `session` | 单设备声明周期管理（kulua-server 部署、剪贴板 I/O、通知轮询、音频） |
-| `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 协议解析（模块名沿用历史） |
+| `session` | 单设备声明周期管理（kulua-server 部署、UDP 直连会话、剪贴板 I/O、通知轮询、音频） |
+| `kulua-proto` | 直连线协议：`proto/direct.proto` 生成的 protobuf + UDP 传输层（分片 / ACK / 重传 / 多流会话） |
+| `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 设备直连地址解析（模块名沿用历史） |
 | `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，60s 缓存） |
 | `fusion` | 融合窗口管理（fusion-viewer.exe 进程生命周期：启动 / 回收 / 优雅关闭） |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |

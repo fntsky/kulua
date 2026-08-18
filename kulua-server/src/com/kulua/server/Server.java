@@ -54,7 +54,6 @@ public final class Server {
             return;
         }
 
-        ConnectionManager manager = new ConnectionManager(options);
         // 预热系统 Context：必须由主线程（已 Looper.prepare）初始化 ActivityThread，
         // 若留给 clipboard-monitor 等后台线程首次触发，会因无 Looper 而崩溃
         // （ActivityThread 构造需要 Handler）
@@ -64,6 +63,8 @@ public final class Server {
         Workarounds.apply();
         // 轮询系统剪贴板，变化时推送给所有 control 连接（手机 → PC 方向）
         Clipboard.startMonitor();
-        manager.loop();
+        // UDP 直连服务器：phone 在 Wi-Fi 网络端口监听，接收所有客户端（daemon/fusion-viewer）
+        UdpServer udpServer = new UdpServer(options);
+        udpServer.loop();
     }
 }

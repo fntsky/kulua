@@ -5,31 +5,33 @@ import android.hardware.display.VirtualDisplay;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.net.LocalSocket;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
+
+import kulua.direct.Frame;
 
 /**
  * 视频编码器 + 推流（每显示器一个实例）。
  *
- * 流程：MediaCodec(surface 输入) → VirtualDisplay 投屏 → 编码输出 → video socket。
- * 流格式（沿用 scrcpy）：先写 4B codec id（"h264"），再写 12B 帧头 + payload：
- * - 帧头：8B pts/flags（bit62=config，bit61=keyframe，pts 低 61 位）+ 4B size（大端）
+ * 流程：MediaCodec(surface 输入) → VirtualDisplay 投屏 → 编码输出 →
+ * 直接 UDP 分片推送。config 帧（SPS/PPS）走可靠 control 流（MediaConfig），
+ * 普通帧走尽力而为媒体分片（Frame{stream=VIDEO, media_pts, media_flags, data}）。
  */
 public final class DisplayEncoder {
 
     private static final String TAG = "kulua-server";
 
-    private static final long FLAG_CONFIG = 1L << 62;
-    private static final long FLAG_KEY_FRAME = 1L << 61;
+    /** 与 kulua-proto codec.rs 的 MEDIA_FLAG_* 对齐。 */
+    static final int FLAG_CONFIG = 1 << 0;
+    static final int FLAG_KEY_FRAME = 1 << 1;
+    static final int FLAG_SESSION = 1 << 2;
 
     private final int id;
-    private final LocalSocket socket;
+    private final ClientConnection client;
     private final DisplayRegistry displayManager;
     private int widthField;
     private int heightField;
@@ -40,19 +42,11 @@ public final class DisplayEncoder {
     private MediaCodec codec;
     private Surface inputSurface;
     private VirtualDisplay virtualDisplay;
-    /**
-     * codec id 是否已写入 socket。
-     *
-     * 为什么需要：resize 会重启编码线程（encodeLoop 重跑），而 codec id 只应在
-     * 流开头写一次（客户端在握手时读取后直接进入帧循环，重复写入会错位解析）。
-     * resize 重启后只发新的 config 帧（SPS/PPS）+ 媒体帧，不再重复 codec id。
-     */
-    private boolean codecIdWritten;
 
-    public DisplayEncoder(int id, LocalSocket socket, DisplayRegistry displayManager,
+    public DisplayEncoder(int id, ClientConnection client, DisplayRegistry displayManager,
                           int width, int height, int dpi) {
         this.id = id;
-        this.socket = socket;
+        this.client = client;
         this.displayManager = displayManager;
         this.widthField = width;
         this.heightField = height;
@@ -98,16 +92,7 @@ public final class DisplayEncoder {
             codec.start();
 
             if (virtualDisplay == null) {
-                // 首次创建 VirtualDisplay；resize 时复用已有实例（换 surface）
-                //
-                // 不能用 getSystemService(DISPLAY_SERVICE)：那样 DisplayManager
-                // 内部的 mContext 是系统 ContextImpl（包名 "android"），
-                // DisplayManagerGlobal.createVirtualDisplay 用
-                // context.getPackageName() 校验 uid → SecurityException
-                // （"packageName must match the calling uid"）。
-                // 官方做法（wrappers/DisplayManager.createNewVirtualDisplay）：
-                // 反射构造 DisplayManager(FakeContext)，包名 = "com.android.shell"
-                // （正好是 shell uid 的包名），校验通过。
+                // 首次创建 VirtualDisplay；resize 时复用已有实例（换 surface）。
                 try {
                     java.lang.reflect.Constructor<android.hardware.display.DisplayManager> ctor =
                             android.hardware.display.DisplayManager.class
@@ -135,18 +120,10 @@ public final class DisplayEncoder {
         }
     }
 
-    /** 编码输出循环：dequeue → 写 video socket（scrcpy 帧格式）。 */
+    /** 编码输出循环：dequeue → 推流（config 可靠 / 媒体分片）。 */
     private void encodeLoop() {
         try {
-            OutputStream output = socket.getOutputStream();
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            // 先写 codec id（4B ASCII "h264"，v4.0 格式）——仅首次，resize 重启不再写
-            if (!codecIdWritten) {
-                output.write(new byte[]{0x68, 0x32, 0x36, 0x34});
-                output.flush();
-                codecIdWritten = true;
-            }
-
             while (running) {
                 int index = codec.dequeueOutputBuffer(info, 10_000);
                 if (index >= 0) {
@@ -154,12 +131,12 @@ public final class DisplayEncoder {
                     if (buffer != null) {
                         boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
                         boolean key = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-                        long pts = info.presentationTimeUs;
-                        long ptsAndFlags = config ? FLAG_CONFIG : pts;
-                        if (key) {
-                            ptsAndFlags |= FLAG_KEY_FRAME;
+                        if (config) {
+                            sendConfig(buffer, info.size);
+                        } else {
+                            int flags = key ? FLAG_KEY_FRAME : 0;
+                            sendData(info.presentationTimeUs, flags, buffer, info.size);
                         }
-                        writeFrame(output, ptsAndFlags, buffer, info.size);
                     }
                     codec.releaseOutputBuffer(index, false);
                 }
@@ -168,13 +145,9 @@ public final class DisplayEncoder {
                 }
             }
         } catch (IllegalStateException e) {
-            // 正常关闭路径：resize/stop 时 codec.stop() 会唤醒阻塞的
-            // dequeueOutputBuffer 并抛 IllegalStateException。这不是错误——
-            // 若在此崩溃（未捕获异常），Android 会杀掉整个 server 进程，
-            // 导致所有显示器/音频/剪贴板连接一起断（实测 resize 即崩）。
+            // 正常关闭路径：resize/stop 时 codec.stop() 唤醒阻塞的 dequeueOutputBuffer
+            // 并抛 IllegalStateException。
             Log.i(TAG, "display #" + id + " codec stopped: " + e.getMessage());
-        } catch (IOException e) {
-            Log.i(TAG, "display #" + id + " stream ended: " + e.getMessage());
         } catch (RuntimeException e) {
             Log.i(TAG, "display #" + id + " encode loop error: " + e.getMessage());
         } finally {
@@ -182,27 +155,25 @@ public final class DisplayEncoder {
         }
     }
 
-    private static void writeFrame(OutputStream output, long ptsAndFlags,
-                                   ByteBuffer buffer, int size) throws IOException {
-        byte[] header = new byte[12];
-        header[0] = (byte) (ptsAndFlags >>> 56);
-        header[1] = (byte) (ptsAndFlags >>> 48);
-        header[2] = (byte) (ptsAndFlags >>> 40);
-        header[3] = (byte) (ptsAndFlags >>> 32);
-        header[4] = (byte) (ptsAndFlags >>> 24);
-        header[5] = (byte) (ptsAndFlags >>> 16);
-        header[6] = (byte) (ptsAndFlags >>> 8);
-        header[7] = (byte) ptsAndFlags;
-        header[8] = (byte) (size >>> 24);
-        header[9] = (byte) (size >>> 16);
-        header[10] = (byte) (size >>> 8);
-        header[11] = (byte) size;
-        output.write(header);
+    /** 发送 config 帧（SPS/PPS，可靠 control 流）。 */
+    private void sendConfig(ByteBuffer buffer, int size) {
         buffer.position(0);
         buffer.limit(size);
-        byte[] payload = new byte[size];
-        buffer.get(payload);
-        output.write(payload);
+        byte[] data = new byte[size];
+        buffer.get(data);
+        client.sendMediaConfig(Frame.Stream.VIDEO.getNumber(), data);
+    }
+
+    /** 发送普通视频帧（尽力而为、分片）。 */
+    private void sendData(long pts, int flags, ByteBuffer buffer, int size) {
+        buffer.position(0);
+        buffer.limit(size);
+        byte[] data = new byte[size];
+        buffer.get(data);
+        if (data.length != size) {
+            data = Arrays.copyOf(data, size);
+        }
+        client.sendMedia(Frame.Stream.VIDEO.getNumber(), client.nextMediaSeq(), pts, flags, data);
     }
 
     /** 停止编码器与推流。 */
@@ -213,18 +184,14 @@ public final class DisplayEncoder {
 
     /**
      * 停掉编码线程并释放 codec（resize / stop 共用）。
-     *
-     * 顺序很重要：先 codec.stop() 唤醒阻塞在 dequeueOutputBuffer 的编码线程
-     * （stop 会让它抛 IllegalStateException，encodeLoop 已捕获并正常退出），
-     * 再 join 等线程真正结束，最后 release。若反过来直接 release，线程会
-     * 因"Pending dequeue output buffer request cancelled"崩溃并拖垮进程。
+     * 顺序：先 codec.stop() 唤醒 dequeue（抛 IllegalStateException，已捕获），
+     * join 等线程结束，最后 release。
      */
     private void stopEncoderThread() {
         if (thread == null) {
             releaseCodec();
             return;
         }
-        // 1. stop codec 唤醒 dequeue（幂等：codec 可能已在异常路径释放）
         try {
             if (codec != null) {
                 codec.stop();
@@ -232,14 +199,12 @@ public final class DisplayEncoder {
         } catch (Exception ignored) {
             // ignore
         }
-        // 2. 等编码线程退出（stop 唤醒后应很快返回；2s 兜底）
         try {
             thread.join(2000);
         } catch (InterruptedException ignored) {
-            // ignore
+            Thread.currentThread().interrupt();
         }
         thread = null;
-        // 3. 释放资源
         releaseCodec();
     }
 

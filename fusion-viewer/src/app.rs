@@ -7,8 +7,11 @@
 //! - ESC = 返回，窗口尺寸变化 → RESIZE_DISPLAY（弹性显示器）
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+
+use kulua_proto::generated::ctrl_msg;
+use kulua_proto::session::{Event, UdpSession};
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
@@ -21,8 +24,7 @@ use winit::window::{Window, WindowId};
 use crate::args::Args;
 use crate::control::{self, POINTER_ID_MOUSE, key_action, touch_action};
 use crate::decoder::DecodedFrame;
-use crate::server::ViewerSession;
-use crate::video::VideoEvent;
+use crate::video::{VideoEvent, VideoInput};
 use crate::yuv::render_yuv420_to_rgbx;
 
 /// Android 键盘 meta 标志（KeyEvent.META_*）。
@@ -45,7 +47,12 @@ const RESIZE_STABLE_TICKS: u32 = 2;
 
 pub struct ViewerApp {
     args: Args,
-    session: ViewerSession,
+    /// UDP 会话（事件流消费者 + 输入注入发送器）
+    session: UdpSession,
+    /// server 分配的虚拟显示器 id
+    display_id: u32,
+    /// 把 UDP 会话的媒体/config 事件转发给解码线程
+    video_input_tx: Sender<VideoInput>,
     video_rx: Receiver<VideoEvent>,
 
     // 窗口与渲染（Arc<Window> 让 softbuffer Context 无生命周期问题）
@@ -77,10 +84,18 @@ pub struct ViewerApp {
 }
 
 impl ViewerApp {
-    pub fn new(args: Args, session: ViewerSession, video_rx: Receiver<VideoEvent>) -> Self {
+    pub fn new(
+        args: Args,
+        session: UdpSession,
+        display_id: u32,
+        video_input_tx: Sender<VideoInput>,
+        video_rx: Receiver<VideoEvent>,
+    ) -> Self {
         Self {
             args,
             session,
+            display_id,
+            video_input_tx,
             video_rx,
             window: None,
             context: None,
@@ -96,6 +111,41 @@ impl ViewerApp {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
             last_error: None,
+        }
+    }
+
+    /// 关闭 UDP 会话（发 BYE；main 在事件循环退出后调用）。
+    pub fn shutdown(&mut self) {
+        self.session.close();
+    }
+
+    /// 消费 UDP 会话事件：视频/config 转发给解码线程，其余忽略/错误处理。
+    fn drain_session(&mut self) {
+        while let Some(event) = self.session.try_recv() {
+            match event {
+                Event::Video(frame) => {
+                    let _ = self.video_input_tx.send(VideoInput::Frame(frame));
+                }
+                Event::Control(msg) => {
+                    // 视频 codec config（H.264 SPS/PPS）走可靠 MediaConfig
+                    if let Some(ctrl_msg::Msg::MediaConfig(cfg)) = msg.msg {
+                        if cfg.stream == 2 {
+                            let _ = self.video_input_tx.send(VideoInput::Config(cfg.data));
+                        }
+                    }
+                    // 剪贴板等事件由 session 负责，viewer 忽略（保持 drain）
+                }
+                Event::Audio(_) => {}
+                Event::Error(e) => {
+                    eprintln!("[viewer] 会话错误: {}", e);
+                    self.last_error = Some(e);
+                }
+                Event::Closed => {
+                    eprintln!("[viewer] 会话已关闭（设备断开或 server 退出）");
+                    self.last_error = Some("设备断开或 server 退出".into());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -115,17 +165,6 @@ impl ViewerApp {
                     // START_APP 已在连接后由 main 发送（displayId 握手时即返回，
                     // 空显示器无帧，等首帧会死锁）
                     self.latest_frame = Some(frame);
-                }
-                VideoEvent::Session {
-                    width,
-                    height,
-                    client_resized,
-                } => {
-                    // 分辨率变化日志；渲染以解码帧自带的尺寸为准
-                    println!(
-                        "[viewer] 分辨率 {}x{} (client_resized={})",
-                        width, height, client_resized
-                    );
                 }
                 VideoEvent::Error(e) => {
                     eprintln!("[viewer] {}", e);
@@ -235,11 +274,11 @@ impl ViewerApp {
     }
 
     /// 当前视频分辨率（触摸消息的 screen_w/screen_h 字段）。
-    fn video_size(&self) -> (u16, u16) {
+    fn video_size(&self) -> (u32, u32) {
         match &self.latest_frame {
             Some(f) => (
-                f.width.min(u16::MAX as usize) as u16,
-                f.height.min(u16::MAX as usize) as u16,
+                f.width.min(u32::MAX as usize) as u32,
+                f.height.min(u32::MAX as usize) as u32,
             ),
             None => (0, 0),
         }
@@ -251,8 +290,8 @@ impl ViewerApp {
             return;
         }
         let msg = control::inject_touch(
-            self.session.display_id,
-            action,
+            self.display_id,
+            action as u32,
             POINTER_ID_MOUSE,
             x,
             y,
@@ -262,7 +301,7 @@ impl ViewerApp {
             0,
             0,
         );
-        let _ = self.session.send(&msg);
+        let _ = self.session.send_ctrl(&msg);
     }
 
     fn send_keycode(&mut self, action: u8, keycode: u32, modifiers: &ModifiersState) {
@@ -279,8 +318,8 @@ impl ViewerApp {
         if modifiers.super_key() {
             meta |= meta::META_ON;
         }
-        let msg = control::inject_keycode(self.session.display_id, action, keycode, 0, meta);
-        let _ = self.session.send(&msg);
+        let msg = control::inject_keycode(self.display_id, action as u32, keycode, 0, meta);
+        let _ = self.session.send_ctrl(&msg);
     }
 
     fn handle_keyboard(
@@ -299,8 +338,8 @@ impl ViewerApp {
             if let Some(text) = text {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() && !modifiers.control_key() && !modifiers.alt_key() {
-                    let msg = control::inject_text(self.session.display_id, trimmed);
-                    let _ = self.session.send(&msg);
+                    let msg = control::inject_text(self.display_id, trimmed);
+                    let _ = self.session.send_ctrl(&msg);
                     return;
                 }
             }
@@ -324,17 +363,8 @@ impl ViewerApp {
             }
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
         };
-        let msg = control::inject_scroll(
-            self.session.display_id,
-            x,
-            y,
-            sw,
-            sh,
-            hscroll,
-            vscroll,
-            0,
-        );
-        let _ = self.session.send(&msg);
+        let msg = control::inject_scroll(self.display_id, x, y, sw, sh, hscroll, vscroll, 0);
+        let _ = self.session.send_ctrl(&msg);
     }
 
     /// 轮询窗口当前尺寸，稳定后发 RESIZE_DISPLAY。
@@ -365,10 +395,8 @@ impl ViewerApp {
         // 分辨率设成与窗口完全一致可能超出 MediaCodec 编码能力上限或带宽
         // 预算，系数 <1 时以更低分辨率编码、由 FFmpeg 放大到窗口，画质
         // 略降但流畅度与带宽更可控；>1 则超采样更清晰。
-        let w = ((size.width as f32 * self.args.scale).round() as u32)
-            .clamp(1, u16::MAX as u32);
-        let h = ((size.height as f32 * self.args.scale).round() as u32)
-            .clamp(1, u16::MAX as u32);
+        let w = ((size.width as f32 * self.args.scale).round() as u32).clamp(1, u16::MAX as u32);
+        let h = ((size.height as f32 * self.args.scale).round() as u32).clamp(1, u16::MAX as u32);
         let current = (w, h);
         if current == self.last_sent_size {
             self.observed_size = current; // 与已发送一致，无操作
@@ -387,7 +415,15 @@ impl ViewerApp {
         }
         // 尺寸已稳定：发送。成功才记录 last_sent（失败下轮重试）
         self.stable_ticks = 0;
-        if self.session.resize_display(w as u16, h as u16).is_ok() {
+        if self
+            .session
+            .send_ctrl(&control::resize_display(
+                self.display_id,
+                w as u32,
+                h as u32,
+            ))
+            .is_ok()
+        {
             self.last_sent_size = current;
         }
     }
@@ -442,6 +478,7 @@ impl ApplicationHandler for ViewerApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.drain_session();
                 self.drain_video_events();
                 self.render();
             }
@@ -479,8 +516,9 @@ impl ApplicationHandler for ViewerApp {
                             ElementState::Pressed => key_action::DOWN,
                             ElementState::Released => key_action::UP,
                         };
-                        let _ =
-                            self.session.send(&control::back_or_screen_on(self.session.display_id, action));
+                        let _ = self
+                            .session
+                            .send_ctrl(&control::back_or_screen_on(self.display_id, action as u32));
                     }
                     _ => {}
                 }
@@ -497,8 +535,8 @@ impl ApplicationHandler for ViewerApp {
                 // 含非 ASCII 的提交（纯 ASCII 由 KeyboardInput 注入）
                 if let Ime::Commit(text) = ime {
                     if !text.is_empty() && !text.is_ascii() {
-                        let msg = control::inject_text(self.session.display_id, &text);
-                        let _ = self.session.send(&msg);
+                        let msg = control::inject_text(self.display_id, &text);
+                        let _ = self.session.send_ctrl(&msg);
                     }
                 }
             }
@@ -521,6 +559,7 @@ impl ApplicationHandler for ViewerApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // 被视频线程 user event 唤醒或需要重绘时刷新
+        self.drain_session();
         if let Some(window) = &self.window {
             window.request_redraw();
         }

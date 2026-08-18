@@ -1,16 +1,18 @@
 //! 命令行参数解析（纯函数，便于单测）。
 //!
-//! 用法：`fusion-viewer.exe --connect <port> --package <pkg> [--label <名称>] [--display <WxH/DPI>] [--scale <系数>]`
+//! 用法：`fusion-viewer.exe --connect <ip:port> --package <pkg> [--label <名称>] [--display <WxH/DPI>] [--scale <系数>]`
 //!
-//! 连接模式：viewer 不部署 server，而是连接 daemon session 已启动的
-//! kulua-server（`adb forward tcp:<port>` 由 session 建立），通过
-//! video 连接创建虚拟显示器。
+//! 连接模式：viewer 不部署 server，而是直连 daemon session 已启动的
+//! kulua-server（`phone IP:UDP端口`，无 adb forward），通过 CreateDisplay
+//! 控制消息创建虚拟显示器。
+
+use std::net::SocketAddr;
 
 /// viewer 启动参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
-    /// ADB forward 本地端口（session 已部署 server）
-    pub port: u16,
+    /// phone 直连地址（IP:UDP 端口，session 已部署 server）
+    pub addr: SocketAddr,
     /// 要启动的应用包名
     pub package: String,
     /// 窗口标题中的应用名（缺省用包名）
@@ -18,7 +20,6 @@ pub struct Args {
     /// 初始虚拟显示器尺寸，如 `1280x960/160`（缺省用默认值）
     pub display: String,
     /// 虚拟显示器分辨率相对窗口物理尺寸的缩放系数
-    /// （如 1.0 = 与窗口一致，0.5 = 窗口的一半；缺省 1.0）
     pub scale: f32,
 }
 
@@ -47,7 +48,7 @@ pub const SCALE_MAX: f32 = 4.0;
 ///
 /// 支持 `--key value` 与 `--key=value` 两种形式；未知参数报错。
 pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, String> {
-    let mut port = None;
+    let mut addr = None;
     let mut package = None;
     let mut label = String::new();
     let mut display = DEFAULT_DISPLAY.to_string();
@@ -69,9 +70,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         match key {
             "--connect" => {
                 let v = value()?;
-                port = Some(
+                addr = Some(
                     v.parse()
-                        .map_err(|_| format!("非法端口: {}", v))?,
+                        .map_err(|_| format!("非法地址（应为 ip:port）: {}", v))?,
                 );
             }
             "--package" => package = Some(value()?),
@@ -92,11 +93,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         }
     }
 
-    let port = port.ok_or_else(|| "缺少 --connect 参数".to_string())?;
+    let addr = addr.ok_or_else(|| "缺少 --connect 参数".to_string())?;
     let package = package.ok_or_else(|| "缺少 --package 参数".to_string())?;
 
     Ok(Args {
-        port,
+        addr,
         package,
         label,
         display,
@@ -112,11 +113,15 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn addr() -> SocketAddr {
+        "192.168.1.5:27183".parse().unwrap()
+    }
+
     #[test]
     fn parses_all_options() {
         let a = parse_args(args(&[
             "--connect",
-            "27183",
+            "192.168.1.5:27183",
             "--package",
             "com.android.settings",
             "--label",
@@ -127,7 +132,7 @@ mod tests {
             "0.5",
         ]))
         .unwrap();
-        assert_eq!(a.port, 27183);
+        assert_eq!(a.addr, addr());
         assert_eq!(a.package, "com.android.settings");
         assert_eq!(a.label, "设置");
         assert_eq!(a.display, "1024x768/160");
@@ -137,17 +142,23 @@ mod tests {
     #[test]
     fn supports_equals_form() {
         let a = parse_args(args(&[
-            "--connect=27183",
+            "--connect=192.168.1.5:27183",
             "--package=com.android.settings",
         ]))
         .unwrap();
-        assert_eq!(a.port, 27183);
+        assert_eq!(a.addr, addr());
         assert_eq!(a.package, "com.android.settings");
     }
 
     #[test]
     fn applies_defaults() {
-        let a = parse_args(args(&["--connect", "27183", "--package", "pkg"])).unwrap();
+        let a = parse_args(args(&[
+            "--connect",
+            "192.168.1.5:27183",
+            "--package",
+            "pkg",
+        ]))
+        .unwrap();
         assert_eq!(a.label, "");
         assert_eq!(a.display, DEFAULT_DISPLAY);
         assert_eq!(a.scale, DEFAULT_SCALE);
@@ -156,7 +167,7 @@ mod tests {
     #[test]
     fn supports_scale_equals_form() {
         let a = parse_args(args(&[
-            "--connect=27183",
+            "--connect=192.168.1.5:27183",
             "--package=pkg",
             "--scale=2.0",
         ]))
@@ -166,33 +177,82 @@ mod tests {
 
     #[test]
     fn invalid_scale_is_error() {
-        // 非数字
-        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "abc"])).is_err());
-        // 超出范围
-        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "0"])).is_err());
-        assert!(parse_args(args(&["--connect", "1", "--package", "pkg", "--scale", "10"])).is_err());
+        assert!(
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--scale",
+                "abc"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--scale",
+                "0"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--scale",
+                "10"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
     fn window_title_uses_label_or_package() {
-        let with_label =
-            parse_args(args(&["--connect", "1", "--package", "pkg", "--label", "应用名"])).unwrap();
+        let with_label = parse_args(args(&[
+            "--connect",
+            "192.168.1.5:27183",
+            "--package",
+            "pkg",
+            "--label",
+            "应用名",
+        ]))
+        .unwrap();
         assert_eq!(with_label.window_title(), "应用名");
 
-        let without_label = parse_args(args(&["--connect", "1", "--package", "pkg"])).unwrap();
+        let without_label = parse_args(args(&[
+            "--connect",
+            "192.168.1.5:27183",
+            "--package",
+            "pkg",
+        ]))
+        .unwrap();
         assert_eq!(without_label.window_title(), "pkg");
     }
 
     #[test]
     fn missing_required_is_error() {
         assert!(parse_args(args(&["--package", "pkg"])).is_err());
-        assert!(parse_args(args(&["--connect", "27183"])).is_err());
+        assert!(parse_args(args(&["--connect", "192.168.1.5:27183"])).is_err());
     }
 
     #[test]
     fn unknown_option_is_error() {
         assert!(
-            parse_args(args(&["--connect", "1", "--package", "pkg", "--bogus", "x"])).is_err()
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--bogus",
+                "x"
+            ]))
+            .is_err()
         );
     }
 
@@ -202,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_port_is_error() {
+    fn invalid_addr_is_error() {
         assert!(parse_args(args(&["--connect", "abc", "--package", "pkg"])).is_err());
     }
 }

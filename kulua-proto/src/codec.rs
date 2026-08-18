@@ -3,7 +3,7 @@
 //! 协议语义见 `proto/direct.proto` 与 `docs/direct-udp-protocol.md`。
 //! 每个 UDP datagram = 恰好一个 `Frame`（protobuf 二进制）。
 
-use crate::generated::{ctrl_msg, frame, CtrlMsg, Frame};
+use crate::generated::{CtrlMsg, Frame, ctrl_msg, frame};
 
 /// Wi-Fi 安全 UDP payload 上限。IP/UDP 头 28B，1500 MTU 下 1200 很保守，
 /// 含路径 MTU / 802.11 开销余量。
@@ -28,7 +28,14 @@ pub fn media_fragments(
 ) -> Vec<Frame> {
     if data.is_empty() {
         return vec![media_frame(
-            stream, msg_seq, msg_id, 0, 0, media_pts, media_flags, &[],
+            stream,
+            msg_seq,
+            msg_id,
+            0,
+            0,
+            media_pts,
+            media_flags,
+            &[],
         )];
     }
     let total = data.len().div_ceil(MAX_FRAGMENT) as u32;
@@ -134,7 +141,11 @@ impl MediaReassembler {
         };
         let seq = frame.seq;
         // 过期 / 重复消息
-        if seq < self.last_seq || (seq == self.last_seq && self.last_seq != 0 && !self.parts.contains_key(&frame.msg_id)) {
+        if seq < self.last_seq
+            || (seq == self.last_seq
+                && self.last_seq != 0
+                && !self.parts.contains_key(&frame.msg_id))
+        {
             return None;
         }
         let total = if frame.frag_total == 0 {
@@ -159,18 +170,15 @@ impl MediaReassembler {
             });
         }
 
-        let part = self
-            .parts
-            .entry(frame.msg_id)
-            .or_insert_with(|| Part {
-                seq,
-                total,
-                frags: vec![None; total],
-                n: 0,
-                pts: frame.media_pts,
-                flags: frame.media_flags,
-                touched: std::time::Instant::now(),
-            });
+        let part = self.parts.entry(frame.msg_id).or_insert_with(|| Part {
+            seq,
+            total,
+            frags: vec![None; total],
+            n: 0,
+            pts: frame.media_pts,
+            flags: frame.media_flags,
+            touched: std::time::Instant::now(),
+        });
         part.touched = std::time::Instant::now();
         // 同一消息的多个 msg_id 不应并存（单生产者顺序流）
         if part.seq != seq {
@@ -231,14 +239,7 @@ mod tests {
     #[test]
     fn media_fragments_roundtrip() {
         let data: Vec<u8> = (0..2500).map(|i| (i % 251) as u8).collect();
-        let frags = media_fragments(
-            frame::Stream::Video,
-            7,
-            11,
-            123,
-            MEDIA_FLAG_KEYFRAME,
-            &data,
-        );
+        let frags = media_fragments(frame::Stream::Video, 7, 11, 123, MEDIA_FLAG_KEYFRAME, &data);
         assert!(frags.len() > 1);
         let mut reassembler = MediaReassembler::new();
         let mut got = None;
@@ -256,16 +257,7 @@ mod tests {
     #[test]
     fn media_dedup_stale_seq() {
         let data = vec![1u8, 2, 3];
-        let f = media_frame(
-            frame::Stream::Audio,
-            5,
-            0,
-            0,
-            0,
-            0,
-            0,
-            &data,
-        );
+        let f = media_frame(frame::Stream::Audio, 5, 0, 0, 0, 0, 0, &data);
         let mut r = MediaReassembler::new();
         assert!(r.push(&f).is_some());
         // 旧序号重复
