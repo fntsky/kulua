@@ -48,11 +48,12 @@ const RESIZE_STABLE_TICKS: u32 = 2;
 /// 虚拟显示器分辨率上限（单边）。
 ///
 /// 目标分辨率始终取自**实时窗口物理尺寸**，但高 DPI 大屏 / `--scale>1` 会让
-/// 结果远超 MediaCodec 的实际编码能力（多数设备 H.264 编码上限在 1080p~4K）：
+/// 结果远超 MediaCodec 的实际编码能力（多数设备 H.264 编码上限在 1080p~2K）：
 /// 超大分辨率会导致编码器失败或输出异常（表现为“画面/缩放没反应”）。
-const MAX_DISPLAY_DIMENSION: u32 = 3840;
-/// 虚拟显示器总面积上限（4K：3840×2160）。
-const MAX_DISPLAY_PIXELS: u64 = 3840u64 * 2160u64;
+/// 上限按 2K（QHD：2560×1440）设置。
+const MAX_DISPLAY_DIMENSION: u32 = 2560;
+/// 虚拟显示器总面积上限（2K：2560×1440）。
+const MAX_DISPLAY_PIXELS: u64 = 2560u64 * 1440u64;
 
 /// 把目标分辨率截到上限内：**统一缩放因子**，同时满足
 /// 单边 ≤ `MAX_DISPLAY_DIMENSION` 与总面积 ≤ `MAX_DISPLAY_PIXELS`，且保持
@@ -633,7 +634,7 @@ mod tests {
     fn cap_clamps_single_dimension() {
         // 8192 超宽 → 统一缩小，单边 ≤3840 且保持宽高比
         let (w, h) = cap_display(8192, 1080);
-        assert_eq!(w, 3840, "宽截到上限");
+        assert_eq!(w, 2560, "宽截到上限");
         assert!(h < 1080, "超高景宽比 → 高按比例缩小, got {w}x{h}");
         // 比例 ≈ 8192/1080
         assert!(
@@ -642,7 +643,7 @@ mod tests {
         );
 
         let (w2, h2) = cap_display(1080, 8192);
-        assert_eq!(h2, 3840, "高截到上限");
+        assert_eq!(h2, 2560, "高截到上限");
         assert!(
             ((w2 as f64 / h2 as f64) - 1080.0 / 8192.0).abs() < 0.02,
             "应等比, got {w2}x{h2}"
@@ -650,16 +651,16 @@ mod tests {
     }
 
     #[test]
-    fn cap_scales_down_when_area_exceeds_4k() {
-        // 3840x3840 > 4K → 等比缩到面积 ≤ 4K
+    fn cap_scales_down_when_area_exceeds_2k() {
+        // 3840x3840 > 2K → 等比缩到面积 ≤ 2K
         let (w, h) = cap_display(3840, 3840);
-        assert!(w as u64 * h as u64 <= 3840u64 * 2160u64, "面积应 ≤ 4K");
+        assert!(w as u64 * h as u64 <= 2560u64 * 1440u64, "面积应 ≤ 2K");
         // 宽高比基本保持（±1 取整误差）
         let ratio = w as f64 / h as f64;
         assert!((ratio - 1.0).abs() < 0.01, "应等比缩放, got {w}x{h}");
 
-        let (w2, h2) = cap_display(7680, 4320); // 8K 16:9 → 等比缩到 ≤4K
-        assert_eq!((w2, h2), (3840, 2160), "8K 应等比缩到 4K");
+        let (w2, h2) = cap_display(7680, 4320); // 8K 16:9 → 等比缩到 ≤2K
+        assert_eq!((w2, h2), (2560, 1440), "8K 应等比缩到 2K");
     }
 
     #[test]
