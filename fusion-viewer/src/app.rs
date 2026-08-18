@@ -47,9 +47,9 @@ const RESIZE_STABLE_TICKS: u32 = 2;
 
 /// 虚拟显示器分辨率上限（单边）。
 ///
-/// 目标分辨率始终取自**实时窗口物理尺寸**，但高 DPI 大屏 / `--scale>1` 会让
-/// 结果远超 MediaCodec 的实际编码能力（多数设备 H.264 编码上限在 1080p~2K）：
-/// 超大分辨率会导致编码器失败或输出异常（表现为“画面/缩放没反应”）。
+/// 目标分辨率 = 实时窗口物理尺寸 ÷ 缩放系数，但高 DPI 大屏 / 系数<1（超采样）
+/// 仍可能把结果推到远超 MediaCodec 实际编码能力（多数设备 H.264 编码上限在
+/// 1080p~2K）：超大分辨率会导致编码器失败或输出异常（表现“画面/缩放没反应”）。
 /// 上限按 2K（QHD：2560×1440）设置。
 const MAX_DISPLAY_DIMENSION: u32 = 2560;
 /// 虚拟显示器总面积上限（2K：2560×1440）。
@@ -74,6 +74,16 @@ fn cap_display(w: u32, h: u32) -> (u32, u32) {
     let nw = (w as f64 * scale).floor().max(1.0) as u32;
     let nh = (h as f64 * scale).floor().max(1.0) as u32;
     (nw, nh)
+}
+
+/// 目标分辨率 = 窗口物理尺寸 ÷ 缩放系数，再套 2K 上限。
+///
+/// `window_*` 为窗口物理像素；`scale>1` = 放大系数，即编码分辨率比窗口小
+/// （降低分辨率），窗口越大照常按比例压低。上限与因子一起计算（先除再截）。
+fn target_display(window_w: u32, window_h: u32, scale: f32) -> (u32, u32) {
+    let w = (window_w as f32 / scale).round() as u32;
+    let h = (window_h as f32 / scale).round() as u32;
+    cap_display(w.max(1), h.max(1))
 }
 
 pub struct ViewerApp {
@@ -424,15 +434,12 @@ impl ViewerApp {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        // 虚拟显示器分辨率 = 窗口物理尺寸 × 缩放系数（--scale）。
-        // 为什么乘以系数：窗口尺寸就是用户看到的画面大小，但把虚拟显示器
-        // 分辨率设成与窗口完全一致可能超出 MediaCodec 编码能力上限或带宽
-        // 预算，系数 <1 时以更低分辨率编码、由 FFmpeg 放大到窗口，画质
-        // 略降但流畅度与带宽更可控；>1 则超采样更清晰。
-        // 每轮都以 window.inner_size()（物理像素）实时计算，再截到编码能力上限。
-        let w = ((size.width as f32 * self.args.scale).round() as u32).max(1);
-        let h = ((size.height as f32 * self.args.scale).round() as u32).max(1);
-        let (w, h) = cap_display(w, h);
+        // 虚拟显示器分辨率 = 窗口物理尺寸 ÷ 缩放系数（--scale）。
+        // WHY 用除法：系数语义是“把视频放大几倍铺到窗口”——系数 >1 意味着
+        // 编码分辨率比窗口小（更低分辨率编码，由 FFmpeg 放大到窗口），即
+        // “降低分辨率”；窗口越大照常按比例压低。默认 1.5 = 1/1.5 分辨率。
+        // 每轮以窗口物理尺寸实时计算：先除以因子（scale>1 = 降低分辨率），再套上限
+        let (w, h) = target_display(size.width, size.height, self.args.scale);
         let current = (w, h);
         if current == self.last_sent_size {
             self.observed_size = current; // 与已发送一致，无操作
@@ -621,7 +628,7 @@ impl ApplicationHandler for ViewerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_display;
+    use super::{cap_display, target_display};
 
     #[test]
     fn cap_keeps_normal_sizes_unchanged() {
@@ -667,5 +674,23 @@ mod tests {
     fn cap_never_zero() {
         let (w, h) = cap_display(0, 0);
         assert!(w >= 1 && h >= 1);
+    }
+
+    #[test]
+    fn target_scale_1_5_reduces_resolution() {
+        // 1920x1080 窗口 / 1.5 = 1280x720（降低分辨率，放大 1.5 倍铺满窗口）
+        assert_eq!(target_display(1920, 1080, 1.5), (1280, 720));
+        assert_eq!(target_display(2560, 1440, 1.5), (1707, 960));
+        assert_eq!(target_display(1280, 960, 1.0), (1280, 960), "scale=1 原样");
+    }
+
+    #[test]
+    fn target_scale_1_5_is_capped_with_factor() {
+        // 4K 窗口 / 1.5 = 2560x1440 → 正好 2K 上限
+        assert_eq!(target_display(3840, 2160, 1.5), (2560, 1440));
+        // 8K 窗口 / 1.5 = 5120x2880 → 上限重算为 2K
+        let (w, h) = target_display(7680, 4320, 1.5);
+        assert!(w as u64 * h as u64 <= 2560u64 * 1440u64, "面积应 ≤ 2K");
+        assert_eq!((w, h), (2560, 1440));
     }
 }

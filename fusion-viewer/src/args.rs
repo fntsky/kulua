@@ -19,7 +19,8 @@ pub struct Args {
     pub label: String,
     /// 初始虚拟显示器尺寸，如 `1280x960/160`（缺省用默认值）
     pub display: String,
-    /// 虚拟显示器分辨率相对窗口物理尺寸的缩放系数
+    /// 虚拟显示器分辨率的放大系数：目标分辨率 = 窗口物理尺寸 ÷ scale
+    /// （scale>1 = 更低分辨率编码、由 FFmpeg 放大到窗口，即降低分辨率；缺省 1.5）
     pub scale: f32,
 }
 
@@ -37,8 +38,10 @@ impl Args {
 /// 默认虚拟显示器尺寸/DPI（与 scrcpy `-x` 模式默认一致）。
 pub const DEFAULT_DISPLAY: &str = "1280x960/160";
 
-/// 默认缩放系数：视频分辨率 = 窗口物理尺寸 × 1.0。
-pub const DEFAULT_SCALE: f32 = 1.0;
+/// 默认缩放系数：虚拟显示器分辨率 = 窗口物理尺寸 ÷ 1.5。
+///
+/// 语义是“放大系数”：把 1/1.5 分辨率的视频放大 1.5 倍铺满窗口 → 降低编码分辨率。
+pub const DEFAULT_SCALE: f32 = 1.5;
 
 /// 缩放系数允许范围。
 pub const SCALE_MIN: f32 = 0.1;
