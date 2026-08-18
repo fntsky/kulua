@@ -148,7 +148,6 @@ mod tests {
     /// DisplayReady。验证 viewer 的握手与 server 完全一致（scid/message 编码）。
     #[test]
     fn connect_handshake_matches_kulua_server_protocol() {
-        use std::net::UdpSocket as StdUdpSocket;
         use std::sync::mpsc;
 
         let listen = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

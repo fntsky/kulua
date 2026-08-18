@@ -4,7 +4,7 @@
 //! control 流（MediaConfig）到达，媒体帧为已重装完整的 `AssembledMedia`。
 //! 本线程只做解码，不直接碰 socket。
 
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use winit::event_loop::EventLoopProxy;
 
@@ -37,14 +37,14 @@ pub enum VideoInput {
 pub fn spawn_video_thread(
     rx: Receiver<VideoInput>,
     codec_id: u32,
-    tx: Sender<VideoEvent>,
+    tx: SyncSender<VideoEvent>,
     proxy: EventLoopProxy<()>,
 ) {
     std::thread::spawn(move || {
         let mut decoder = match VideoDecoder::new(codec_id) {
             Ok(d) => d,
             Err(e) => {
-                let _ = tx.send(VideoEvent::Error(e));
+                let _ = tx.try_send(VideoEvent::Error(e));
                 return;
             }
         };
@@ -61,7 +61,7 @@ pub fn spawn_video_thread(
                         match crate::decoder::avcc_to_annexb(&payload) {
                             Some(conv) => conv,
                             None => {
-                                let _ = tx.send(VideoEvent::Error(
+                                let _ = tx.try_send(VideoEvent::Error(
                                     "config 帧既不是 Annex-B 也无法解析为 avcC".into(),
                                 ));
                                 return;
@@ -70,17 +70,18 @@ pub fn spawn_video_thread(
                     };
                     if !decoder.is_open() {
                         if let Err(e) = decoder.set_extradata(&annexb) {
-                            let _ = tx.send(VideoEvent::Error(format!("设置 extradata 失败: {e}")));
+                            let _ =
+                                tx.try_send(VideoEvent::Error(format!("设置 extradata 失败: {e}")));
                             return;
                         }
                         if let Err(e) = decoder.open() {
-                            let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {e}")));
+                            let _ = tx.try_send(VideoEvent::Error(format!("打开解码器失败: {e}")));
                             return;
                         }
                     } else {
                         // 已打开：resize 后新编码器发出新分辨率 SPS/PPS，必须重置
                         if let Err(e) = decoder.reset_with_extradata(&annexb) {
-                            let _ = tx.send(VideoEvent::Error(format!("重置解码器失败: {e}")));
+                            let _ = tx.try_send(VideoEvent::Error(format!("重置解码器失败: {e}")));
                             return;
                         }
                         println!("[viewer] 解码器已按新分辨率重置");
@@ -98,7 +99,7 @@ pub fn spawn_video_thread(
                     }
                     if !decoder.is_open() {
                         if let Err(e) = decoder.open() {
-                            let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {e}")));
+                            let _ = tx.try_send(VideoEvent::Error(format!("打开解码器失败: {e}")));
                             return;
                         }
                     }
@@ -106,35 +107,33 @@ pub fn spawn_video_thread(
                     let pts = frame.pts as i64;
                     match decoder.decode(&frame.data, Some(pts), keyframe) {
                         Ok(Some(frame)) => {
-                            if tx.send(VideoEvent::Frame(frame)).is_err() {
-                                return;
-                            }
+                            let _ = tx.try_send(VideoEvent::Frame(frame));
                             let _ = proxy.send_event(());
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            let _ = tx.send(VideoEvent::Error(format!("解码失败: {e}")));
+                            let _ = tx.try_send(VideoEvent::Error(format!("解码失败: {e}")));
                             return;
                         }
                     }
                 }
             }
         }
-        let _ = tx.send(VideoEvent::Closed);
+        let _ = tx.try_send(VideoEvent::Closed);
     });
 }
 
 /// 罕见的内联 config 帧处理（与 VideoInput::Config 同逻辑）。
-fn rx_tx_config(decoder: &mut VideoDecoder, data: Vec<u8>, tx: &Sender<VideoEvent>) {
+fn rx_tx_config(decoder: &mut VideoDecoder, data: Vec<u8>, tx: &SyncSender<VideoEvent>) {
     if let Err(e) = decoder.set_extradata(&data) {
-        let _ = tx.send(VideoEvent::Error(format!("设置 extradata 失败: {e}")));
+        let _ = tx.try_send(VideoEvent::Error(format!("设置 extradata 失败: {e}")));
         return;
     }
     if !decoder.is_open() {
         if let Err(e) = decoder.open() {
-            let _ = tx.send(VideoEvent::Error(format!("打开解码器失败: {e}")));
+            let _ = tx.try_send(VideoEvent::Error(format!("打开解码器失败: {e}")));
         }
     } else if let Err(e) = decoder.reset_with_extradata(&data) {
-        let _ = tx.send(VideoEvent::Error(format!("重置解码器失败: {e}")));
+        let _ = tx.try_send(VideoEvent::Error(format!("重置解码器失败: {e}")));
     }
 }

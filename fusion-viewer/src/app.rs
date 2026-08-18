@@ -7,7 +7,7 @@
 //! - ESC = 返回，窗口尺寸变化 → RESIZE_DISPLAY（弹性显示器）
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use kulua_proto::generated::ctrl_msg;
@@ -93,7 +93,7 @@ pub struct ViewerApp {
     /// server 分配的虚拟显示器 id
     display_id: u32,
     /// 把 UDP 会话的媒体/config 事件转发给解码线程
-    video_input_tx: Sender<VideoInput>,
+    video_input_tx: SyncSender<VideoInput>,
     video_rx: Receiver<VideoEvent>,
 
     // 窗口与渲染（Arc<Window> 让 softbuffer Context 无生命周期问题）
@@ -131,7 +131,7 @@ impl ViewerApp {
         args: Args,
         session: UdpSession,
         display_id: u32,
-        video_input_tx: Sender<VideoInput>,
+        video_input_tx: SyncSender<VideoInput>,
         video_rx: Receiver<VideoEvent>,
     ) -> Self {
         Self {
@@ -168,13 +168,17 @@ impl ViewerApp {
         while let Some(event) = self.session.try_recv() {
             match event {
                 Event::Video(frame) => {
-                    let _ = self.video_input_tx.send(VideoInput::Frame(frame));
+                    // try_send：解码线程忙 / 通道满时丢弃新帧（视频容忍丢帧，
+                    // 渲染最新帧即可）。绝不让 main 阻塞在 send 上——
+                    // std mpsc::channel 是 rendezvous，若用阻塞 send 会与解码
+                    // 线程的 send 互相等待 → 打开即卡死。
+                    let _ = self.video_input_tx.try_send(VideoInput::Frame(frame));
                 }
                 Event::Control(msg) => {
                     // 视频 codec config（H.264 SPS/PPS）走可靠 MediaConfig
                     if let Some(ctrl_msg::Msg::MediaConfig(cfg)) = msg.msg {
                         if cfg.stream == 2 {
-                            let _ = self.video_input_tx.send(VideoInput::Config(cfg.data));
+                            let _ = self.video_input_tx.try_send(VideoInput::Config(cfg.data));
                         }
                     }
                     // 剪贴板等事件由 session 负责，viewer 忽略（保持 drain）
@@ -183,10 +187,12 @@ impl ViewerApp {
                 Event::Error(e) => {
                     eprintln!("[viewer] 会话错误: {}", e);
                     self.last_error = Some(e);
+                    self.should_exit = true;
                 }
                 Event::Closed => {
                     eprintln!("[viewer] 会话已关闭（设备断开或 server 退出）");
                     self.last_error = Some("设备断开或 server 退出".into());
+                    self.should_exit = true;
                 }
                 _ => {}
             }
