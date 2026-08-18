@@ -19,8 +19,9 @@ pub struct Args {
     pub label: String,
     /// 初始虚拟显示器尺寸，如 `1280x960/160`（缺省用默认值）
     pub display: String,
-    /// 虚拟显示器分辨率的放大系数：目标分辨率 = 窗口物理尺寸 ÷ scale
-    /// （scale>1 = 更低分辨率编码、由 FFmpeg 放大到窗口，即降低分辨率；缺省 1.5）
+    /// 虚拟显示器分辨率的放大系数：目标分辨率 = 窗口物理尺寸 ÷ scale（结果对齐
+    /// 到偶数，H.264 宏块要求）；scale>1 = 更低分辨率编码、由 FFmpeg 放大到窗口
+    /// （降低分辨率；缺省 1.5）
     pub scale: f32,
     /// `--debug`：启动诊断（2s 心跳/事件计数到 stderr）
     pub debug: bool,

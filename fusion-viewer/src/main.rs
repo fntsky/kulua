@@ -61,7 +61,7 @@ fn main() {
     //    send 会阻塞到对方 recv —— 本架构 main 喂解码线程、解码线程又喂 main，
     //    两个阻塞 send 会互相等待死锁（打开即卡死）。有界 + try_send 满了丢新帧
     //    （视频容忍丢帧，渲染用最新帧即可），任何线程都不阻塞在 send 上。
-    let (video_input_tx, video_input_rx) = mpsc::sync_channel::<video::VideoInput>(8);
+    let (video_input_tx, video_input_rx) = mpsc::sync_channel::<video::VideoInput>(64);
     let (video_event_tx, video_event_rx) = mpsc::sync_channel::<video::VideoEvent>(8);
     let codec_id = session.codec_id;
     video::spawn_video_thread(video_input_rx, codec_id, video_event_tx, proxy);

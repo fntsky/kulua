@@ -80,14 +80,22 @@ fn cap_display(w: u32, h: u32) -> (u32, u32) {
     (nw, nh)
 }
 
-/// 目标分辨率 = 窗口物理尺寸 ÷ 缩放系数，再套 2K 上限。
+/// 目标分辨率 = 窗口物理尺寸 ÷ 缩放系数，再套 2K 上限，并**对齐到偶数**。
 ///
 /// `window_*` 为窗口物理像素；`scale>1` = 放大系数，即编码分辨率比窗口小
 /// （降低分辨率），窗口越大照常按比例压低。上限与因子一起计算（先除再截）。
+/// 为何对齐偶数：H.264/MediaCodec 要求宽高为宏块对齐（偶数），`窗口/1.5` 常得
+/// 奇数（如 2240/1.5=1493），奇数尺寸会让设备端编码器失败/输出花屏。
 fn target_display(window_w: u32, window_h: u32, scale: f32) -> (u32, u32) {
     let w = (window_w as f32 / scale).round() as u32;
     let h = (window_h as f32 / scale).round() as u32;
-    cap_display(w.max(1), h.max(1))
+    let (w, h) = cap_display(w.max(1), h.max(1));
+    (even_dim(w), even_dim(h))
+}
+
+/// 对齐到不小于 2 的偶数（H.264 宏块对齐）。
+fn even_dim(v: u32) -> u32 {
+    (v.max(2)) & !1
 }
 
 pub struct ViewerApp {
@@ -654,8 +662,10 @@ impl ApplicationHandler for ViewerApp {
             self.last_resize_check = Instant::now();
             self.poll_window_size();
         }
-        // 诊断：--debug 时每 2s 打印存活心跳（主线程卡死 → 心跳消失，定位卡点）
-        if self.args.debug && self.last_debug.elapsed() >= Duration::from_secs(2) {
+        // 诊断：--debug 或环境变量 KULUA_DEBUG=1（daemon 拉起的 viewer 用环境变量）
+        // 时每 2s 打印存活心跳（主线程卡死 → 心跳消失，定位卡点）
+        let debug = self.args.debug || std::env::var("KULUA_DEBUG").is_ok_and(|v| v == "1");
+        if debug && self.last_debug.elapsed() >= Duration::from_secs(2) {
             self.last_debug = Instant::now();
             eprintln!(
                 "[viewer:alive] t={:.1}s frame={} win={:?}",
@@ -677,7 +687,7 @@ impl ApplicationHandler for ViewerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_display, target_display};
+    use super::{cap_display, even_dim, target_display};
 
     #[test]
     fn cap_keeps_normal_sizes_unchanged() {
@@ -729,8 +739,26 @@ mod tests {
     fn target_scale_1_5_reduces_resolution() {
         // 1920x1080 窗口 / 1.5 = 1280x720（降低分辨率，放大 1.5 倍铺满窗口）
         assert_eq!(target_display(1920, 1080, 1.5), (1280, 720));
-        assert_eq!(target_display(2560, 1440, 1.5), (1707, 960));
+        assert_eq!(
+            target_display(2560, 1440, 1.5),
+            (1706, 960),
+            "2560/1.5=1706.67→1706 偶数"
+        );
         assert_eq!(target_display(1280, 960, 1.0), (1280, 960), "scale=1 原样");
+    }
+
+    #[test]
+    fn target_always_even_for_h264() {
+        // 2240/1.5=1493.33 → 1492（偶数）；1680/1.5=1120
+        assert_eq!(target_display(2240, 1680, 1.5), (1492, 1120));
+        assert_eq!(target_display(1920, 1080, 1.5), (1280, 720));
+        // 任意输入都返回偶数
+        assert_eq!(even_dim(1), 2);
+        for (w, h) in [(1, 1), (3, 5), (1000, 1001), (2559, 1441), (7680, 4320)] {
+            let (ew, eh) = target_display(w, h, 1.5);
+            assert!(ew % 2 == 0 && eh % 2 == 0, "应偶对齐 got {ew}x{eh}");
+            assert!(ew >= 2 && eh >= 2);
+        }
     }
 
     #[test]
