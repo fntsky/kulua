@@ -45,6 +45,36 @@ const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 尺寸需连续稳定多少轮才发送 RESIZE_DISPLAY（500ms × 2 = 1s）。
 const RESIZE_STABLE_TICKS: u32 = 2;
 
+/// 虚拟显示器分辨率上限（单边）。
+///
+/// 目标分辨率始终取自**实时窗口物理尺寸**，但高 DPI 大屏 / `--scale>1` 会让
+/// 结果远超 MediaCodec 的实际编码能力（多数设备 H.264 编码上限在 1080p~4K）：
+/// 超大分辨率会导致编码器失败或输出异常（表现为“画面/缩放没反应”）。
+const MAX_DISPLAY_DIMENSION: u32 = 3840;
+/// 虚拟显示器总面积上限（4K：3840×2160）。
+const MAX_DISPLAY_PIXELS: u64 = 3840u64 * 2160u64;
+
+/// 把目标分辨率截到上限内：**统一缩放因子**，同时满足
+/// 单边 ≤ `MAX_DISPLAY_DIMENSION` 与总面积 ≤ `MAX_DISPLAY_PIXELS`，且保持
+/// 原始宽高比（避免高 DPI 大窗口 / scale>1 时分辨率爆到编码器能力之外）。
+fn cap_display(w: u32, h: u32) -> (u32, u32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    // 各边上限的缩放因子
+    let mut scale = 1.0f64;
+    scale = scale.min(MAX_DISPLAY_DIMENSION as f64 / w as f64);
+    scale = scale.min(MAX_DISPLAY_DIMENSION as f64 / h as f64);
+    // 面积上限（4K）的缩放因子
+    let area_scale = ((MAX_DISPLAY_PIXELS as f64) / (w as u64 * h as u64) as f64).sqrt();
+    scale = scale.min(area_scale);
+    if scale >= 1.0 {
+        return (w, h); // 未超上限，原样返回
+    }
+    let nw = (w as f64 * scale).floor().max(1.0) as u32;
+    let nh = (h as f64 * scale).floor().max(1.0) as u32;
+    (nw, nh)
+}
+
 pub struct ViewerApp {
     args: Args,
     /// UDP 会话（事件流消费者 + 输入注入发送器）
@@ -398,8 +428,10 @@ impl ViewerApp {
         // 分辨率设成与窗口完全一致可能超出 MediaCodec 编码能力上限或带宽
         // 预算，系数 <1 时以更低分辨率编码、由 FFmpeg 放大到窗口，画质
         // 略降但流畅度与带宽更可控；>1 则超采样更清晰。
-        let w = ((size.width as f32 * self.args.scale).round() as u32).clamp(1, u16::MAX as u32);
-        let h = ((size.height as f32 * self.args.scale).round() as u32).clamp(1, u16::MAX as u32);
+        // 每轮都以 window.inner_size()（物理像素）实时计算，再截到编码能力上限。
+        let w = ((size.width as f32 * self.args.scale).round() as u32).max(1);
+        let h = ((size.height as f32 * self.args.scale).round() as u32).max(1);
+        let (w, h) = cap_display(w, h);
         let current = (w, h);
         if current == self.last_sent_size {
             self.observed_size = current; // 与已发送一致，无操作
@@ -583,5 +615,56 @@ impl ApplicationHandler for ViewerApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap_display;
+
+    #[test]
+    fn cap_keeps_normal_sizes_unchanged() {
+        assert_eq!(cap_display(1280, 960), (1280, 960));
+        assert_eq!(cap_display(1920, 1080), (1920, 1080));
+        assert_eq!(cap_display(1, 1), (1, 1));
+    }
+
+    #[test]
+    fn cap_clamps_single_dimension() {
+        // 8192 超宽 → 统一缩小，单边 ≤3840 且保持宽高比
+        let (w, h) = cap_display(8192, 1080);
+        assert_eq!(w, 3840, "宽截到上限");
+        assert!(h < 1080, "超高景宽比 → 高按比例缩小, got {w}x{h}");
+        // 比例 ≈ 8192/1080
+        assert!(
+            ((w as f64 / h as f64) - 8192.0 / 1080.0).abs() < 0.02,
+            "应等比, got {w}x{h}"
+        );
+
+        let (w2, h2) = cap_display(1080, 8192);
+        assert_eq!(h2, 3840, "高截到上限");
+        assert!(
+            ((w2 as f64 / h2 as f64) - 1080.0 / 8192.0).abs() < 0.02,
+            "应等比, got {w2}x{h2}"
+        );
+    }
+
+    #[test]
+    fn cap_scales_down_when_area_exceeds_4k() {
+        // 3840x3840 > 4K → 等比缩到面积 ≤ 4K
+        let (w, h) = cap_display(3840, 3840);
+        assert!(w as u64 * h as u64 <= 3840u64 * 2160u64, "面积应 ≤ 4K");
+        // 宽高比基本保持（±1 取整误差）
+        let ratio = w as f64 / h as f64;
+        assert!((ratio - 1.0).abs() < 0.01, "应等比缩放, got {w}x{h}");
+
+        let (w2, h2) = cap_display(7680, 4320); // 8K 16:9 → 等比缩到 ≤4K
+        assert_eq!((w2, h2), (3840, 2160), "8K 应等比缩到 4K");
+    }
+
+    #[test]
+    fn cap_never_zero() {
+        let (w, h) = cap_display(0, 0);
+        assert!(w >= 1 && h >= 1);
     }
 }
