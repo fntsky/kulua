@@ -109,7 +109,10 @@ public final class UdpServer {
     /** 清扫空闲客户端（watchdog 之外的双保险）。 */
     private void sweepIdle() {
         long now = System.nanoTime();
-        for (ClientConnection c : clients.values()) {
+        // 快照迭代：close() 内会从 clients 移除，HashSet/HashMap 边遍历边改会抛 CME
+        java.util.List<ClientConnection> snapshot =
+                new java.util.ArrayList<>(clients.values());
+        for (ClientConnection c : snapshot) {
             if (now - c.lastActivityNanos() >= SESSION_TIMEOUT_NANOS) {
                 c.close(ClientConnection.ClientCloseReason.REASON_IDLE);
             }

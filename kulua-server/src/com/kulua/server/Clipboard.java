@@ -180,7 +180,7 @@ public final class Clipboard {
         }
     }
 
-    /** 剪贴板变化时的订阅回调（ConnectionManager 注册）。 */
+    /** 剪贴板变化时的订阅回调（ClientConnection 注册）。 */
     public interface ChangeListener {
         void onClipboardChanged(String text);
     }
