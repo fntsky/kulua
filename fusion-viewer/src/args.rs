@@ -22,6 +22,8 @@ pub struct Args {
     /// 虚拟显示器分辨率的放大系数：目标分辨率 = 窗口物理尺寸 ÷ scale
     /// （scale>1 = 更低分辨率编码、由 FFmpeg 放大到窗口，即降低分辨率；缺省 1.5）
     pub scale: f32,
+    /// `--debug`：启动诊断（2s 心跳/事件计数到 stderr）
+    pub debug: bool,
 }
 
 impl Args {
@@ -56,6 +58,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
     let mut label = String::new();
     let mut display = DEFAULT_DISPLAY.to_string();
     let mut scale = DEFAULT_SCALE;
+    let mut debug = false;
 
     let mut iter = iter.into_iter();
     while let Some(arg) = iter.next() {
@@ -99,6 +102,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
                 }
                 scale = s;
             }
+            "--debug" => debug = true,
             other => return Err(format!("未知参数: {}", other)),
         }
     }
@@ -112,6 +116,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         label,
         display,
         scale,
+        debug,
     })
 }
 

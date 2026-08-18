@@ -45,6 +45,10 @@ const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 尺寸需连续稳定多少轮才发送 RESIZE_DISPLAY（500ms × 2 = 1s）。
 const RESIZE_STABLE_TICKS: u32 = 2;
 
+/// 渲染节流：两次 present 之间至少间隔（≈ 60fps 上限）。
+/// 防止解码线程每帧唤醒重绘时，render 里 buffer::present 把事件循环占死。
+const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
 /// 虚拟显示器分辨率上限（单边）。
 ///
 /// 目标分辨率 = 实时窗口物理尺寸 ÷ 缩放系数，但高 DPI 大屏 / 系数<1（超采样）
@@ -113,8 +117,14 @@ pub struct ViewerApp {
     last_sent_size: (u32, u32),
     /// 最近一帧（渲染用）
     latest_frame: Option<DecodedFrame>,
+    /// 是否有新画面/尺寸变化待重绘（按需渲染，避免事件循环自激忙转）
+    needs_render: bool,
+    /// 上次 present 时刻（节流 ≤60fps，防止 buffer::present 阻塞事件循环）
+    last_render: Instant,
     /// viewer 启动时刻（用于打印首帧耗时，诊断"应用启动很久"）
     started_at: Instant,
+    /// KULUA_DEBUG=1 时的心跳计时（主线程若卡死，心跳会消失）
+    last_debug: Instant,
 
     // 输入状态
     mouse_down: bool,
@@ -149,7 +159,10 @@ impl ViewerApp {
             stable_ticks: 0,
             last_sent_size: (0, 0), // (0,0) 保证首次轮询必然发送
             latest_frame: None,
+            needs_render: true,
+            last_render: Instant::now(),
             started_at: Instant::now(),
+            last_debug: Instant::now(),
             mouse_down: false,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
@@ -215,6 +228,7 @@ impl ViewerApp {
                     // START_APP 已在连接后由 main 发送（displayId 握手时即返回，
                     // 空显示器无帧，等首帧会死锁）
                     self.latest_frame = Some(frame);
+                    self.needs_render = true;
                 }
                 VideoEvent::Error(e) => {
                     eprintln!("[viewer] {}", e);
@@ -230,7 +244,7 @@ impl ViewerApp {
 
     /// 渲染最新帧到窗口（letterbox 等比显示）。
     fn render(&mut self) {
-        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
+        let (Some(_window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
         let Some(frame) = self.latest_frame.as_ref() else {
@@ -240,6 +254,13 @@ impl ViewerApp {
         if win_w == 0 || win_h == 0 {
             return;
         }
+        // 节流 ≤60fps：present/交换链可能阻塞（等上一帧/合成器），解码过快时
+        // 跳帧只保留最新画面，避免事件循环卡死在 render 里（窗口“卡死”）。
+        if self.last_render.elapsed() < MIN_RENDER_INTERVAL {
+            self.needs_render = true; // 留待下一次
+            return;
+        }
+        self.last_render = Instant::now();
 
         let vw = frame.width as f64;
         let vh = frame.height as f64;
@@ -297,7 +318,6 @@ impl ViewerApp {
             pixels[dst_start..dst_start + row_bytes]
                 .copy_from_slice(&video_pixels[src_start..src_start + row_bytes]);
         }
-        let _ = window.request_redraw();
         let _ = buffer.present();
     }
 
@@ -510,6 +530,11 @@ impl ApplicationHandler for ViewerApp {
         self.context = context.ok();
         self.surface = surface;
         self.window = Some(window);
+        // 首帧/首次尺寸：请求重绘（按需渲染会处理）
+        self.needs_render = true;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -522,14 +547,19 @@ impl ApplicationHandler for ViewerApp {
                 // Resized 事件在拖动/DPI 变化时可能丢事件或不稳定触发，
                 // 轮询窗口实际尺寸更可靠（见 poll_window_size）
                 self.window_size = (size.width, size.height);
+                self.needs_render = true; // 新尺寸需要重新 letterbox
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
+                // 按需渲染：有新画面/尺寸变化才真正 present，防止事件循环自激忙转
                 self.drain_session();
                 self.drain_video_events();
-                self.render();
+                if self.needs_render {
+                    self.needs_render = false;
+                    self.render();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;
@@ -607,25 +637,38 @@ impl ApplicationHandler for ViewerApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // 被视频线程 user event 唤醒或需要重绘时刷新
+        // 事件循环即将进入空闲：消费会话事件，只在有内容待画时才请求重绘
         self.drain_session();
         if self.should_exit {
             // 会话已死：结束事件循环，避免窗口僵死
             event_loop.exit();
             return;
         }
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.needs_render {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
         // 每 500ms 轮询窗口尺寸 → 弹性显示器 resize（稳定 1s 才发，见 poll_window_size）
         if self.last_resize_check.elapsed() >= RESIZE_POLL_INTERVAL {
             self.last_resize_check = Instant::now();
             self.poll_window_size();
         }
+        // 诊断：--debug 时每 2s 打印存活心跳（主线程卡死 → 心跳消失，定位卡点）
+        if self.args.debug && self.last_debug.elapsed() >= Duration::from_secs(2) {
+            self.last_debug = Instant::now();
+            eprintln!(
+                "[viewer:alive] t={:.1}s frame={} win={:?}",
+                self.started_at.elapsed().as_secs_f32(),
+                self.latest_frame.is_some(),
+                self.window_size,
+            );
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
         // 视频线程每解码一帧发送 user event 唤醒事件循环
+        self.needs_render = true; // 可能已有新帧待渲染
         if let Some(window) = &self.window {
             window.request_redraw();
         }
