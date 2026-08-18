@@ -81,6 +81,8 @@ pub struct ViewerApp {
     /// 当前修饰键状态（ModifiersChanged 事件维护）
     modifiers: ModifiersState,
     last_error: Option<String>,
+    /// 会话致命错误/关闭时置位，触发窗口退出（避免"看起来活着其实是死的"）
+    should_exit: bool,
 }
 
 impl ViewerApp {
@@ -111,6 +113,7 @@ impl ViewerApp {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
             last_error: None,
+            should_exit: false,
         }
     }
 
@@ -557,9 +560,14 @@ impl ApplicationHandler for ViewerApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // 被视频线程 user event 唤醒或需要重绘时刷新
         self.drain_session();
+        if self.should_exit {
+            // 会话已死：结束事件循环，避免窗口僵死
+            event_loop.exit();
+            return;
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }

@@ -142,6 +142,10 @@ final class ClientConnection {
             close(ClientCloseReason.REASON_CTRL_DEAD);
             return;
         }
+        // 回累积 ACK：PC 的可靠发送靠 ACK 释放滑动窗口。若不回，PC 窗口积压 →
+        // 重传超限判死 → 连接关闭（实测输入注入 / RESIZE / 剪贴板全部失效）。
+        // 单线程接收循环里处理完一条即回一次（累积确认天然抗 ACK 丢失）。
+        sendAck();
         for (byte[] bytes : delivered) {
             try {
                 CtrlMsg msg = CtrlMsg.parseFrom(bytes);
@@ -150,6 +154,17 @@ final class ClientConnection {
                 Log.w(TAG, "bad ctrl msg from " + addr, e);
             }
         }
+    }
+
+    /** 发送控制流累积 ACK（确认到 ackSeq()，含）。 */
+    private void sendAck() {
+        int ack = ctrlReceiver.ackSeq();
+        server.sendDatagramRaw(addr, Frame.newBuilder()
+                .setStreamValue(Frame.Stream.CTRL.getNumber())
+                .setTypeValue(Frame.Type.ACK.getNumber())
+                .setAckSeq(ack)
+                .build()
+                .toByteArray());
     }
 
     /** 回复 HELLO_ACK（初始 codec 状态）。audio_codec=0 表示未请求/禁用。 */
