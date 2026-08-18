@@ -24,6 +24,7 @@ symphonia = { version = "0.5", features = ["aac", "flac", "pcm"] }
 
 uuid = { version = "1", features = ["serde", "v4"] }
 serde_json = "1"
+md-5 = "0.10"
 kulua-proto = { path = "../kulua-proto" }
 
 [target.'cfg(windows)'.dependencies]

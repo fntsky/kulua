@@ -105,6 +105,31 @@ pub struct ScrcpyServer {
     pub port: u16,
 }
 
+/// 判断本地 jar 是否需要 push 到设备：本地缺失 / 远程缺失 / 内容 md5 不一致。
+///
+/// WHY: 只看“远程存在”会跳过协议换代后的重新部署（设备上残留旧 jar → UDP
+/// 直连握手超时）。用 `md5sum` 比较内容，本地重建过就重新 push，内容一致才跳过。
+fn jar_needs_push(adb: &dyn AdbOps, serial: &str, local: &str, remote: &str) -> bool {
+    let Ok(local_bytes) = std::fs::read(local) else {
+        return true; // 本地缺失按需 push 处理（调用方随后会报 push 失败）
+    };
+    let remote_md5 = adb
+        .run(&["-s", serial, "shell", "md5sum", remote])
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        });
+    let local_md5 = {
+        use md5::Digest;
+        format!("{:x}", md5::Md5::digest(&local_bytes))
+    };
+    remote_md5.as_deref() != Some(local_md5.as_str())
+}
+
 /// 远程 jar 路径（自研 kulua-server，替代官方 scrcpy-server）。
 pub const REMOTE_JAR: &str = "/data/local/tmp/kulua-server.jar";
 
@@ -142,14 +167,15 @@ impl ScrcpyServer {
         mark("kill_by_scid");
 
         let remote_jar = REMOTE_JAR;
-        let needs_push = adb
-            .run(&["-s", &device.serial, "shell", "test", "-f", remote_jar])
-            .is_err();
+        // 本地/远程内容比较（md5）：仅当缺失或内容不一致才 push。
+        // WHY：不能只看“文件是否存在”——协议换代/重新构建后本地 jar 已变，
+        // 若仍沿用设备上的旧 jar（如旧 TCP localabstract 版），UDP 直连会握手超时。
+        let needs_push = jar_needs_push(adb, &device.serial, local_jar, remote_jar);
         mark("jar 检查");
         if needs_push {
             adb.push(device, local_jar, remote_jar)?;
         } else {
-            println!("kulua-server.jar already exists on device, skipping push");
+            println!("kulua-server.jar already up-to-date on device, skipping push");
         }
         mark("jar push（如需）");
 

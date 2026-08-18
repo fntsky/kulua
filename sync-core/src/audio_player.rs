@@ -411,7 +411,11 @@ mod tests {
         assert_eq!(AudioCodec::from_name("aac"), AudioCodec::Aac);
         assert_eq!(AudioCodec::from_name("flac"), AudioCodec::Flac);
         assert_eq!(AudioCodec::from_name("raw"), AudioCodec::Raw);
-        assert_eq!(AudioCodec::from_name("bogus"), AudioCodec::Raw, "无效名回退 raw");
+        assert_eq!(
+            AudioCodec::from_name("bogus"),
+            AudioCodec::Raw,
+            "无效名回退 raw"
+        );
         // 握手索引与 server readRequestedCodec 一致
         assert_eq!(AudioCodec::Raw.handshake_byte(), 0);
         assert_eq!(AudioCodec::Opus.handshake_byte(), 1);

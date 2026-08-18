@@ -5427,6 +5427,7 @@ dependencies = [
  "futures",
  "image",
  "kulua-proto",
+ "md-5",
  "mdns-sd",
  "notify-rust",
  "opus",
