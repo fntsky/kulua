@@ -156,58 +156,96 @@ public final class Device {
         return ok;
     }
 
-    /** 启动应用到指定显示器（shell 权限下用 `am start --display <id>`）。 */
+    /** 启动应用到指定显示器（shell 权限下用 `am start`）。 */
     public static void startApp(String packageName, int displayId) {
-        try {
-            java.util.List<String> command = new java.util.ArrayList<>();
-            command.add("am");
-            command.add("start");
-            command.add("-a");
-            command.add("android.intent.action.MAIN");
-            command.add("-c");
-            command.add("android.intent.category.LAUNCHER");
-            command.add("-p");
-            command.add(packageName);
-            if (displayId != 0) {
-                command.add("--display");
-                command.add(String.valueOf(displayId));
-            }
-            // 诊断：System.err 会随 daemon 的 `adb shell` stderr 转发显示出来
-            // （Log.i 只进 logcat，daemon 看不到）。
-            System.err.println("[kulua] startApp " + packageName
-                    + " display=" + displayId + " cmd=" + String.join(" ", command));
-            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-            // 为什么异步等待：`am start` 每次都要冷启动一个 app_process 虚拟机
-            // （实测 1~3s），同步 waitFor 会阻塞本 control 连接的消息处理线程，
-            // 期间输入注入等消息全部排队（应用已开始启动但控制通道被卡住）。
-            // 改为后台线程等待退出并记录结果；输出也要 drain，避免 am 写满
-            // 管道缓冲而自己阻塞。
-            new Thread(() -> {
-                try {
-                    StringBuilder out = new StringBuilder(4096);
-                    byte[] buf = new byte[1024];
-                    while (process.getInputStream().read(buf) != -1) {
-                        // 最多保留 8KB 供诊断
-                        if (out.length() < 8192) {
-                            out.append(new String(buf, java.nio.charset.StandardCharsets.UTF_8));
-                        }
-                    }
-                    int exit = process.waitFor();
-                    String msg = out.toString().trim();
-                    System.err.println("[kulua] startApp done " + packageName
-                            + " display=" + displayId + " exit=" + exit
-                            + (msg.isEmpty() ? "" : " out=" + msg));
-                    Log.i(TAG, "start app " + packageName + " on display " + displayId
-                            + " exit=" + exit);
-                } catch (IOException e) {
-                    Log.w(TAG, "start app stream: " + packageName, e);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+        new Thread(() -> {
+            try {
+                // 1) 先解析该包的 LAUNCHER 组件。WHY：个别应用（如高德）的 launcher
+                //    用 activity-alias / 非常规 manifest，`am start -p pkg -a MAIN
+                //    -c LAUNCHER` 会 "unable to resolve Intent"（实测），应用根本没启动。
+                //    用隐藏命令 resolve-activity 拿到真实组件后用 `-n` 启动，最可靠。
+                String component = resolveLauncher(packageName);
+                System.err.println("[kulua] startApp " + packageName
+                        + " display=" + displayId + " component=" + component);
+
+                java.util.List<String> command = new java.util.ArrayList<>();
+                command.add("am");
+                command.add("start");
+                if (component != null) {
+                    command.add("-n");
+                    command.add(component);
+                } else {
+                    // 解析不到 launcher → 回退旧方式（错误信息随 out 返回，便于诊断）
+                    command.add("-a");
+                    command.add("android.intent.action.MAIN");
+                    command.add("-c");
+                    command.add("android.intent.category.LAUNCHER");
+                    command.add("-p");
+                    command.add(packageName);
                 }
-            }, "am-start-" + packageName).start();
+                if (displayId != 0) {
+                    command.add("--display");
+                    command.add(String.valueOf(displayId));
+                }
+                // 诊断：System.err 会随 daemon 的 `adb shell` stderr 转发显示出来
+                // （Log.i 只进 logcat，daemon 看不到）。
+                System.err.println("[kulua] startApp cmd=" + String.join(" ", command));
+
+                Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+                // 异步等待：`am start` 每次要冷启动一个 app_process 虚拟机（1~3s），
+                // 同步 waitFor 会阻塞 control 连接的处理线程。输出要 drain，防管道写满。
+                StringBuilder out = new StringBuilder(4096);
+                byte[] buf = new byte[1024];
+                while (process.getInputStream().read(buf) != -1) {
+                    if (out.length() < 8192) {
+                        out.append(new String(buf, java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                }
+                int exit = process.waitFor();
+                String msg = out.toString().trim();
+                System.err.println("[kulua] startApp done " + packageName
+                        + " display=" + displayId + " exit=" + exit
+                        + (msg.isEmpty() ? "" : " out=" + msg));
+                Log.i(TAG, "start app " + packageName + " on display " + displayId
+                        + " exit=" + exit);
+            } catch (Exception e) {
+                System.err.println("[kulua] startApp failed " + packageName + ": " + e);
+                Log.e(TAG, "start app failed: " + packageName, e);
+            }
+        }, "am-start-" + packageName).start();
+    }
+
+    /**
+     * 解析包名的 LAUNCHER 组件（`cmd package resolve-activity --brief`）。
+     *
+     * 返回形如 `com.autonavi.minimap/com.autonavi.minimap.main.MainActivity`；
+     * 无 launcher / 命令失败返回 null（调用方回退 `-p` 方式）。
+     * Android 8+ 支持该隐藏命令。
+     */
+    private static String resolveLauncher(String packageName) {
+        try {
+            Process p = new ProcessBuilder("cmd", "package", "resolve-activity", "--brief",
+                    "-a", "android.intent.action.MAIN",
+                    "-c", "android.intent.category.LAUNCHER",
+                    packageName).redirectErrorStream(true).start();
+            StringBuilder out = new StringBuilder(4096);
+            byte[] buf = new byte[1024];
+            while (p.getInputStream().read(buf) != -1) {
+                if (out.length() < 4096) {
+                    out.append(new String(buf, java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            p.waitFor();
+            for (String line : out.toString().split("\n")) {
+                String t = line.trim();
+                if (t.contains("/")) {
+                    return t;
+                }
+            }
+            return null;
         } catch (Exception e) {
-            System.err.println("[kulua] startApp failed " + packageName + ": " + e);
-            Log.e(TAG, "start app failed: " + packageName, e);
+            Log.w(TAG, "resolveLauncher failed: " + packageName, e);
+            return null;
         }
     }
 }
