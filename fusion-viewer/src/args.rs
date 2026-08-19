@@ -1,6 +1,9 @@
 //! 命令行参数解析（纯函数，便于单测）。
 //!
-//! 用法：`fusion-viewer.exe --connect <ip:port> --package <pkg> [--label <名称>] [--display <WxH/DPI>] [--scale <系数>]`
+//! 用法：`fusion-viewer.exe --connect <ip:port> --package <pkg> [--label <名称>] [--display <WxH/DPI>] [--scale <系数>] [--dpi <80-600>]`
+//!
+//! 清晰度 = 分辨率÷scale（越小越清晰，1.0≈1:1）；字体大小 = --dpi（越大字体越大）。
+//! daemon 拉起时可设 Windows 环境变量 KULUA_SCALE / KULUA_DPI（重启 daemon 生效）。
 //!
 //! 连接模式：viewer 不部署 server，而是直连 daemon session 已启动的
 //! kulua-server（`phone IP:UDP端口`，无 adb forward），通过 CreateDisplay
@@ -23,6 +26,9 @@ pub struct Args {
     /// 到偶数，H.264 宏块要求）；scale>1 = 更低分辨率编码、由 FFmpeg 放大到窗口
     /// （降低分辨率；缺省 1.5）
     pub scale: f32,
+    /// 虚拟显示器 DPI（控制 Android 端字体/控件大小：越大字体越大）。
+    /// 缺省由环境变量 KULUA_DPI 决定，否则 160；写死不随分辨率变化。
+    pub dpi: u16,
     /// `--debug`：启动诊断（2s 心跳/事件计数到 stderr）
     pub debug: bool,
 }
@@ -44,7 +50,11 @@ pub const DEFAULT_DISPLAY: &str = "1280x960/160";
 /// 默认缩放系数：虚拟显示器分辨率 = 窗口物理尺寸 ÷ 1.5。
 ///
 /// 语义是“放大系数”：把 1/1.5 分辨率的视频放大 1.5 倍铺满窗口 → 降低编码分辨率。
+/// 清晰度：scale 越接近 1.0 ≈ 1:1 像素最清晰；可被环境变量 KULUA_SCALE 覆盖。
 pub const DEFAULT_SCALE: f32 = 1.5;
+
+/// 默认虚拟显示器 DPI（字体大小基准）。可被 `--dpi` / 环境变量 KULUA_DPI 覆盖。
+pub const DEFAULT_DPI: u16 = 160;
 
 /// 缩放系数允许范围。
 pub const SCALE_MIN: f32 = 0.1;
@@ -58,7 +68,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
     let mut package = None;
     let mut label = String::new();
     let mut display = DEFAULT_DISPLAY.to_string();
-    let mut scale = DEFAULT_SCALE;
+    let mut scale = match std::env::var("KULUA_SCALE") {
+        Ok(v) => v.parse::<f32>().unwrap_or(DEFAULT_SCALE),
+        Err(_) => DEFAULT_SCALE,
+    };
+    let mut dpi = match std::env::var("KULUA_DPI") {
+        Ok(v) => v.parse::<u16>().unwrap_or(DEFAULT_DPI),
+        Err(_) => DEFAULT_DPI,
+    };
     let mut debug = false;
 
     let mut iter = iter.into_iter();
@@ -103,6 +120,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
                 }
                 scale = s;
             }
+            "--dpi" => {
+                let v = value()?;
+                let d: u16 = v.parse().map_err(|_| format!("非法 DPI: {}", v))?;
+                if !(80..=600).contains(&d) {
+                    return Err(format!("DPI {} 超出范围 [80, 600]", d));
+                }
+                dpi = d;
+            }
             "--debug" => debug = true,
             other => return Err(format!("未知参数: {}", other)),
         }
@@ -117,6 +142,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, Strin
         label,
         display,
         scale,
+        dpi,
         debug,
     })
 }
@@ -275,6 +301,64 @@ mod tests {
     #[test]
     fn missing_value_is_error() {
         assert!(parse_args(args(&["--connect"])).is_err());
+    }
+
+    #[test]
+    fn parses_dpi() {
+        let a = parse_args(args(&[
+            "--connect",
+            "192.168.1.5:27183",
+            "--package",
+            "pkg",
+            "--dpi",
+            "240",
+        ]))
+        .unwrap();
+        assert_eq!(a.dpi, 240);
+        assert_eq!(a.scale, DEFAULT_SCALE, "未给 --scale 用默认");
+    }
+
+    #[test]
+    fn invalid_dpi_is_error() {
+        assert!(
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--dpi",
+                "abc"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(args(&["--connect", "1", "--package", "pkg", "--dpi", "10"])).is_err(),
+            "<80 拒绝"
+        );
+        assert!(
+            parse_args(args(&[
+                "--connect",
+                "1",
+                "--package",
+                "pkg",
+                "--dpi",
+                "9999"
+            ]))
+            .is_err(),
+            ">600 拒绝"
+        );
+    }
+
+    #[test]
+    fn default_dpi_is_160() {
+        let a = parse_args(args(&[
+            "--connect",
+            "192.168.1.5:27183",
+            "--package",
+            "pkg",
+        ]))
+        .unwrap();
+        assert_eq!(a.dpi, 160);
     }
 
     #[test]

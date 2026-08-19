@@ -35,8 +35,10 @@ impl ViewerSession {
     /// 连接已有 kulua-server 并创建虚拟显示器。
     ///
     /// 阻塞直到 HELLO 握手 + DisplayReady 都完成（或超时失败）。
-    pub fn connect(addr: SocketAddr, display: &str) -> Result<Self, String> {
-        let (width, height, dpi) = parse_display(display)?;
+    pub fn connect(addr: SocketAddr, display: &str, dpi: u16) -> Result<Self, String> {
+        // --display 提供 WxH（尺寸随后会被 resize 覆盖）；DPI 用独立参数（可调字体大小）
+        let (width, height, _) = parse_display(display)?;
+        let dpi = dpi.clamp(80, 600);
         let scid = scid_for_port(addr.port());
         let mut session = UdpSession::connect(addr, &scid, false)
             .map_err(|e| format!("连接 {addr} 失败: {e}"))?;
@@ -232,7 +234,7 @@ mod tests {
             }
         });
 
-        let session = ViewerSession::connect(addr, "1280x960/160").unwrap();
+        let session = ViewerSession::connect(addr, "1280x960/160", 160).unwrap();
         assert_eq!(session.display_id, 42);
         assert_eq!(session.codec_id, 0x68323634);
         let (w, h, dpi) = done_rx

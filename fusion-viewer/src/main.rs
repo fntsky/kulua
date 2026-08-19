@@ -26,7 +26,7 @@ fn main() {
     let window_title = args.window_title();
 
     // 连接已有 kulua-server + 创建虚拟显示器（HELLO → CreateDisplay → DisplayReady）
-    let mut session = match server::ViewerSession::connect(args.addr, &args.display) {
+    let mut session = match server::ViewerSession::connect(args.addr, &args.display, args.dpi) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("fusion-viewer: 连接失败: {}", e);
