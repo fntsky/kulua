@@ -335,6 +335,11 @@ impl UdpSession {
         self.state.lock().unwrap().hello_ack.clone()
     }
 
+    /// 视频流累计丢失的消息数（HUD 丢包率用）。
+    pub fn video_lost(&self) -> u64 {
+        self.video_rx.lock().unwrap().lost()
+    }
+
     /// 关闭会话（发 BYE + 停线程 + 关 socket）。
     pub fn close(&mut self) {
         self.closed.store(true, Ordering::SeqCst);

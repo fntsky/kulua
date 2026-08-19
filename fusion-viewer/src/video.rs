@@ -1,23 +1,26 @@
-//! 视频解码线程：接收上层转发的视频帧/配置 → FFmpeg 解码 → 送渲染事件。
+//! 视频解码线程：接收上层转发的视频帧/配置 → FFmpeg 解码 → YUV→RGBA → 送 UI。
 //!
 //! 数据源是 UDP 会话的事件流（`VideoInput`）：config 帧（H.264 SPS/PPS）经可靠
 //! control 流（MediaConfig）到达，媒体帧为已重装完整的 `AssembledMedia`。
-//! 本线程只做解码，不直接碰 socket。
+//! 本线程做解码 + YUV→RGBA 转换（把重活移出 UI 线程），UI 只上传纹理。
 
 use std::sync::mpsc::{Receiver, SyncSender};
 
-use winit::event_loop::EventLoopProxy;
-
 use crate::decoder::{DecodedFrame, VideoDecoder};
+use crate::yuv::render_yuv420_to_rgba;
 use kulua_proto::codec::AssembledMedia;
 
 /// 单帧最大字节数（安全上限，防异常流撑爆内存）。
 const MAX_FRAME_SIZE: usize = 50 * 1024 * 1024;
 
-/// 视频线程 → 主线程事件。
+/// 解码线程 → UI 线程事件。
 pub enum VideoEvent {
-    /// 解码出的一帧（YUV420P）
-    Frame(DecodedFrame),
+    /// 解码 + 转 RGBA 完成的帧（UI 上传 egui 纹理）。
+    Frame {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
     /// 流错误（解码失败 / 连接断开）
     Error(String),
     /// 流正常结束
@@ -33,13 +36,8 @@ pub enum VideoInput {
     Frame(AssembledMedia),
 }
 
-/// 启动视频解码线程。每产生一帧都会通过 proxy 发送 user event 唤醒事件循环。
-pub fn spawn_video_thread(
-    rx: Receiver<VideoInput>,
-    codec_id: u32,
-    tx: SyncSender<VideoEvent>,
-    proxy: EventLoopProxy<()>,
-) {
+/// 启动视频解码线程。
+pub fn spawn_video_thread(rx: Receiver<VideoInput>, codec_id: u32, tx: SyncSender<VideoEvent>) {
     std::thread::spawn(move || {
         let mut decoder = match VideoDecoder::new(codec_id) {
             Ok(d) => d,
@@ -52,9 +50,9 @@ pub fn spawn_video_thread(
         while let Ok(input) = rx.recv() {
             match input {
                 VideoInput::Config(payload) => {
-                    // 与旧实现在同一语义：非 Annex-B（通常 avcC 长度前缀）转
-                    // Annex-B，防止与媒体帧模式冲突；vivo 等设备 IDR 不自带
-                    // SPS/PPS，config 是唯一参数来源，不能丢弃。
+                    // 语义同旧实现：非 Annex-B（通常 avcC 长度前缀）转 Annex-B，
+                    // 防止与媒体帧模式冲突；vivo 等设备 IDR 不自带 SPS/PPS，
+                    // config 是唯一参数来源，不能丢弃。
                     let annexb = if crate::decoder::is_annexb(&payload) {
                         payload
                     } else {
@@ -79,7 +77,6 @@ pub fn spawn_video_thread(
                             return;
                         }
                     } else {
-                        // 已打开：resize 后新编码器发出新分辨率 SPS/PPS，必须重置
                         if let Err(e) = decoder.reset_with_extradata(&annexb) {
                             let _ = tx.try_send(VideoEvent::Error(format!("重置解码器失败: {e}")));
                             return;
@@ -94,7 +91,7 @@ pub fn spawn_video_thread(
                     }
                     // 防御：帧内携带 config 标志（正常走 MediaConfig，不应出现）
                     if frame.flags & 1 != 0 {
-                        rx_tx_config(&mut decoder, frame.data.clone(), &tx);
+                        handle_config(&mut decoder, frame.data.clone(), &tx);
                         continue;
                     }
                     if !decoder.is_open() {
@@ -106,9 +103,16 @@ pub fn spawn_video_thread(
                     let keyframe = (frame.flags >> 1) & 1 != 0;
                     let pts = frame.pts as i64;
                     match decoder.decode(&frame.data, Some(pts), keyframe) {
-                        Ok(Some(frame)) => {
-                            let _ = tx.try_send(VideoEvent::Frame(frame));
-                            let _ = proxy.send_event(());
+                        Ok(Some(d)) => {
+                            // 解码 → YUV→RGBA（移出 UI 线程），native 分辨率交给 egui 缩放
+                            let Some(rgba) = to_rgba(&d) else {
+                                continue;
+                            };
+                            let _ = tx.try_send(VideoEvent::Frame {
+                                width: d.width,
+                                height: d.height,
+                                rgba,
+                            });
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -123,8 +127,19 @@ pub fn spawn_video_thread(
     });
 }
 
+/// 解码帧 YUV → RGBA（native 尺寸）。
+fn to_rgba(d: &DecodedFrame) -> Option<Vec<u8>> {
+    let (w, h) = (d.width, d.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    render_yuv420_to_rgba(&mut rgba, w, h, &d.y, &d.u, &d.v, w, h);
+    Some(rgba)
+}
+
 /// 罕见的内联 config 帧处理（与 VideoInput::Config 同逻辑）。
-fn rx_tx_config(decoder: &mut VideoDecoder, data: Vec<u8>, tx: &SyncSender<VideoEvent>) {
+fn handle_config(decoder: &mut VideoDecoder, data: Vec<u8>, tx: &SyncSender<VideoEvent>) {
     if let Err(e) = decoder.set_extradata(&data) {
         let _ = tx.try_send(VideoEvent::Error(format!("设置 extradata 失败: {e}")));
         return;

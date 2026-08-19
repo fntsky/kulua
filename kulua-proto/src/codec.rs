@@ -103,6 +103,8 @@ pub struct MediaReassembler {
     parts: std::collections::HashMap<u32, Part>,
     /// 最近一次投递时间（超时清残留用）。
     last_emit: std::time::Instant,
+    /// 已判定丢失的媒体消息数（序号跳变 / 分片超时被清扫），供 HUD 丢包率。
+    lost: u64,
 }
 
 #[derive(Debug)]
@@ -130,6 +132,7 @@ impl MediaReassembler {
             last_seq: 0,
             parts: std::collections::HashMap::new(),
             last_emit: std::time::Instant::now(),
+            lost: 0,
         }
     }
 
@@ -159,7 +162,7 @@ impl MediaReassembler {
 
         // 单分片（整包）→ 直接输出
         if total == 1 {
-            self.last_seq = seq.max(self.last_seq);
+            self.note_emitted(seq);
             self.last_emit = std::time::Instant::now();
             // 清理残留旧 part（避免 msg_id 复用）
             self.parts.remove(&frame.msg_id);
@@ -195,7 +198,7 @@ impl MediaReassembler {
         }
         if part.n == part.total {
             let done = self.parts.remove(&frame.msg_id).unwrap();
-            self.last_seq = done.seq.max(self.last_seq);
+            self.note_emitted(done.seq);
             self.last_emit = std::time::Instant::now();
             let mut out = Vec::with_capacity(done.total * MAX_FRAGMENT);
             for f in done.frags.into_iter().flatten() {
@@ -211,11 +214,28 @@ impl MediaReassembler {
         }
     }
 
-    /// 清理超时残留分片（重装不完整且太久无进展）。
+    /// 清理超时残留分片（重装不完整且太久无进展）；每条被清的消息计一次丢帧。
     pub fn sweep(&mut self, timeout: std::time::Duration) {
         let now = std::time::Instant::now();
+        let before = self.parts.len();
         self.parts
             .retain(|_, p| now.duration_since(p.touched) < timeout);
+        self.lost += (before - self.parts.len()) as u64;
+    }
+
+    /// 记录一次成功输出消息的序号，并估算其间跳过（丢失）的消息数。
+    fn note_emitted(&mut self, seq: u32) {
+        if self.last_seq != 0 && seq > self.last_seq {
+            let gap = (seq - self.last_seq - 1) as u64;
+            // 上限 1024：防止异常流（序号错乱）把计数刷爆
+            self.lost += gap.min(1024);
+        }
+        self.last_seq = seq;
+    }
+
+    /// 已判定丢失的消息数（丢包率 = lost / (lost + 成功输出数)）。
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 }
 

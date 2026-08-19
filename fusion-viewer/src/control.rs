@@ -26,8 +26,6 @@ pub const POINTER_ID_MOUSE: u64 = u64::MAX;
 pub mod keycode {
     pub const BACK: u32 = 4;
     pub const HOME: u32 = 3;
-    pub const VOLUME_UP: u32 = 24;
-    pub const VOLUME_DOWN: u32 = 25;
     pub const ENTER: u32 = 66;
     pub const DEL: u32 = 67;
     pub const TAB: u32 = 61;
@@ -36,17 +34,6 @@ pub mod keycode {
     pub const DPAD_DOWN: u32 = 20;
     pub const DPAD_LEFT: u32 = 21;
     pub const DPAD_RIGHT: u32 = 22;
-    pub const KEY_SEMICOLON: u32 = 74;
-    pub const KEY_APOSTROPHE: u32 = 75;
-    pub const KEY_COMMA: u32 = 55;
-    pub const KEY_PERIOD: u32 = 56;
-    pub const KEY_SLASH: u32 = 76;
-    pub const KEY_LEFT_BRACKET: u32 = 71;
-    pub const KEY_RIGHT_BRACKET: u32 = 72;
-    pub const KEY_MINUS: u32 = 69;
-    pub const KEY_EQUALS: u32 = 70;
-    pub const KEY_GRAVE: u32 = 68;
-    pub const KEY_BACKSLASH: u32 = 73;
 }
 
 #[cfg(test)]
