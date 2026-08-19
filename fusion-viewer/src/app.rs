@@ -175,6 +175,9 @@ pub struct ViewerApp {
     last_error: Option<String>,
     /// 是否加载到中文字体（false 时 HUD 用英文标签，避免乱码）。
     has_cjk: bool,
+    /// 首帧超时诊断：已提示过 / 已自动重发 START_APP。
+    no_frame_alerted: bool,
+    start_app_resent: bool,
 }
 
 impl ViewerApp {
@@ -212,6 +215,8 @@ impl ViewerApp {
             should_exit: false,
             last_error: None,
             has_cjk: false,
+            no_frame_alerted: false,
+            start_app_resent: false,
         }
     }
 
@@ -280,6 +285,39 @@ impl ViewerApp {
                     self.last_error = Some("视频流已结束（设备断开或应用退出）".into());
                 }
             }
+        }
+    }
+
+    /// 首帧看门狗：无视频帧时先重发 START_APP，再于 18s 给出终态告警。
+    ///
+    /// WHY：个别应用 `am start` 偶发失败/被忽略（尤其非系统应用），设备端会有
+    /// `[kulua] startApp ... exit=...` 日志；这里兜底重发一次 + 可见告警，
+    /// 而不是永久“卡在等待首帧”。
+    fn watchdog_no_frame(&mut self) {
+        if self.latest.is_some() || self.no_frame_alerted {
+            return;
+        }
+        let elapsed = self.started_at.elapsed();
+        if !self.start_app_resent && elapsed >= Duration::from_secs(8) {
+            self.start_app_resent = true;
+            let pkg = self.args.package.clone();
+            println!("[viewer] 8s 无首帧，重发 START_APP {}", pkg);
+            if let Err(e) = self
+                .session
+                .send_ctrl(&control::start_app(self.display_id, &pkg))
+            {
+                eprintln!("[viewer] 重发 START_APP 失败: {}", e);
+            }
+            self.last_error = Some(
+                "应用 8s 未出首帧，已重发启动（仍无画面请看设备端 [kulua] startApp 日志）".into(),
+            );
+            return;
+        }
+        if self.start_app_resent && elapsed >= Duration::from_secs(18) {
+            self.no_frame_alerted = true;
+            let msg = "应用启动后 18s 仍无视频帧：am start 失败，或该应用不渲染到虚拟显示器（见设备端 [kulua] startApp 日志）";
+            eprintln!("[viewer] {msg}");
+            self.last_error = Some(msg.into());
         }
     }
 
@@ -581,6 +619,7 @@ impl eframe::App for ViewerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.watchdog_no_frame();
 
         // 视频
         {

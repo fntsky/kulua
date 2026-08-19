@@ -172,6 +172,10 @@ public final class Device {
                 command.add("--display");
                 command.add(String.valueOf(displayId));
             }
+            // 诊断：System.err 会随 daemon 的 `adb shell` stderr 转发显示出来
+            // （Log.i 只进 logcat，daemon 看不到）。
+            System.err.println("[kulua] startApp " + packageName
+                    + " display=" + displayId + " cmd=" + String.join(" ", command));
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             // 为什么异步等待：`am start` 每次都要冷启动一个 app_process 虚拟机
             // （实测 1~3s），同步 waitFor 会阻塞本 control 连接的消息处理线程，
@@ -180,12 +184,19 @@ public final class Device {
             // 管道缓冲而自己阻塞。
             new Thread(() -> {
                 try {
+                    StringBuilder out = new StringBuilder(4096);
                     byte[] buf = new byte[1024];
-                    // 读完剩余输出后 am 自然退出
                     while (process.getInputStream().read(buf) != -1) {
-                        // discard
+                        // 最多保留 8KB 供诊断
+                        if (out.length() < 8192) {
+                            out.append(new String(buf, java.nio.charset.StandardCharsets.UTF_8));
+                        }
                     }
                     int exit = process.waitFor();
+                    String msg = out.toString().trim();
+                    System.err.println("[kulua] startApp done " + packageName
+                            + " display=" + displayId + " exit=" + exit
+                            + (msg.isEmpty() ? "" : " out=" + msg));
                     Log.i(TAG, "start app " + packageName + " on display " + displayId
                             + " exit=" + exit);
                 } catch (IOException e) {
@@ -195,6 +206,7 @@ public final class Device {
                 }
             }, "am-start-" + packageName).start();
         } catch (Exception e) {
+            System.err.println("[kulua] startApp failed " + packageName + ": " + e);
             Log.e(TAG, "start app failed: " + packageName, e);
         }
     }
