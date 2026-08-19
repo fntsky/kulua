@@ -70,7 +70,13 @@ fn main() {
     let result = eframe::run_native(
         "fusion-viewer",
         options,
-        Box::new(move |_cc| Ok(Box::new(app) as Box<dyn eframe::App>)),
+        Box::new(move |cc| {
+            // 加载系统中文字体（egui 默认无 CJK 字形，中文会乱码）
+            let has_cjk = app::setup_fonts(&cc.egui_ctx);
+            let mut app = app;
+            app.set_has_cjk(has_cjk);
+            Ok(Box::new(app) as Box<dyn eframe::App>)
+        }),
     );
     if let Err(e) = result {
         eprintln!("fusion-viewer: eframe 错误: {e}");

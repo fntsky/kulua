@@ -17,6 +17,53 @@ use crate::args::Args;
 use crate::control::{self, POINTER_ID_MOUSE, touch_action};
 use crate::video::{VideoEvent, VideoInput};
 
+/// 尝试加载系统中文字体并安装到 egui；成功返回 true。
+///
+/// WHY：egui 默认字体只有拉丁字形，中文会显示乱码/方块。Windows 基本必有
+/// msyh.ttc（微软雅黑）/ simhei.ttf；.ttc 通过 FontData.index 取集合首张。
+pub fn setup_fonts(ctx: &egui::Context) -> bool {
+    let Some((data, name)) = load_cjk_font() else {
+        return false;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(name.clone(), std::sync::Arc::new(data));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(name.clone());
+    }
+    ctx.set_fonts(fonts);
+    true
+}
+
+/// 依平台常见路径探测中文字体（.ttf 优先，.ttc 需 epaint 支持集合索引）。
+fn load_cjk_font() -> Option<(egui::FontData, String)> {
+    let candidates: &[(&str, &str)] = &[
+        // Windows
+        ("C:\\Windows\\Fonts\\msyh.ttc", "msyh"),
+        ("C:\\Windows\\Fonts\\simhei.ttf", "simhei"),
+        ("C:\\Windows\\Fonts\\simsun.ttc", "simsun"),
+        // macOS / Linux
+        ("/System/Library/Fonts/PingFang.ttc", "pingfang"),
+        ("/System/Library/Fonts/STHeiti Medium.ttc", "stheiti"),
+        (
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "noto-cjk",
+        ),
+        (
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "wqymicrohei",
+        ),
+    ];
+    for (path, name) in candidates {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        return Some((egui::FontData::from_owned(bytes), (*name).to_string()));
+    }
+    None
+}
+
 /// 每 500ms 轮询窗口尺寸。
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 尺寸需连续稳定多少轮才发送 RESIZE_DISPLAY。
@@ -126,6 +173,8 @@ pub struct ViewerApp {
 
     should_exit: bool,
     last_error: Option<String>,
+    /// 是否加载到中文字体（false 时 HUD 用英文标签，避免乱码）。
+    has_cjk: bool,
 }
 
 impl ViewerApp {
@@ -162,7 +211,13 @@ impl ViewerApp {
             pressed_keys: HashSet::new(),
             should_exit: false,
             last_error: None,
+            has_cjk: false,
         }
+    }
+
+    /// 设置是否已加载中文字体（HUD 据此切中文/英文标签）。
+    pub fn set_has_cjk(&mut self, has: bool) {
+        self.has_cjk = has;
     }
 
     /// 消费 UDP 会话事件 → 解码线程 + HUD 计数。
@@ -542,7 +597,15 @@ impl eframe::App for ViewerApp {
                         ui.put(rect, img);
                     } else {
                         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-                        ui.put(rect, egui::Label::new("加载中…").selectable(false));
+                        ui.put(
+                            rect,
+                            egui::Label::new(if self.has_cjk {
+                                "加载中…"
+                            } else {
+                                "Loading…"
+                            })
+                            .selectable(false),
+                        );
                     }
                     self.video_rect = Some(rect);
                     ui_rect = Some(rect);
@@ -552,7 +615,11 @@ impl eframe::App for ViewerApp {
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
-                        ui.label("等待视频帧…");
+                        ui.label(if self.has_cjk {
+                            "等待视频帧…"
+                        } else {
+                            "Waiting for video…"
+                        });
                     });
                 }
             });
