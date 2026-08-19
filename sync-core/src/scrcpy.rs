@@ -52,26 +52,81 @@ pub fn kill_by_scid(adb: &dyn AdbOps, serial: &str, port: u16) {
 ///
 /// 优先级：
 /// 1. `serial` 形如 `ip:port`（adb wireless 主路径）→ 取 IP
-/// 2. 其它（USB 等）：`adb -s <serial> shell ip route` 解析默认路由的 `src <ip>`
+/// 2. 其它（无 IP 的 serial，如 mDNS/USB）：取设备**默认路由网卡**的 inet 地址。
+///    比直接扫 `src <ip>` 可靠——src 可能是旧的/其它网卡（tethering/VPN）IP，
+///    用错 IP 会导致 UDP 直连 HELLO 频繁超时。
 ///
 /// 返回 (ip, port)：ip 为解析到的设备地址，port 为会话端口（UDP vs 语义无差）。
 pub fn resolve_device_ip(adb: &dyn AdbOps, serial: &str, port: u16) -> Option<String> {
     if let Some(ip) = serial_ip(serial) {
         return Some(format!("{ip}:{port}"));
     }
-    // USB 设备：从默认路由取实际 IP（phone 需与 PC 在同一 Wi-Fi）
+    // 无 IP 的 serial：优先按默认路由网卡取 inet 地址
+    if let Some(iface) = default_route_dev(adb, serial) {
+        if let Some(ip) = iface_inet_ip(adb, serial, &iface) {
+            return Some(format!("{ip}:{port}"));
+        }
+    }
+    // 兜底：扫 `ip route` 里的 `src <ip>`
     let out = adb
         .run(&["-s", serial, "shell", "ip", "route"])
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
     for line in out.lines() {
-        // 形如 "default via 192.168.1.1 dev wlan0 ..." 或含 "src <ip>"
         let tokens: Vec<&str> = line.split_whitespace().collect();
         for (i, t) in tokens.iter().enumerate() {
             if *t == "src" {
                 if let Some(ip) = tokens.get(i + 1) {
                     return Some(format!("{ip}:{port}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析设备默认路由的出网卡名（`ip route` 中 `default ... dev <iface>`）。
+fn default_route_dev(adb: &dyn AdbOps, serial: &str) -> Option<String> {
+    let out = adb
+        .run(&["-s", serial, "shell", "ip", "route"])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    for line in out.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.first() != Some(&"default") {
+            continue;
+        }
+        for (i, t) in tokens.iter().enumerate() {
+            if *t == "dev" {
+                if let Some(dev) = tokens.get(i + 1) {
+                    return Some((*dev).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 取指定网卡的 IPv4 地址（`ip -f inet addr show <iface>` 中 `inet A.B.C.D/n`）。
+fn iface_inet_ip(adb: &dyn AdbOps, serial: &str, iface: &str) -> Option<String> {
+    let out = adb
+        .run(&[
+            "-s", serial, "shell", "ip", "-f", "inet", "addr", "show", iface,
+        ])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    for line in out.lines() {
+        // 形如 "    inet 192.168.1.6/24 brd ... scope global wlan0"
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.first() == Some(&"inet") {
+            if let Some(addr) = tokens.get(1) {
+                if let Some(ip) = addr.split('/').next() {
+                    if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                        return Some(ip.to_string());
+                    }
                 }
             }
         }

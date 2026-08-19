@@ -115,10 +115,24 @@ impl UdpSession {
         };
         let mut wire = Vec::with_capacity(64);
         prost::Message::encode(&hello, &mut wire).expect("encode hello");
+        let mut last_progress = Instant::now();
         while !s.state.lock().unwrap().connected {
             if Instant::now() > deadline {
                 s.close();
-                return Err(format!("HELLO 握手超时（{peer}）"));
+                return Err(format!(
+                    "HELLO 握手超时（{peer}）：server 未就绪或端口不通——确认设备端 kulua-server \
+                     已启动且绑定了该端口，且此地址是手机当前 Wi-Fi IP"
+                ));
+            }
+            // 握手不是静默的：每 2s 打印一次进度，避免“卡在连接中”无感知
+            if last_progress.elapsed() >= Duration::from_secs(2) {
+                let elapsed = deadline.saturating_duration_since(Instant::now());
+                eprintln!(
+                    "[kulua] 仍在等待 {} 握手（还剩 {:.0}s）……若始终超时，检查设备 server/端口/IP",
+                    peer,
+                    elapsed.as_secs_f32()
+                );
+                last_progress = Instant::now();
             }
             let _ = s.socket.send(&wire);
             std::thread::sleep(Duration::from_millis(100));

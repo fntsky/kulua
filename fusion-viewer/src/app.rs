@@ -119,10 +119,12 @@ struct Hud {
     seen: u64,
     disp: u64,
     prev_lost: u64,
-    // 上秒显示值
+    // 上窗口显示值
     fps: f64,
     bitrate_mbps: f64,
     loss_pct: f64,
+    /// 累计丢失帧数（HUD 展示，直观感受丢包）。
+    lost_total: u64,
 }
 
 /// 弹性显示器 resize 防抖状态。
@@ -207,6 +209,7 @@ impl ViewerApp {
                 fps: 0.0,
                 bitrate_mbps: 0.0,
                 loss_pct: 0.0,
+                lost_total: 0,
             },
             resize: ResizeState::new(),
             started_at: Instant::now(),
@@ -321,10 +324,10 @@ impl ViewerApp {
         }
     }
 
-    /// HUD 每秒统计（丢包率 = 本秒新增丢失 / (本秒收到 + 新增丢失)）。
+    /// HUD 统计（250ms 窗口，实时刷新；丢包率 = 窗口内新增丢失 / (收到 + 新增丢失)）。
     fn tick_hud(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.hud.window_start) < Duration::from_secs(1) {
+        if now.duration_since(self.hud.window_start) < Duration::from_millis(250) {
             return;
         }
         let secs = now
@@ -334,6 +337,7 @@ impl ViewerApp {
         let lost_now = self.session.video_lost();
         let lost_delta = lost_now.saturating_sub(self.hud.prev_lost);
         self.hud.prev_lost = lost_now;
+        self.hud.lost_total = lost_now;
 
         self.hud.fps = self.hud.disp as f64 / secs;
         self.hud.bitrate_mbps = self.hud.rx_bytes as f64 * 8.0 / 1e6 / secs;
