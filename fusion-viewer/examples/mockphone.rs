@@ -1,8 +1,8 @@
 //! 本地 mock「手机」：在无真机环境下复现/验证 viewer 的 UDP 会话、事件循环与渲染。
 //!
-//! 行为对齐真实 kulua-server 的握手 + 媒体：
-//! - HELLO → HELLO_ACK
-//! - CreateDisplay（control DATA）→ ACK + 回 DisplayReady，随后按文件推真实 H.264
+//! 行为对齐真实 kulua-server 的三端口协议：
+//! - ctrl 端口 P：HELLO → HELLO_ACK（携带 client_id）；CreateDisplay → ACK + DisplayReady
+//! - video 端口 P+1：收到 PC 的 OPEN（登记端点）后，按 25B 定长头推真实 H.264 分片
 //! - 对每条 control DATA 回累积 ACK（否则 viewer 的可靠发送窗口积压 → 判死关闭）
 //!
 //! 用法：`mockphone <port> [h264_file]`
@@ -12,6 +12,7 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use kulua_proto::codec::{MEDIA_HDR_LEN, VIDEO_PORT_OFFSET, media_datagrams};
 use kulua_proto::generated::{CtrlMsg, DisplayReady, Frame, HelloAck, ctrl_msg, frame};
 use kulua_proto::prost::Message;
 
@@ -107,46 +108,62 @@ fn main() {
         None => (None, Vec::new()),
     };
     println!(
-        "[mockphone] listening 127.0.0.1:{port}, clip={} config={} frames={}",
+        "[mockphone] listening 127.0.0.1:{port} (video {}), clip={} config={} frames={}",
+        port + VIDEO_PORT_OFFSET,
         file,
         video_config.is_some(),
         video_frames.len()
     );
 
-    let sock = UdpSocket::bind(("127.0.0.1", port)).unwrap();
-    let mut peer: Option<std::net::SocketAddr> = None;
+    let ctrl_sock = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    let video_sock = UdpSocket::bind(("127.0.0.1", port + VIDEO_PORT_OFFSET)).unwrap();
+    for s in [&ctrl_sock, &video_sock] {
+        s.set_read_timeout(Some(Duration::from_millis(10))).ok();
+    }
+    // 三端口协议：媒体端点由 PC 在 video 端口的首个数据报（OPEN）登记
+    const CLIENT_ID: u32 = 1;
+    let mut video_endpoint: Option<std::net::SocketAddr> = None;
     let mut started = false;
     let mut frame_idx: usize = 0;
     let mut last_video = Instant::now();
     let mut vseq: u32 = 1;
     let mut buf = vec![0u8; 65536];
-    sock.set_read_timeout(Some(Duration::from_millis(10))).ok();
 
     loop {
+        // 媒体推送：25B 定长头分片，从 video 端口 socket 发往登记端点
         if started && !video_frames.is_empty() && last_video.elapsed() >= Duration::from_millis(33)
         {
             last_video = Instant::now();
-            let Some(peer) = peer else { continue };
-            let data = &video_frames[frame_idx % video_frames.len()];
-            let frags = kulua_proto::codec::media_fragments(
-                frame::Stream::Video,
-                vseq,
-                vseq,
-                last_video.elapsed().as_micros() as u64,
-                0,
-                data,
-            );
-            for f in frags {
-                send(&sock, peer, &f);
+            if let Some(dst) = video_endpoint {
+                let data = &video_frames[frame_idx % video_frames.len()];
+                let frags = media_datagrams(CLIENT_ID, vseq, vseq, 0, 0, data);
+                for f in frags {
+                    let _ = video_sock.send_to(&f, dst);
+                }
+                vseq += 1;
+                frame_idx += 1;
             }
-            vseq += 1;
-            frame_idx += 1;
         }
 
-        let Ok((n, src)) = sock.recv_from(&mut buf) else {
+        // video 端口：PC 的 OPEN/数据报 → 登记端点（负载不消费，对齐真机）
+        if let Ok((n, src)) = video_sock.recv_from(&mut buf) {
+            let cid = if n >= MEDIA_HDR_LEN as usize {
+                u32::from_be_bytes(buf[0..4].try_into().unwrap())
+            } else {
+                0
+            };
+            if cid == CLIENT_ID {
+                if video_endpoint != Some(src) {
+                    println!("[mockphone] video endpoint registered: {src}");
+                }
+                video_endpoint = Some(src);
+            }
+        }
+
+        // ctrl 端口：protobuf Frame（HELLO / DATA / ACK ...）
+        let Ok((n, src)) = ctrl_sock.recv_from(&mut buf) else {
             continue;
         };
-        peer = Some(src);
         let Ok(f) = Frame::decode(&buf[..n]) else {
             continue;
         };
@@ -158,7 +175,7 @@ fn main() {
                 };
                 println!("[mockphone] HELLO scid={scid}");
                 send(
-                    &sock,
+                    &ctrl_sock,
                     src,
                     &Frame {
                         stream: frame::Stream::Ctrl as i32,
@@ -167,12 +184,11 @@ fn main() {
                         msg_id: 0,
                         frag: 0,
                         frag_total: 0,
-                        media_pts: 0,
-                        media_flags: 0,
                         payload: Some(frame::Payload::HelloAck(HelloAck {
                             scid,
                             audio_codec: 0,
                             video_codec: 0x68323634,
+                            client_id: CLIENT_ID,
                         })),
                     },
                 );
@@ -181,7 +197,7 @@ fn main() {
                 if frame::Stream::try_from(f.stream) == Ok(frame::Stream::Ctrl) =>
             {
                 send(
-                    &sock,
+                    &ctrl_sock,
                     src,
                     &Frame {
                         stream: frame::Stream::Ctrl as i32,
@@ -190,8 +206,6 @@ fn main() {
                         msg_id: 0,
                         frag: 0,
                         frag_total: 0,
-                        media_pts: 0,
-                        media_flags: 0,
                         payload: Some(frame::Payload::AckSeq(f.seq)),
                     },
                 );
@@ -205,7 +219,7 @@ fn main() {
                                     cd.width, cd.height, cd.dpi
                                 );
                                 send(
-                                    &sock,
+                                    &ctrl_sock,
                                     src,
                                     &Frame {
                                         stream: frame::Stream::Ctrl as i32,
@@ -214,8 +228,6 @@ fn main() {
                                         msg_id: 1,
                                         frag: 0,
                                         frag_total: 0,
-                                        media_pts: 0,
-                                        media_flags: 0,
                                         payload: Some(frame::Payload::Data(
                                             CtrlMsg {
                                                 msg: Some(ctrl_msg::Msg::DisplayReady(
@@ -234,7 +246,7 @@ fn main() {
                                 );
                                 if let Some(cfg) = &video_config {
                                     send(
-                                        &sock,
+                                        &ctrl_sock,
                                         src,
                                         &Frame {
                                             stream: frame::Stream::Ctrl as i32,
@@ -243,8 +255,6 @@ fn main() {
                                             msg_id: 2,
                                             frag: 0,
                                             frag_total: 0,
-                                            media_pts: 0,
-                                            media_flags: 0,
                                             payload: Some(frame::Payload::Data(
                                                 CtrlMsg {
                                                     msg: Some(ctrl_msg::Msg::MediaConfig(

@@ -18,33 +18,48 @@
 | control 可靠 | 剪贴板/输入注入/启动应用必须不丢、有序；采用**滑动窗口 + 累积 ACK + 超时重传** |
 | audio/video 容忍丢包 | 媒体对丢帧容忍（视频靠关键帧重同步、音频 20ms 帧丢失可掩蔽）；乱序/重复直接丢弃 |
 | 分片 | Wi-Fi 安全 UDP payload ≈ 1200B；视频关键帧 / raw PCM 音频帧远超此值，需要按 datagram 分片 + 重装 |
-| 单 socket 多流 | 一个 UDP 端口承载 control/audio/video 全部流（协议内 `stream` 字段区分），复用现有 session 端口号 |
+| 三端口分流 | ctrl=P / video=P+1 / audio=P+2：单 socket 时音视频分片共享发送缓冲（视频关键帧突发挤掉音频），且 ctrl 单循环要为每个媒体分片跑 protobuf 解析；分端口后三路缓冲独立、媒体路径零 protobuf（25B 定长头） |
 | phone 绑定 0.0.0.0:port | shell 用户可 bind UDP；PC 端用 phone 的 Wi-Fi IP（来自 `adb connect` serial 或 `ip route` 解析）直连 |
 
 ## 数据报格式
 
-**每个 UDP datagram = 一个 protobuf `Frame`**（无额外二进制帧头；datagram 边界即消息边界）。
-`Frame` 全字段定义见 `proto/direct.proto`，要点：
+**control 端口（P）**：每个 UDP datagram = 一个 protobuf `Frame`（datagram 边界即
+消息边界）。媒体已迁出，`Frame.Stream` 只剩 `CTRL`。全字段定义见
+`proto/direct.proto`，要点：
 
 ```
 message Frame {
-  Stream stream     // CTRL / AUDIO / VIDEO
+  Stream stream     // 仅 CTRL
   Type   type       // DATA / ACK / HELLO / HELLO_ACK / HEARTBEAT / BYE
-  uint32 seq        // 每流单调递增（control 用于 ACK/去重，media 用于排序）
+  uint32 seq        // control 单调递增（ACK/去重/窗口滑动）
   uint32 msg_id     // 分片归属（同一消息的所有分片共享）
-  uint32 frag       // 分片索引（0 起）
-  uint32 frag_total // 总分片数（0 = 单包完整）
-  uint64 media_pts     // 仅 media DATA 首分片有效：PTS(μs)
-  uint32 media_flags   // 仅 media DATA 首分片有效：bit0=config bit1=keyframe bit2=session
+  uint32 frag / frag_total
   oneof payload {
-    bytes  data        // media DATA 分片负载（或 control 原字节，见下）
-    CtrlMsg ctrl       // control 消息（可靠 DATA）
+    bytes  data        // control 负载（重装后为 CtrlMsg，可靠）
     uint32 ack_seq     // ACK：确认到该序号（control 累积）
     Hello  hello       // PC→phone 会话打开
-    HelloAck hello_ack // phone→PC
+    HelloAck hello_ack // phone→PC（含 client_id）
   }
 }
 ```
+
+**媒体端口（video=P+1 / audio=P+2）**：每个 UDP datagram = **25B 大端定长头 +
+负载（≤1200B）**，非 protobuf：
+
+```
+offset  size  field
+0      4     client_id  （HELLO_ACK 分配，phone 按它路由到会话）
+4      4     msg_id     （一条媒体帧一个 id，分片共享）
+8      4     seq        （每流单调递增，排序/去重用）
+12     2     frag       （分片索引，0 起）
+14     2     frag_total （0 = 单包完整；0xFFFF 且负载为空 = OPEN 注册包）
+16     8     pts        （微秒；接收侧以 frag==0 的值为准）
+24     1     flags      （bit0=config bit1=keyframe）
+```
+
+WHY 不进 protobuf：媒体分片速率高（8Mbps 视频 ≈170 片/s/viewer），定长头
+解析 O(1) 且省去每片 20~35B 的 envelope；phone 端 app_process 环境也无需
+引入任何新依赖。
 
 `CtrlMsg` 覆盖所有 control 命令（`inject_keycode/text/touch/scroll`、
 `back_or_screen_on`、`set_clipboard`、`start_app`、`resize_display`、
@@ -55,25 +70,34 @@ protobuf，Java 消费 protobuf 转 Android 注入）。
 
 ## 会话模型
 
-UDP 无连接概念，phone 端按 **源地址（IP:port）解复用**客户端：
+UDP 无连接概念，phone 端三个 socket 各司其职：
 
 ```
-phone (0.0.0.0:port, 单 DatagramSocket)
-  └─ receive 循环 → 按 src addr 路由到 ClientConnection
-       ├─ daemon 客户端：control(双向) + audio(推流)
-       └─ 每个 fusion-viewer 客户端：control(双向) + video(含各自虚拟显示器)
+phone (0.0.0.0:P / P+1 / P+2, 三个 DatagramSocket)
+  ├─ ctrl 循环      → 按 src addr 解复用 ClientConnection（protobuf Frame）
+  ├─ video 循环     → 按 25B 头 client_id 找会话，登记源地址为 video 发送端点
+  └─ audio 循环     → 同上，登记 audio 发送端点
+
+客户端构成：
+  ├─ daemon 客户端：ctrl(双向) + audio 端点（收音频推流）
+  └─ 每个 fusion-viewer 客户端：ctrl(双向) + video 端点（含各自虚拟显示器）
 ```
 
 ### 握手
 
-1. PC（session 或 viewer）把 socket bind 到随机本地端口，向 `phone_ip:port` 发
-   `HELLO{scid}`，每 500ms 重发（最多 20 次 → 判死）。
-2. phone 校验 `scid` 与自身一致后回 `HELLO_ACK`（附带 `audio_codec`
-   = 0 关闭 / 4B codec id），并在本客户端会话内注册该源地址。
-3. 后续文件：daemon 发 control 信息直接走 `Frame{stream=CTRL, type=DATA, ctrl=...}`；
-   audio 编码协商：`AudioReady.codec_id` 经 HELLO_ACK 携带（无需二次握手）。
-4. viewer 创建显示器：发 `CtrlMsg.create_display{width,height,dpi}`（可靠），
-   phone 创建 VirtualDisplay + 编码器，回 `CtrlMsg.display_ready{display_id, codec_id, ...}`。
+1. PC 把 ctrl socket bind 到随机本地端口，向 `phone_ip:P` 发 `HELLO{scid}`，
+   每 500ms 重发（最多 20 次 → 判死）。
+2. phone 校验 `scid` 后回 `HELLO_ACK`（附带 `audio_codec` + **`client_id`**，
+   phone 侧 1 起单调分配），并注册该源地址为本客户端 ctrl 端点。
+3. PC 按需打开媒体 socket（bind 随机本地端口、connect 到 `phone_ip:P+1/P+2`），
+   在媒体端口周期发 **OPEN**（25B 头，frag_total=0xFFFF、无负载，携 client_id，
+   500ms 重发直到收到首个媒体包）。phone 收到媒体端口上任何头合法且
+   client_id 可识别的数据报，即把源地址登记为该流的发送端点——OPEN 只是
+   首次注册的触发器。
+4. daemon 发 control 信息走 `Frame{CTRL, DATA, CtrlMsg}`；audio 编码协商经
+   HELLO_ACK 的 `audio_codec` 携带（无需二次握手）。
+5. viewer 创建显示器：发 `CtrlMsg.create_display{width,height,dpi}`（可靠），
+   phone 创建 VirtualDisplay + 编码器，回 `CtrlMsg.display_ready{...}`。
 
 ### 生命周期与保活
 
@@ -98,23 +122,20 @@ phone (0.0.0.0:port, 单 DatagramSocket)
 
 ## 媒体流策略
 
-- **audio**：`Frame{stream=AUDIO, type=DATA, seq, frag..., media_pts, media_flags, data}`
-  - config 包（AAC AudioSpecificConfig / FLAC STREAMINFO）：**可靠发送**（走 control
-    语义或 media 首帧重复多次）——丢失无法初始化解码器。
-  - 普通帧：不可靠；接收端按 `seq` 丢弃乱序/重复（20ms 帧丢失可接受）。
-- **video**：`Frame{stream=VIDEO, type=DATA, ...}`（首分片带 media_flags）
-  - config(SPS/PPS) 可靠发送；关键帧尽量可靠（不可靠时丢帧等下一个关键帧）。
-  - 分片：任一 fragment 丢失 → 整个视频帧丢弃（解码器下个关键帧重同步）。
-
-> 实现简化：config 帧通过 control 流承载一个专用 `CtrlMsg.media_config`
-> （或复用 media DATA + 强制重传），本设计文档以「config 帧可靠发送」为准，
-> 具体打包方式见 `.proto` 与代码注释。
+- 媒体数据报格式见上文「数据报格式」；phone 从**对应端口的 socket**发送
+  （PC 端 socket 是 connect() 的，源端口须匹配）；端点未登记时静默丢弃
+  （OPEN 注册完成前的少量首帧丢失可接受，config 可靠兜底 + 关键帧重同步）。
+- **audio**：尽力而为；乱序/重复按 seq 丢弃（20ms 帧丢失可掩蔽）。
+- **video**：尽力而为；任一分片丢失 → 整帧丢弃（解码器下个关键帧重同步）；
+  HUD 丢包率用重装器的 lost 计数。
+- config 帧（SPS/PPS / AudioSpecificConfig）：**仍走 control 流可靠投递**
+  （`CtrlMsg.media_config`，stream 字段 1=audio 2=video），确保解码器可在
+  首帧前初始化。
 
 ## 端口 / 地址 / 发现
 
-- phone 绑定 UDP `0.0.0.0:<session_port>`，`session_port` 沿用 `Core::run` 的
-  `port_counter`（27183 起，融合窗口区间 27200:27299 的约定不再适用，因为
-  不再有 adb forward 端口）。
+- phone 绑定 UDP `0.0.0.0:P`（ctrl）、`P+1`（video）、`P+2`（audio）；`P` 沿用
+  `Core::run` 的 `port_counter`（27183 起）。
 - PC 侧目标 IP 解析优先级：
   1. `device.serial` 含 `ip:port` → 取 IP（adb wireless 主路径）。
   2. USB/其他：`adb -s <serial> shell ip route` 解析默认路由 `src <ip>`。

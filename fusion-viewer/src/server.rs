@@ -40,7 +40,7 @@ impl ViewerSession {
         let (width, height, _) = parse_display(display)?;
         let dpi = dpi.clamp(80, 600);
         let scid = scid_for_port(addr.port());
-        let mut session = UdpSession::connect(addr, &scid, false)
+        let mut session = UdpSession::connect(addr, &scid, false, true)
             .map_err(|e| format!("连接 {addr} 失败: {e}"))?;
 
         // 发送 CreateDisplay（可靠 control）→ phone 创建虚拟显示器 + 编码器

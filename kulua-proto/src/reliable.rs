@@ -73,8 +73,6 @@ impl ReliableSender {
                 msg_id,
                 frag: i as u32,
                 frag_total: total,
-                media_pts: 0,
-                media_flags: 0,
                 payload: Some(frame::Payload::Data(chunk.to_vec())),
             };
             let mut wire = Vec::with_capacity(frame.encoded_len() + 16);

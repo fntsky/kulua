@@ -12,14 +12,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import kulua.direct.Frame;
-
 /**
  * 视频编码器 + 推流（每显示器一个实例）。
  *
  * 流程：MediaCodec(surface 输入) → VirtualDisplay 投屏 → 编码输出 →
- * 直接 UDP 分片推送。config 帧（SPS/PPS）走可靠 control 流（MediaConfig），
- * 普通帧走尽力而为媒体分片（Frame{stream=VIDEO, media_pts, media_flags, data}）。
+ * 媒体端口 UDP 分片推送（25B 定长头）。config 帧（SPS/PPS）走可靠
+ * control 流（MediaConfig），普通帧走尽力而为媒体分片（pts/flags 进媒体头）。
  */
 public final class DisplayEncoder {
 
@@ -198,7 +196,7 @@ public final class DisplayEncoder {
         buffer.limit(size);
         byte[] data = new byte[size];
         buffer.get(data);
-        client.sendMediaConfig(Frame.Stream.VIDEO.getNumber(), data);
+        client.sendMediaConfig(ClientConnection.MEDIA_STREAM_VIDEO, data);
     }
 
     /** 发送普通视频帧（尽力而为、分片）。 */
@@ -210,7 +208,7 @@ public final class DisplayEncoder {
         if (data.length != size) {
             data = Arrays.copyOf(data, size);
         }
-        client.sendMedia(Frame.Stream.VIDEO.getNumber(), client.nextMediaSeq(), pts, flags, data);
+        client.sendMedia(ClientConnection.MEDIA_STREAM_VIDEO, client.nextMediaSeq(), pts, flags, data);
     }
 
     /** 停止编码器与推流。 */

@@ -207,9 +207,10 @@ impl Session {
         let want_audio = audio_enabled;
         let peer2 = peer;
         let scid2 = scid.clone();
-        let udp =
-            tokio::task::spawn_blocking(move || UdpSession::connect(peer2, &scid2, want_audio))
-                .await;
+        let udp = tokio::task::spawn_blocking(move || {
+            UdpSession::connect(peer2, &scid2, want_audio, false)
+        })
+        .await;
         let mut udp = match udp {
             Ok(Ok(s)) => s,
             _ => {
@@ -305,8 +306,8 @@ impl Session {
                                 }
                             }
                             Some(ctrl_msg::Msg::MediaConfig(cfg)) => {
-                                // cfg.stream: 0=CTRL 1=AUDIO 2=VIDEO（AUDIO=1）
-                                if want_audio && cfg.stream == 1 {
+                                // cfg.stream：1=AUDIO 2=VIDEO（媒体流标识，与媒体端口对应）
+                                if want_audio && cfg.stream == kulua_proto::codec::MEDIA_STREAM_AUDIO {
                                     let _ = audio_tx.send(AudioEvent::Config(cfg.data)).await;
                                 }
                             }

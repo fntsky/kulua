@@ -6,6 +6,7 @@ import com.google.protobuf.ByteString;
 
 import java.net.InetSocketAddress;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import kulua.direct.CtrlMsg;
 import kulua.direct.Frame;
@@ -28,9 +29,21 @@ final class ClientConnection {
     /** 视频 codec id（4B ASCII "h264"）。 */
     static final int VIDEO_CODEC_ID = 0x68323634;
 
+    /** 媒体流标识：audio（与 MediaConfig.stream 数值一致，Rust 侧同值）。 */
+    static final int MEDIA_STREAM_AUDIO = 1;
+
+    /** 媒体流标识：video。 */
+    static final int MEDIA_STREAM_VIDEO = 2;
+
     private final UdpServer server;
     private final InetSocketAddress addr;
+    /** phone 分配的客户端 id（1 起单调）；媒体数据报头携带，phone 按它路由。 */
+    private final int clientId;
     private final Options options;
+
+    /** PC 媒体接收端点（媒体端口数据报源地址登记；null = 未登记，发送丢弃）。 */
+    private volatile InetSocketAddress videoEndpoint;
+    private volatile InetSocketAddress audioEndpoint;
 
     private final ReliableControl.Sender ctrlSender;
     private final ReliableControl.Receiver ctrlReceiver = new ReliableControl.Receiver();
@@ -42,14 +55,17 @@ final class ClientConnection {
     private volatile long lastActivityNanos = System.nanoTime();
     private volatile boolean closed;
 
-    private int mediaMsgId = 1;
-    private final java.util.concurrent.atomic.AtomicInteger mediaSeq = new java.util.concurrent.atomic.AtomicInteger(1);
+    private final AtomicInteger mediaMsgId = new AtomicInteger(1);
+    /** 每流递增的媒体消息序号（音频/视频各自调用）。 */
+    private final AtomicInteger mediaSeq = new AtomicInteger(1);
 
     private final Clipboard.ChangeListener clipboardListener = this::onClipboardChanged;
 
-    ClientConnection(UdpServer server, InetSocketAddress addr, boolean wantAudio, Options options) {
+    ClientConnection(UdpServer server, InetSocketAddress addr, int clientId,
+                     boolean wantAudio, Options options) {
         this.server = server;
         this.addr = addr;
+        this.clientId = clientId;
         this.wantAudio = wantAudio;
         this.options = options;
         this.ctrlSender = new ReliableControl.Sender(server.sink(addr));
@@ -93,6 +109,23 @@ final class ClientConnection {
 
     InetSocketAddress addr() {
         return addr;
+    }
+
+    int clientId() {
+        return clientId;
+    }
+
+    /**
+     * 媒体端口数据报登记入口（UdpServer 媒体接收线程调用，含 OPEN）：
+     * 把源地址登记为对应流的发送端点并刷新活跃时间。
+     */
+    void registerMediaEndpoint(int stream, InetSocketAddress src) {
+        if (stream == MEDIA_STREAM_VIDEO) {
+            videoEndpoint = src;
+        } else if (stream == MEDIA_STREAM_AUDIO) {
+            audioEndpoint = src;
+        }
+        touch();
     }
 
     void touch() {
@@ -174,6 +207,7 @@ final class ClientConnection {
                 .setScid(options.scid)
                 .setAudioCodec(audioCodec)
                 .setVideoCodec(VIDEO_CODEC_ID)
+                .setClientId(clientId)
                 .build();
         server.sendDatagramRaw(addr, Frame.newBuilder()
                 .setStreamValue(Frame.Stream.CTRL.getNumber())
@@ -252,29 +286,26 @@ final class ClientConnection {
     }
 
     /**
-     * 尽力而为发送媒体分片（audio/video）。
+     * 尽力而为发送媒体分片（audio/video）：25B 定长头 + ≤1200B 负载，
+     * 从对应媒体端口 socket 发往登记端点。
      *
-     * 每条消息共享 {@code msgSeq}/{@code msgId}，分片携带 pts/flags（首片为准）。
+     * 每条消息共享 {@code msgSeq}/{@code msgId}，分片携带 pts/flags（接收侧以
+     * frag==0 的值为准）；端点未登记（OPEN 未到/已拆除）时静默丢弃。
      */
     void sendMedia(int stream, int msgSeq, long pts, int flags, byte[] data) {
-        int msgId = mediaMsgId++;
-        int total = data.length == 0 ? 1 : (data.length + ReliableControl.MAX_FRAGMENT - 1)
+        InetSocketAddress dst =
+                stream == MEDIA_STREAM_AUDIO ? audioEndpoint : videoEndpoint;
+        if (dst == null) {
+            return;
+        }
+        int msgId = mediaMsgId.getAndIncrement();
+        int total = (data.length + ReliableControl.MAX_FRAGMENT - 1)
                 / ReliableControl.MAX_FRAGMENT;
         for (int i = 0; i < total; i++) {
             int start = i * ReliableControl.MAX_FRAGMENT;
-            int end = Math.min(data.length, start + ReliableControl.MAX_FRAGMENT);
-            Frame frame = Frame.newBuilder()
-                    .setStreamValue(stream)
-                    .setTypeValue(Frame.Type.DATA.getNumber())
-                    .setSeq(msgSeq)
-                    .setMsgId(msgId)
-                    .setFrag(i)
-                    .setFragTotal(total)
-                    .setMediaPts(pts)
-                    .setMediaFlags(flags)
-                    .setData(ByteString.copyFrom(data, start, end - start))
-                    .build();
-            server.sendDatagramRaw(addr, frame.toByteArray());
+            int len = Math.min(data.length - start, ReliableControl.MAX_FRAGMENT);
+            server.sendMediaRaw(stream, dst, MediaDatagram.encode(
+                    clientId, msgId, msgSeq, i, total, pts, flags, data, start, len));
         }
     }
 

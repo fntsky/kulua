@@ -12,8 +12,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import kulua.direct.Frame;
-
 /**
  * 音频捕获（系统播放声音，shell 权限下无需 MediaProjection 授权）。
  *
@@ -24,7 +22,7 @@ import kulua.direct.Frame;
  * - 编码：opus / aac / flac：AudioRecord PCM → MediaCodec 编码
  *   - config 包（AAC AudioSpecificConfig / FLAC STREAMINFO）→ 可靠 control 流
  *     （MediaConfig），确保解码器可在首帧前初始化
- *   - 普通帧 → 尽力而为媒体分片（Frame{stream=AUDIO, media_pts, media_flags, data}）
+ *   - 普通帧 → 尽力而为媒体端口分片（25B 定长头，pts 进媒体头）
  * - raw：PCM 直通（S16LE 48kHz 立体声，20ms 一帧），无 config
  */
 public final class AudioCapture {
@@ -168,14 +166,14 @@ public final class AudioCapture {
     /** 发送普通音频帧（尽力而为、分片）。 */
     private void sendData(long pts, byte[] payload, int size) {
         byte[] data = size == payload.length ? payload : Arrays.copyOf(payload, size);
-        client.sendMedia(Frame.Stream.AUDIO.getNumber(), client.nextMediaSeq(), pts, 0, data);
+        client.sendMedia(ClientConnection.MEDIA_STREAM_AUDIO, client.nextMediaSeq(), pts, 0, data);
     }
 
     private void sendData(long pts, ByteBuffer payload, int size) {
         payload.rewind();
         byte[] data = new byte[size];
         payload.get(data);
-        client.sendMedia(Frame.Stream.AUDIO.getNumber(), client.nextMediaSeq(), pts, 0, data);
+        client.sendMedia(ClientConnection.MEDIA_STREAM_AUDIO, client.nextMediaSeq(), pts, 0, data);
     }
 
     /** 发送 codec config 帧（可靠 control 流）。 */
@@ -183,7 +181,7 @@ public final class AudioCapture {
         payload.rewind();
         byte[] data = new byte[size];
         payload.get(data);
-        client.sendMediaConfig(Frame.Stream.AUDIO.getNumber(), data);
+        client.sendMediaConfig(ClientConnection.MEDIA_STREAM_AUDIO, data);
     }
 
     /**

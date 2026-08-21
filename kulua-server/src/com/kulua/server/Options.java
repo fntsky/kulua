@@ -21,6 +21,21 @@ public final class Options {
     /** 音频码率（bps），0 = 编码器默认 */
     public int audioBitRate;
 
+    /** ctrl 端口 = 配置端口（protobuf Frame 控制流）。 */
+    public int ctrlPort() {
+        return port;
+    }
+
+    /** video 端口 = ctrl + 1（25B 头媒体数据报）。 */
+    public int videoPort() {
+        return port + 1;
+    }
+
+    /** audio 端口 = ctrl + 2（25B 头媒体数据报）。 */
+    public int audioPort() {
+        return port + 2;
+    }
+
     private Options() {
         // use parse()
     }

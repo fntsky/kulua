@@ -1,21 +1,30 @@
 //! UDP 会话客户端（daemon 与 fusion-viewer 共用）。
 //!
-//! 基于 `std::net::UdpSocket`（阻塞 + 短读超时）+ 读写两个后台线程：
-//! - reader：recv 循环 → 解析 `Frame` → 分派（control 投递 / ACK / media 重装 / HELLO_ACK）
-//! - writer：定时 flush ACK、control 重传、心跳、判死
+//! control 端口：`std::net::UdpSocket`（阻塞 + 短读超时）+ 读写两个后台线程：
+//! - reader：recv 循环 → 解析 `Frame` → 分派（control 投递 / ACK / HELLO_ACK）
+//! - writer：定时 flush ACK、control 重传、心跳、媒体 OPEN 注册、判死
+//!
+//! 媒体端口（video=P+1 / audio=P+2，按需开启）：各自 reader 线程解析 25B
+//! 定长头 → 重装 → 事件；writer 在媒体端口收到首个有效数据报前每 500ms
+//! 重发 OPEN 注册包（phone 收到任意合法头数据报即登记端点）。
 //!
 //! 事件经 tokio unbounded channel 暴露：daemon 用 `recv().await`（异步上下文），
 //! fusion-viewer 用 `try_recv()`（winit 事件循环轮询）。
 
+use parking_lot::Mutex;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use prost::Message;
 
-use crate::codec::{AssembledMedia, MediaReassembler, decode_ctrl, encode_ctrl};
+use crate::codec::{
+    AUDIO_PORT_OFFSET, AssembledMedia, MEDIA_HDR_LEN, MEDIA_OPEN_TOTAL, MediaFragment,
+    MediaReassembler, VIDEO_PORT_OFFSET, decode_ctrl, decode_media_datagram, encode_ctrl,
+    encode_media_datagram,
+};
 use crate::generated::{CtrlMsg, Frame, Hello, HelloAck, ctrl_msg, frame};
 use crate::reliable::{ReliableReceiver, ReliableSender};
 
@@ -45,12 +54,22 @@ struct State {
 
 /// 心跳间隔。
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// 媒体 OPEN 注册包重发间隔（收到首个媒体包前）。
+const OPEN_INTERVAL: Duration = Duration::from_millis(500);
 /// 完成后清理媒体残留的分片缓冲超时。
 const MEDIA_SWEEP: Duration = Duration::from_millis(500);
 
 /// 一个与 phone 上 kulua-server 直连的 UDP 会话。
 pub struct UdpSession {
     socket: UdpSocket,
+    /// 媒体 socket（按需：want_video→video 端口 P+1，want_audio→audio 端口 P+2）。
+    audio_socket: Option<UdpSocket>,
+    video_socket: Option<UdpSocket>,
+    /// phone 分配的客户端 id（HELLO_ACK 带回；媒体数据报头路由用）。
+    client_id: Arc<AtomicU32>,
+    /// 媒体端口已收到有效数据（writer 停止 OPEN 重发）。
+    audio_flowing: Arc<AtomicBool>,
+    video_flowing: Arc<AtomicBool>,
     scid: String,
     state: Arc<Mutex<State>>,
     ctrl_tx: Arc<Mutex<ReliableSender>>,
@@ -62,14 +81,23 @@ pub struct UdpSession {
     msg_id: std::cell::Cell<u32>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+    /// 媒体 reader 线程（close 时 join）。
+    media_readers: Vec<JoinHandle<()>>,
     closed: Arc<AtomicBool>,
 }
 
 impl UdpSession {
-    /// 连接 peer（phone ip:port）并完成 HELLO/HELLO_ACK 握手。
+    /// 连接 peer（phone ctrl 端口 ip:port）并完成 HELLO/HELLO_ACK 握手。
     ///
-    /// 阻塞至多 10s；成功返回已就绪的会话（`event` 中不会再有 `Connected`）。
-    pub fn connect(peer: SocketAddr, scid: &str, want_audio: bool) -> Result<Self, String> {
+    /// `want_audio`/`want_video` 按需打开媒体端口 socket（audio=P+2 /
+    /// video=P+1）。阻塞至多 10s；成功返回已就绪的会话（`event` 中不会再有
+    /// `Connected`）。
+    pub fn connect(
+        peer: SocketAddr,
+        scid: &str,
+        want_audio: bool,
+        want_video: bool,
+    ) -> Result<Self, String> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -78,10 +106,37 @@ impl UdpSession {
             .connect(peer)
             .map_err(|e| format!("connect {peer}: {e}"))?;
 
+        // 媒体 socket：与 ctrl 独立的本地端口，connect() 过滤非 phone 源。
+        // 握手期 server 可能尚未绑媒体端口 → ICMP 不可达（Windows 表现为
+        // ConnectionReset），reader 按 ConnectionReset 忽略。
+        let bind_media = |offset: u16| -> Result<UdpSocket, String> {
+            let s = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind media: {e}"))?;
+            s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+            let media_peer = SocketAddr::new(peer.ip(), peer.port() + offset);
+            s.connect(media_peer)
+                .map_err(|e| format!("connect {media_peer}: {e}"))?;
+            Ok(s)
+        };
+        let audio_socket = if want_audio {
+            Some(bind_media(AUDIO_PORT_OFFSET)?)
+        } else {
+            None
+        };
+        let video_socket = if want_video {
+            Some(bind_media(VIDEO_PORT_OFFSET)?)
+        } else {
+            None
+        };
+
         let (ev_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let closed = Arc::new(AtomicBool::new(false));
         let mut s = UdpSession {
             socket,
+            audio_socket,
+            video_socket,
+            client_id: Arc::new(AtomicU32::new(0)),
+            audio_flowing: Arc::new(AtomicBool::new(false)),
+            video_flowing: Arc::new(AtomicBool::new(false)),
             scid: scid.to_string(),
             state: Arc::new(Mutex::new(State::default())),
             ctrl_tx: Arc::new(Mutex::new(ReliableSender::new())),
@@ -93,6 +148,7 @@ impl UdpSession {
             msg_id: std::cell::Cell::new(1),
             reader: None,
             writer: None,
+            media_readers: Vec::new(),
             closed: closed.clone(),
         };
         s.start_threads();
@@ -106,8 +162,6 @@ impl UdpSession {
             msg_id: 0,
             frag: 0,
             frag_total: 0,
-            media_pts: 0,
-            media_flags: 0,
             payload: Some(frame::Payload::Hello(Hello {
                 scid: s.scid.clone(),
                 audio: want_audio,
@@ -116,7 +170,7 @@ impl UdpSession {
         let mut wire = Vec::with_capacity(64);
         prost::Message::encode(&hello, &mut wire).expect("encode hello");
         let mut last_progress = Instant::now();
-        while !s.state.lock().unwrap().connected {
+        while !s.state.lock().connected {
             if Instant::now() > deadline {
                 s.close();
                 return Err(format!(
@@ -140,16 +194,15 @@ impl UdpSession {
         Ok(s)
     }
 
-    /// 启动 reader（收包分发）与 writer（ACK/重传/心跳/判死）两个后台线程。
+    /// 启动 reader（收包分发）、writer（ACK/重传/心跳/OPEN/判死）与媒体 reader。
     fn start_threads(&mut self) {
-        // ── reader：收包 → 解析 → 分发事件 ──
+        // ── reader：ctrl 收包 → 解析 → 分发事件 ──
         {
             let socket = self.socket.try_clone().expect("clone udp socket");
             let state = self.state.clone();
             let ctrl_tx = self.ctrl_tx.clone();
             let ctrl_rx = self.ctrl_rx.clone();
-            let audio_rx = self.audio_rx.clone();
-            let video_rx = self.video_rx.clone();
+            let client_id = self.client_id.clone();
             let ev_tx = self.ev_tx.clone();
             let closed = self.closed.clone();
             self.reader = Some(std::thread::spawn(move || {
@@ -161,7 +214,7 @@ impl UdpSession {
                             match maybe {
                                 Ok(frame) => {
                                     for evt in Self::dispatch(
-                                        &frame, &state, &ctrl_tx, &ctrl_rx, &audio_rx, &video_rx,
+                                        &frame, &state, &ctrl_tx, &ctrl_rx, &client_id,
                                     ) {
                                         let _ = ev_tx.send(evt);
                                     }
@@ -194,23 +247,61 @@ impl UdpSession {
             }));
         }
 
-        // ── writer：ACK flush / 重传 / 心跳 / 判死 ──
+        // ── 媒体 reader：每 socket 一线程，25B 头解析 → 重装 → 事件 ──
+        if let Some(sock) = self.audio_socket.as_ref() {
+            let sock = sock.try_clone().expect("clone audio socket");
+            self.media_readers.push(Self::spawn_media_reader(
+                sock,
+                false,
+                self.client_id.clone(),
+                self.audio_flowing.clone(),
+                self.audio_rx.clone(),
+                self.ev_tx.clone(),
+                self.closed.clone(),
+            ));
+        }
+        if let Some(sock) = self.video_socket.as_ref() {
+            let sock = sock.try_clone().expect("clone video socket");
+            self.media_readers.push(Self::spawn_media_reader(
+                sock,
+                true,
+                self.client_id.clone(),
+                self.video_flowing.clone(),
+                self.video_rx.clone(),
+                self.ev_tx.clone(),
+                self.closed.clone(),
+            ));
+        }
+
+        // ── writer：ACK flush / 重传 / 心跳 / OPEN / 判死 ──
         {
             let socket = self.socket.try_clone().expect("clone udp socket");
             let ctrl_tx = self.ctrl_tx.clone();
             let ctrl_rx = self.ctrl_rx.clone();
             let audio_rx = self.audio_rx.clone();
             let video_rx = self.video_rx.clone();
+            let client_id = self.client_id.clone();
+            let audio_flowing = self.audio_flowing.clone();
+            let video_flowing = self.video_flowing.clone();
+            let audio_socket = self
+                .audio_socket
+                .as_ref()
+                .map(|s| s.try_clone().expect("clone audio socket"));
+            let video_socket = self
+                .video_socket
+                .as_ref()
+                .map(|s| s.try_clone().expect("clone video socket"));
             let ev_tx = self.ev_tx.clone();
             let closed = self.closed.clone();
             self.writer = Some(std::thread::spawn(move || {
                 let mut last_ack = 0u32;
                 let mut last_hb = Instant::now();
+                let mut last_open = Instant::now();
                 while !closed.load(Ordering::SeqCst) {
                     let now = Instant::now();
                     // ACK flush
                     {
-                        let ack = ctrl_rx.lock().unwrap().ack_seq();
+                        let ack = ctrl_rx.lock().ack_seq();
                         if ack != last_ack {
                             last_ack = ack;
                             if let Ok(wire) = encode_ack(ack) {
@@ -220,7 +311,7 @@ impl UdpSession {
                     }
                     // control 重传
                     {
-                        let mut tx = ctrl_tx.lock().unwrap();
+                        let mut tx = ctrl_tx.lock();
                         for wire in tx.due_timeouts(now) {
                             let _ = socket.send(&wire);
                         }
@@ -237,10 +328,29 @@ impl UdpSession {
                             let _ = socket.send(&wire);
                         }
                     }
+                    // 媒体 OPEN 注册：phone 收到任意合法头数据报即登记端点；
+                    // 收到首个媒体包前每 500ms 重发（编码器尚未推流时靠它上线）
+                    if now.duration_since(last_open) >= OPEN_INTERVAL {
+                        last_open = now;
+                        let cid = client_id.load(Ordering::SeqCst);
+                        if cid != 0 {
+                            let wire = encode_open(cid);
+                            if !video_flowing.load(Ordering::SeqCst) {
+                                if let Some(s) = &video_socket {
+                                    let _ = s.send(&wire);
+                                }
+                            }
+                            if !audio_flowing.load(Ordering::SeqCst) {
+                                if let Some(s) = &audio_socket {
+                                    let _ = s.send(&wire);
+                                }
+                            }
+                        }
+                    }
                     // 媒体残留清理
                     {
-                        audio_rx.lock().unwrap().sweep(MEDIA_SWEEP);
-                        video_rx.lock().unwrap().sweep(MEDIA_SWEEP);
+                        audio_rx.lock().sweep(MEDIA_SWEEP);
+                        video_rx.lock().sweep(MEDIA_SWEEP);
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -248,25 +358,79 @@ impl UdpSession {
         }
     }
 
+    /// 启动一个媒体端口 reader：解析 25B 头 → client_id 校验 → 重装 → 事件。
+    ///
+    /// 媒体 socket 错误不判死会话（判死只在 ctrl 路径）；媒体断流由上层
+    /// 看门狗（viewer 首帧超时 / daemon 音频静默）兜底。
+    fn spawn_media_reader(
+        socket: UdpSocket,
+        is_video: bool,
+        client_id: Arc<AtomicU32>,
+        flowing: Arc<AtomicBool>,
+        rx: Arc<Mutex<MediaReassembler>>,
+        ev_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+        closed: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; MEDIA_HDR_LEN + 1400];
+            while !closed.load(Ordering::SeqCst) {
+                match socket.recv(&mut buf) {
+                    Ok(n) => {
+                        let Some(f) = decode_media_datagram(&buf[..n]) else {
+                            continue; // 非法/截断 datagram
+                        };
+                        let cid = client_id.load(Ordering::SeqCst);
+                        if cid == 0 || f.client_id != cid {
+                            continue; // 未握手 / 非本会话
+                        }
+                        if f.frag_total == MEDIA_OPEN_TOTAL {
+                            continue; // OPEN 只出现在 PC→phone 方向，防御
+                        }
+                        flowing.store(true, Ordering::SeqCst);
+                        if let Some(m) = rx.lock().push(&f) {
+                            let evt = if is_video {
+                                Event::Video(m)
+                            } else {
+                                Event::Audio(m)
+                            };
+                            let _ = ev_tx.send(evt);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                    // 握手期 server 未绑媒体端口 → ICMP 不可达（Windows 表现为
+                    // ConnectionReset），与 ctrl socket 同样忽略
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ConnectionReset
+                            || e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
     /// 分发一个收到的 Frame，返回要发出的事件列表（可能为空）。
+    ///
+    /// 媒体 DATA 已迁到独立端口（媒体 reader 线程处理），ctrl 端口只收控制流。
     fn dispatch(
         frame: &Frame,
         state: &Arc<Mutex<State>>,
         ctrl_tx: &Arc<Mutex<ReliableSender>>,
         ctrl_rx: &Arc<Mutex<ReliableReceiver>>,
-        audio_rx: &Arc<Mutex<MediaReassembler>>,
-        video_rx: &Arc<Mutex<MediaReassembler>>,
+        client_id: &Arc<AtomicU32>,
     ) -> Vec<Event> {
         match frame::Type::try_from(frame.r#type) {
             Ok(frame::Type::Ack) => {
                 if let Some(frame::Payload::AckSeq(ack)) = &frame.payload {
-                    ctrl_tx.lock().unwrap().on_ack(*ack);
+                    ctrl_tx.lock().on_ack(*ack);
                 }
                 Vec::new()
             }
             Ok(frame::Type::HelloAck) => {
                 if let Some(frame::Payload::HelloAck(ack)) = &frame.payload {
-                    let mut st = state.lock().unwrap();
+                    // client_id 供媒体 reader 校验数据报归属（媒体头携带）
+                    client_id.store(ack.client_id, Ordering::SeqCst);
+                    let mut st = state.lock();
                     st.connected = true;
                     st.hello_ack = Some(ack.clone());
                     vec![Event::Connected]
@@ -276,7 +440,7 @@ impl UdpSession {
             }
             Ok(frame::Type::Data) => match frame::Stream::try_from(frame.stream) {
                 Ok(frame::Stream::Ctrl) => {
-                    let mut rx = ctrl_rx.lock().unwrap();
+                    let mut rx = ctrl_rx.lock();
                     if rx.is_dead() {
                         return vec![Event::Error("control 接收缓冲溢出".into())];
                     }
@@ -289,21 +453,7 @@ impl UdpSession {
                     }
                     out
                 }
-                Ok(frame::Stream::Audio) => audio_rx
-                    .lock()
-                    .unwrap()
-                    .push(frame)
-                    .into_iter()
-                    .map(Event::Audio)
-                    .collect(),
-                Ok(frame::Stream::Video) => video_rx
-                    .lock()
-                    .unwrap()
-                    .push(frame)
-                    .into_iter()
-                    .map(Event::Video)
-                    .collect(),
-                Err(_) => Vec::new(),
+                Err(_) => Vec::new(), // 未知流：忽略（兼容误发）
             },
             Ok(frame::Type::Bye) => vec![Event::Closed],
             Ok(frame::Type::Heartbeat) => Vec::new(),
@@ -317,7 +467,7 @@ impl UdpSession {
         let bytes = encode_ctrl(msg);
         let id = self.msg_id.get();
         self.msg_id.set(id.wrapping_add(1));
-        let frames = self.ctrl_tx.lock().unwrap().send_ctrl_bytes(id, &bytes);
+        let frames = self.ctrl_tx.lock().send_ctrl_bytes(id, &bytes);
         for f in frames {
             let mut wire = Vec::with_capacity(f.encoded_len() + 8);
             prost::Message::encode(&f, &mut wire).map_err(|e| format!("encode: {e}"))?;
@@ -346,12 +496,12 @@ impl UdpSession {
 
     /// 握手后返回的 codec 状态。
     pub fn hello_ack(&self) -> Option<HelloAck> {
-        self.state.lock().unwrap().hello_ack.clone()
+        self.state.lock().hello_ack.clone()
     }
 
     /// 视频流累计丢失的消息数（HUD 丢包率用）。
     pub fn video_lost(&self) -> u64 {
-        self.video_rx.lock().unwrap().lost()
+        self.video_rx.lock().lost()
     }
 
     /// 关闭会话（发 BYE + 停线程 + 关 socket）。
@@ -362,6 +512,9 @@ impl UdpSession {
             let _ = h.join();
         }
         if let Some(h) = self.writer.take() {
+            let _ = h.join();
+        }
+        for h in self.media_readers.drain(..) {
             let _ = h.join();
         }
         let _ = self.rx.try_recv(); // 清残留
@@ -397,8 +550,6 @@ fn encode_ack(ack_seq: u32) -> Result<Vec<u8>, String> {
         msg_id: 0,
         frag: 0,
         frag_total: 0,
-        media_pts: 0,
-        media_flags: 0,
         payload: Some(frame::Payload::AckSeq(ack_seq)),
     };
     let mut wire = Vec::with_capacity(16);
@@ -414,8 +565,6 @@ fn encode_heartbeat() -> Result<Vec<u8>, String> {
         msg_id: 0,
         frag: 0,
         frag_total: 0,
-        media_pts: 0,
-        media_flags: 0,
         payload: None,
     };
     let mut wire = Vec::with_capacity(16);
@@ -431,13 +580,33 @@ fn encode_bye() -> Result<Vec<u8>, String> {
         msg_id: 0,
         frag: 0,
         frag_total: 0,
-        media_pts: 0,
-        media_flags: 0,
         payload: None,
     };
     let mut wire = Vec::with_capacity(16);
     prost::Message::encode(&f, &mut wire).map_err(|e| format!("encode bye: {e}"))?;
     Ok(wire)
+}
+
+/// 构造媒体端点 OPEN 注册包（25B 头，frag_total=OPEN 标记，无负载）。
+///
+/// phone 收到任意合法头数据报即把源地址登记为媒体发送目标；编码器尚未
+/// 推流时靠本包周期重发完成注册。
+fn encode_open(client_id: u32) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(MEDIA_HDR_LEN);
+    encode_media_datagram(
+        &MediaFragment {
+            client_id,
+            msg_id: 0,
+            seq: 0,
+            frag: 0,
+            frag_total: MEDIA_OPEN_TOTAL,
+            pts: 0,
+            flags: 0,
+            payload: &[],
+        },
+        &mut wire,
+    );
+    wire
 }
 
 /// 由请求构造 control 指令的小工具集。

@@ -14,43 +14,59 @@ package kulua.direct;
 option java_multiple_files = true;
 option java_package = "kulua.direct";
 
-// 数据报外层：流 + 类型 + 序号 + 分片信息 + 负载。
+// 数据报外层（仅 control 端口 P 使用）。
+//
+// 音频/视频已迁出到独立 UDP 端口（video=P+1 / audio=P+2），用 25B 大端定长
+// 二进制头承载（非 protobuf），手机端独立 socket 收发：
+//
+//   offset  size  field
+//   0       4     client_id  （HELLO_ACK 分配，phone 按它路由媒体分片）
+//   4       4     msg_id     （一条媒体帧一个 id，分片共享）
+//   8       4     seq        （每流单调递增，排序/去重用）
+//   12      2     frag       （分片索引，0 起）
+//   14      2     frag_total （0 = 单包完整；0xFFFF = OPEN 注册包，负载为空）
+//   16      8     pts        （微秒；接收侧以 frag==0 的值为准）
+//   24      1     flags      （bit0=config bit1=keyframe）
+//
+// WHY：单端口单 socket 时音视频分片共享发送缓冲（视频关键帧突发挤掉音频），
+// 且手机 ctrl 单循环要给每个媒体分片跑 protobuf 解析。分端口后三路流缓冲
+// 独立、媒体路径零 protobuf。PC 在媒体端口发 OPEN（携 client_id）注册接收
+// 端点；phone 收到任何校验通过的数据报即把源地址登记为发送目标。
+// config 帧（SPS/PPS 等）仍走 control 端口可靠投递（MediaConfig）。
 message Frame {
-  // 逻辑流（对应原「连接类型」握手字节在一条 UDP 端口上的多路复用）。
+  // control 端口上只剩控制流（媒体已迁出，AUDIO=1/VIDEO=2 仅作为
+  // 媒体端口/ MediaConfig.stream 的流标识保留数值）。
   enum Stream {
-    CTRL = 0;   // 控制流（可靠、有序、双向）
-    AUDIO = 1;  // 音频流（phone → PC，尽力而为）
-    VIDEO = 2;  // 视频流（phone → PC managed by viewer，尽力而为）
+    CTRL = 0;
   }
 
-  // 帧类型。DATA 为业务负载（control 或 media 分片）；其余为连接/控制面。
+  // 帧类型。
   enum Type {
-    DATA = 0;
+    DATA = 0;       // control 负载（重装后为 CtrlMsg，可靠）
     ACK = 1;        // control 累积确认（不回 seq，天然抗丢）
     HELLO = 2;      // PC → phone：打开会话（携带 scid）
-    HELLO_ACK = 3;  // phone → PC：回执（携带 codec 状态）
+    HELLO_ACK = 3;  // phone → PC：回执（携带 codec 状态 + client_id）
     HEARTBEAT = 4;  // PC → phone 保活（也用于 NAT 映射保鲜）
     BYE = 5;        // 关闭会话
   }
 
   Stream stream = 1;
   Type type = 2;
-  // 每流单调递增发送序号：control 用于 ACK/去重/窗口滑动，media 用于排序与去重。
+  // control 单调递增序号：ACK/去重/窗口滑动用。
   uint32 seq = 3;
   // 分片归属：同一消息的所有分片共享一个 msg_id（配合 frag/frag_total 重装）。
   uint32 msg_id = 4;
   // 分片索引（0 起）；单包完整消息 = 0。
   uint32 frag = 5;
-  // 总分片数（0 表示单包完整；DATA 分片消息中首片给出真实总数）。
+  // 总分片数（0 表示单包完整；分片消息首片给出真实总数）。
   uint32 frag_total = 6;
 
-  // ↓ 以下字段仅在 media DATA 的首分片（frag == 0）有效，后续分片忽略。
-  // PTS（微秒）。config/keyframe 标志沿用 scrcpy 帧头语义。
-  uint64 media_pts = 7;
-  uint32 media_flags = 8; // bit0=config, bit1=keyframe, bit2=session(预留)
+  // 7/8 为旧媒体字段（media_pts/media_flags）占位，媒体已迁出到媒体端口，
+  // 不复用以避免新旧实现歧义。
+  reserved 7, 8;
 
   oneof payload {
-    // 负载字节：control DATA（可靠流，重装后为 CtrlMsg）或 media 分片（audio/video）。
+    // control DATA 负载（可靠流，重装后为 CtrlMsg）。
     bytes data = 10;
     // ACK：确认到该序号（含）。
     uint32 ack_seq = 12;
@@ -70,6 +86,9 @@ message HelloAck {
   string scid = 1;            // 回显
   uint32 audio_codec = 2;     // 音频 codec id（0=禁用 / 4B ASCII id，如 "opus"）
   uint32 video_codec = 3;     // 视频 codec id（"h264"）；未创建显示器时可不填
+  // phone 分配的客户端 id（1 起单调递增）；媒体端口数据报头携带，
+  // phone 按它把媒体分片路由到本会话、并把数据报源地址登记为媒体发送目标。
+  uint32 client_id = 4;
 }
 
 // 所有 control 命令 / 服务器事件（可靠 DATA 的负载）。
@@ -106,7 +125,7 @@ message SetAudioCodec {
 // 音频/视频 config 帧（AAC AudioSpecificConfig / FLAC STREAMINFO / H.264 SPS+PPS）。
 // 走可靠 control 流，确保解码器可在首帧前初始化。
 message MediaConfig {
-  uint32 stream = 1; // Frame.Stream 值（AUDIO=1 / VIDEO=2）
+  uint32 stream = 1; // 流标识：1=AUDIO 2=VIDEO（与媒体端口序 video=P+1/audio=P+2 对应）
   bytes data = 2;    // config 原始字节（同原 12B 帧头 bit62 携带的内容）
 }
 
