@@ -16,6 +16,9 @@ import java.io.IOException;
 
 public final class Server {
 
+    /** logcat tag，与其余类保持一致（logcat -s kulua-server 过滤用）。 */
+    public static final String TAG = "kulua-server";
+
     public static final String SERVER_PATH;
 
     static {
@@ -32,7 +35,10 @@ public final class Server {
         try {
             internalMain(args);
         } catch (Throwable t) {
-            android.util.Log.e("kulua", "server error", t);
+            // stderr 随 daemon 的 `adb shell` stderr 转发到 PC 控制台（见 scrcpy.rs），
+            // 没挂 logcat 时也能看到致命错误
+            t.printStackTrace();
+            android.util.Log.e(TAG, "server error", t);
             status = 1;
         } finally {
             System.exit(status);
@@ -46,7 +52,7 @@ public final class Server {
         android.os.Looper.prepare();
 
         Options options = Options.parse(args);
-        android.util.Log.i("kulua", "kulua-server " + options.scid);
+        android.util.Log.i(TAG, "kulua-server " + options.scid);
 
         // 一次性模式：枚举应用后退出（不监听 socket）
         if (options.listApps) {
