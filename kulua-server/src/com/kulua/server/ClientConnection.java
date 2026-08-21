@@ -256,6 +256,18 @@ final class ClientConnection {
             displays.destroy(entry.id);
             return;
         }
+        // WHY：DisplayReady 必须等 VirtualDisplay 真正 attach——viewer 收到即发
+        // START_APP/触摸，早于 attach 会被 systemDisplayId 兜底成 0（真屏）。
+        // 编码线程创建成功或失败都会放行 latch，失败用 isRunning 区分。
+        boolean vdInTime = encoder.awaitVirtualDisplay(2000);
+        if (!encoder.isRunning()) {
+            Log.e(TAG, "display #" + entry.id + " encoder failed before ready");
+            displays.destroy(entry.id);
+            return;
+        }
+        if (!vdInTime) {
+            Log.w(TAG, "display #" + entry.id + " virtual display attach slow (>2s)");
+        }
         sendCtrlMsg(CtrlMsg.newBuilder()
                 .setDisplayReady(kulua.direct.DisplayReady.newBuilder()
                         .setDisplayId(entry.id)

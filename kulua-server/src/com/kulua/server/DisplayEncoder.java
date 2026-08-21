@@ -11,6 +11,7 @@ import android.view.Surface;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
 
 /**
  * 视频编码器 + 推流（每显示器一个实例）。
@@ -39,6 +40,9 @@ public final class DisplayEncoder {
     private int pendingHeight;
     private volatile boolean resizeRequested;
 
+    /** VirtualDisplay 首次创建信号（成功 attach / 创建失败都放行，见 createCodec）。 */
+    private final CountDownLatch vdReady = new CountDownLatch(1);
+
     private final int dpi;
 
     private volatile boolean running;
@@ -65,6 +69,22 @@ public final class DisplayEncoder {
         resizeRequested = false;
         thread = new Thread(this::encodeLoop, "display-" + id);
         thread.start();
+    }
+
+    /** 等待 VirtualDisplay 首次创建完成；返回是否在超时内就绪。
+     *  创建失败同样放行（配合 {@link #isRunning()} 区分成败）。 */
+    boolean awaitVirtualDisplay(long timeoutMs) {
+        try {
+            return vdReady.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** 编码器是否仍在运行（初始创建失败 / stop 后为 false）。 */
+    boolean isRunning() {
+        return running;
     }
 
     /** 弹性显示器：调整 VirtualDisplay 尺寸并重启编码器。 */
@@ -140,6 +160,9 @@ public final class DisplayEncoder {
             Log.e(TAG, "create codec/display failed #" + id, e);
             releaseCodec();
             throw e;
+        } finally {
+            // 成功 attach / 创建失败都放行等待方；失败由 running=false 区分
+            vdReady.countDown();
         }
     }
 
@@ -179,6 +202,7 @@ public final class DisplayEncoder {
             }
         } catch (IOException e) {
             Log.e(TAG, "create codec failed #" + id, e);
+            running = false;
         } catch (IllegalStateException e) {
             // 正常关闭路径：resize/stop 时 codec.stop() 唤醒阻塞的 dequeueOutputBuffer
             // 并抛 IllegalStateException。
