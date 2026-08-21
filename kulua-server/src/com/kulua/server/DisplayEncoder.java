@@ -35,6 +35,12 @@ public final class DisplayEncoder {
     private final DisplayRegistry displayManager;
     private int widthField;
     private int heightField;
+
+    private final Object resizeLock = new Object();
+    private int pendingWidth;
+    private int pendingHeight;
+    private volatile boolean resizeRequested;
+
     private final int dpi;
 
     private volatile boolean running;
@@ -44,39 +50,60 @@ public final class DisplayEncoder {
     private VirtualDisplay virtualDisplay;
 
     public DisplayEncoder(int id, ClientConnection client, DisplayRegistry displayManager,
-                          int width, int height, int dpi) {
+            int width, int height, int dpi) {
         this.id = id;
         this.client = client;
         this.displayManager = displayManager;
         this.widthField = width;
         this.heightField = height;
+        this.pendingWidth = width;
+        this.pendingHeight = height;
         this.dpi = dpi;
     }
 
     /** 启动编码与推流（创建编码器 + VirtualDisplay，独立线程推流）。 */
     public void start() throws IOException {
         running = true;
-        createCodec();
+        resizeRequested = false;
         thread = new Thread(this::encodeLoop, "display-" + id);
         thread.start();
     }
 
     /** 弹性显示器：调整 VirtualDisplay 尺寸并重启编码器。 */
     public synchronized void resize(int newWidth, int newHeight) {
-        widthField = newWidth;
-        heightField = newHeight;
-        running = false;
-        stopEncoderThread();
-        try {
-            createCodec();
-            running = true;
-            thread = new Thread(this::encodeLoop, "display-" + id);
-            thread.start();
-        } catch (IOException e) {
-            Log.e(TAG, "resize restart failed #" + id, e);
+        synchronized (resizeLock) {
+            pendingWidth = newWidth;
+            pendingHeight = newHeight;
+            resizeRequested = true;
         }
     }
 
+    private void performResize() {
+        int newWidth;
+        int newHeight;
+        synchronized (resizeLock) {
+            if (!resizeRequested)
+                return;
+            newWidth = pendingWidth;
+            newHeight = pendingHeight;
+            resizeRequested = false;
+        }
+
+        releaseCodecForResize();
+
+        widthField = newWidth;
+        heightField = newHeight;
+
+        try {
+            createCodec();
+        } catch (Exception e) {
+            Log.e(TAG, "resize failed #" + id + " " + newWidth + "x" + newHeight, e);
+            running = false;
+        }
+    }
+
+    /** 创建 codec + VirtualDisplay。必须在编码线程调用（MediaCodec 非线程安全）；
+     *  resize 复用 VirtualDisplay 实例，仅换 surface。 */
     private void createCodec() throws IOException {
         try {
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
@@ -94,12 +121,10 @@ public final class DisplayEncoder {
             if (virtualDisplay == null) {
                 // 首次创建 VirtualDisplay；resize 时复用已有实例（换 surface）。
                 try {
-                    java.lang.reflect.Constructor<android.hardware.display.DisplayManager> ctor =
-                            android.hardware.display.DisplayManager.class
-                                    .getDeclaredConstructor(android.content.Context.class);
+                    java.lang.reflect.Constructor<android.hardware.display.DisplayManager> ctor = android.hardware.display.DisplayManager.class
+                            .getDeclaredConstructor(android.content.Context.class);
                     ctor.setAccessible(true);
-                    android.hardware.display.DisplayManager systemDisplayManager =
-                            ctor.newInstance(FakeContext.get());
+                    android.hardware.display.DisplayManager systemDisplayManager = ctor.newInstance(FakeContext.get());
                     virtualDisplay = systemDisplayManager.createVirtualDisplay(
                             "kulua-" + id, widthField, heightField, dpi, inputSurface,
                             DisplayRegistry.buildFlags());
@@ -123,8 +148,18 @@ public final class DisplayEncoder {
     /** 编码输出循环：dequeue → 推流（config 可靠 / 媒体分片）。 */
     private void encodeLoop() {
         try {
+            createCodec();
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             while (running) {
+
+                if (resizeRequested) {
+                    performResize();
+                }
+
+                if (codec == null) {
+                    continue;
+                }
+
                 int index = codec.dequeueOutputBuffer(info, 10_000);
                 if (index >= 0) {
                     ByteBuffer buffer = codec.getOutputBuffer(index);
@@ -144,6 +179,8 @@ public final class DisplayEncoder {
                     break;
                 }
             }
+        } catch (IOException e) {
+            Log.e(TAG, "create codec failed #" + id, e);
         } catch (IllegalStateException e) {
             // 正常关闭路径：resize/stop 时 codec.stop() 唤醒阻塞的 dequeueOutputBuffer
             // 并抛 IllegalStateException。
@@ -183,7 +220,7 @@ public final class DisplayEncoder {
     }
 
     /**
-     * 停掉编码线程并释放 codec（resize / stop 共用）。
+     * 停掉编码线程并释放 codec（stop 路径；resize 走 releaseCodecForResize）。
      * 顺序：先 codec.stop() 唤醒 dequeue（抛 IllegalStateException，已捕获），
      * join 等线程结束，最后 release。
      */
@@ -226,6 +263,32 @@ public final class DisplayEncoder {
         codec = null;
         if (inputSurface != null) {
             inputSurface.release();
+            inputSurface = null;
+        }
+    }
+
+    private void releaseCodecForResize() {
+        if (virtualDisplay != null) {
+            try {
+                virtualDisplay.setSurface(null);
+            } catch (Exception e) {
+                Log.w(TAG, "detach surface failed #" + id, e);
+            }
+        }
+        if (codec != null) {
+            try {
+                codec.stop();
+            } catch (Exception e) {
+                Log.w(TAG, "codec.stop failed #" + id, e);
+            }
+        }
+
+        if (inputSurface != null) {
+            try {
+                inputSurface.release();
+            } catch (Exception e) {
+                Log.w(TAG, "surface.release failed #" + id, e);
+            }
             inputSurface = null;
         }
     }
