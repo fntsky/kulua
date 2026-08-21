@@ -17,11 +17,11 @@ import java.lang.reflect.Method;
  *
  * 为什么需要：
  * 1. `DisplayManager.createVirtualDisplay` 校验 packageName 与 calling uid 匹配，
- *    系统 Context 的包名（"android"）不匹配 shell uid → SecurityException。
- *    官方 scrcpy 用 FakeContext 解决（包名设为 com.android.shell）。
+ * 系统 Context 的包名（"android"）不匹配 shell uid → SecurityException。
+ * 官方 scrcpy 用 FakeContext 解决（包名设为 com.android.shell）。
  * 2. 剪贴板读取（Settings provider）同样校验包名与 uid，且 ContentResolver
- *    必须用 `getContentProviderExternal`（binder 直取 provider）绕开
- *    ActivityThread.acquireProvider 的 uid 校验。
+ * 必须用 `getContentProviderExternal`（binder 直取 provider）绕开
+ * ActivityThread.acquireProvider 的 uid 校验。
  */
 public final class FakeContext extends ContextWrapper {
 
@@ -92,7 +92,9 @@ public final class FakeContext extends ContextWrapper {
         return builder.build();
     }
 
-    /** ActivityManager.getContentProviderExternal：binder 直取 provider（shell 权限下可用）。 */
+    /**
+     * ActivityManager.getContentProviderExternal：binder 直取 provider（shell 权限下可用）。
+     */
     private static IContentProvider getContentProviderExternal(String name) {
         try {
             Class<?> activityManagerClass = Class.forName("android.app.ActivityManager");

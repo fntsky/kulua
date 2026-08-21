@@ -7,6 +7,8 @@
 ///
 /// 与旧 RGBX 版相同的最近邻采样，一次完成 YUV→RGB 与缩放，
 /// 但输出为字节级 RGBA（egui::ColorImage 需要）。
+///
+/// TODO: GPU 加速
 pub fn render_yuv420_to_rgba(
     dst: &mut [u8],
     dst_w: usize,
