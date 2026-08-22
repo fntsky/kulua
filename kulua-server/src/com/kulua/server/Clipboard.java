@@ -3,7 +3,6 @@ package com.kulua.server;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.util.Log;
 
 import java.lang.reflect.Method;
 
@@ -12,7 +11,6 @@ import java.lang.reflect.Method;
  */
 public final class Clipboard {
 
-    private static final String TAG = "kulua-server";
 
     private static Context context;
 
@@ -70,7 +68,7 @@ public final class Clipboard {
             manager.setPrimaryClip(ClipData.newPlainText(null, text));
             return true;
         } catch (Exception e) {
-            Log.e(TAG, "set clipboard failed", e);
+            Server.e("set clipboard failed", e);
             return false;
         }
     }
@@ -175,7 +173,7 @@ public final class Clipboard {
             }
             return null;
         } catch (Exception e) {
-            Log.e(TAG, "getPrimaryClipDirect failed", e);
+            Server.e("getPrimaryClipDirect failed", e);
             return null;
         }
     }
@@ -245,7 +243,7 @@ public final class Clipboard {
             }
             return "";
         } catch (Exception e) {
-            Log.e(TAG, "get clipboard failed", e);
+            Server.e("get clipboard failed", e);
             return "";
         }
     }

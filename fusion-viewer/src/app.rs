@@ -1,7 +1,8 @@
 //! eframe/egui 窗口应用：渲染视频帧 + 输入注入 + HUD 调试面板。
 //!
 //! 视频帧由解码线程产出 RGBA，UI 线程上传 egui 纹理并按窗口 letterbox 显示；
-//! HUD（egui 窗口）实时显示码率 / 帧率 / 丢包率 / 分辨率，便于诊断卡死/花屏。
+//! HUD（egui 弹窗）实时显示码率 / 帧率 / 丢包率 / 运行时长 / 距上帧：
+//! 运行时长停走 = UI 线程卡死；时长在走但「距上帧」持续增大 = 视频断流。
 
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -112,11 +113,12 @@ struct VideoFrame {
     rgba: Vec<u8>,
 }
 
-/// HUD 统计（每秒推进一次窗口，锁内采样 session 丢包）。
+/// HUD 统计（250ms 推进一次统计窗口；丢包数采样自 session 的重组器）。
 struct Hud {
     window_start: Instant,
     rx_bytes: u64,
     seen: u64,
+    /// 统计窗口内真实上传的新帧数（不含重复重绘）。
     disp: u64,
     prev_lost: u64,
     // 上窗口显示值
@@ -163,11 +165,17 @@ pub struct ViewerApp {
     latest: Option<VideoFrame>,
     texture: Option<egui::TextureHandle>,
     last_upload: Instant,
+    /// 解码帧代号：每收到一帧新 RGBA 递增（判断是否有新帧需要上传）。
+    frame_gen: u64,
+    /// 已上传到纹理的帧代号（< frame_gen 表示有待上传的新帧）。
+    uploaded_gen: u64,
     video_rect: Option<Rect>,
 
     hud: Hud,
     resize: ResizeState,
     started_at: Instant,
+    /// 最近一次收到解码帧的时刻（HUD「距上帧」用，诊断视频断流）。
+    last_frame_at: Instant,
 
     // 输入
     mouse_down: bool,
@@ -180,6 +188,8 @@ pub struct ViewerApp {
     /// 首帧超时诊断：已提示过 / 已自动重发 START_APP。
     no_frame_alerted: bool,
     start_app_resent: bool,
+    /// 视频断流日志已打（每次断流只记一条，恢复时再记恢复）。
+    stall_logged: bool,
 }
 
 impl ViewerApp {
@@ -199,6 +209,8 @@ impl ViewerApp {
             latest: None,
             texture: None,
             last_upload: Instant::now(),
+            frame_gen: 0,
+            uploaded_gen: 0,
             video_rect: None,
             hud: Hud {
                 window_start: Instant::now(),
@@ -213,6 +225,7 @@ impl ViewerApp {
             },
             resize: ResizeState::new(),
             started_at: Instant::now(),
+            last_frame_at: Instant::now(),
             mouse_down: false,
             pressed_keys: HashSet::new(),
             should_exit: false,
@@ -220,6 +233,7 @@ impl ViewerApp {
             has_cjk: false,
             no_frame_alerted: false,
             start_app_resent: false,
+            stall_logged: false,
         }
     }
 
@@ -240,6 +254,9 @@ impl ViewerApp {
                 Event::Control(msg) => {
                     if let Some(ctrl_msg::Msg::MediaConfig(cfg)) = msg.msg {
                         if cfg.stream == 2 {
+                            // 诊断：config 长度可对照 phone 端 csd 日志，
+                            // 识别编码器分次吐 CSD / 残缺参数集问题
+                            eprintln!("[viewer] 收到视频 config（{} 字节）", cfg.data.len());
                             let _ = self.video_input_tx.try_send(VideoInput::Config(cfg.data));
                         }
                     }
@@ -274,11 +291,21 @@ impl ViewerApp {
                             self.started_at.elapsed().as_secs_f32()
                         );
                     }
+                    if self.stall_logged {
+                        // 诊断：断流后恢复，记录断流时长（与 phone 端 stats 对账）
+                        eprintln!(
+                            "[viewer] 视频恢复（此前断流 {:.1}s）",
+                            self.last_frame_at.elapsed().as_secs_f32()
+                        );
+                        self.stall_logged = false;
+                    }
                     self.latest = Some(VideoFrame {
                         width,
                         height,
                         rgba,
                     });
+                    self.frame_gen += 1;
+                    self.last_frame_at = Instant::now();
                 }
                 VideoEvent::Error(e) => {
                     eprintln!("[viewer] {}", e);
@@ -354,21 +381,30 @@ impl ViewerApp {
         self.hud.disp = 0;
     }
 
-    /// 更新纹理（新帧 ≥16ms 才上传，节流 UI 线程）。
+    /// 更新纹理：仅当有新解码帧时才拷贝/上传（≥16ms 节流）。
+    ///
+    /// WHY：旧实现每 16ms 无条件重传同一帧 RGBA，2K 下约 880MB/s 的无谓
+    /// CPU 拷贝 + GPU 上传，是多窗口时的卡死诱因；且「显示帧率」若在
+    /// 这里无条件计数，画面冻结时仍显示 ~60fps，无法用于判断卡死。
     fn upload_texture(&mut self, ctx: &egui::Context) {
-        let Some(frame) = self.latest.as_ref() else {
-            return;
-        };
+        if self.uploaded_gen == self.frame_gen {
+            return; // 没有新帧
+        }
         if self.last_upload.elapsed() < MIN_UPLOAD_INTERVAL {
             return;
         }
+        let Some(frame) = self.latest.as_ref() else {
+            return;
+        };
         self.last_upload = Instant::now();
+        self.uploaded_gen = self.frame_gen;
         let image =
             egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
         let tex = self.texture.get_or_insert_with(|| {
             ctx.load_texture("video", image.clone(), egui::TextureOptions::LINEAR)
         });
         tex.set(image, egui::TextureOptions::LINEAR);
+        self.hud.disp += 1;
     }
 
     /// 视频坐标换算（letterbox 逆变换）。
@@ -592,11 +628,34 @@ impl ViewerApp {
                         ui.label("丢包率");
                         ui.label(RichText::new(format!("{:.1}%", self.hud.loss_pct)).monospace());
                         ui.end_row();
+                        ui.label("累计丢帧");
+                        ui.label(RichText::new(format!("{}", self.hud.lost_total)).monospace());
+                        ui.end_row();
                         ui.label("分辨率");
                         ui.label(RichText::new(format!("{vx}×{vy}")).monospace());
                         ui.end_row();
                         ui.label("目标尺寸");
                         ui.label(RichText::new(format!("{:?}", self.resize.last_sent)).monospace());
+                        ui.end_row();
+                        // 卡死判据：运行时长停走 → UI 线程卡死；时长在走而
+                        // 距上帧持续增大 → 视频断流（解码/网络侧问题）
+                        ui.label("运行时长");
+                        ui.label(RichText::new(fmt_elapsed(self.started_at.elapsed())).monospace());
+                        ui.end_row();
+                        let since_frame = self.last_frame_at.elapsed();
+                        let age_col = if since_frame >= Duration::from_secs(10) {
+                            Color32::RED
+                        } else if since_frame >= Duration::from_secs(2) {
+                            Color32::YELLOW
+                        } else {
+                            Color32::WHITE
+                        };
+                        ui.label("距上帧");
+                        ui.label(
+                            RichText::new(format!("{:.1}s", since_frame.as_secs_f32()))
+                                .monospace()
+                                .color(age_col),
+                        );
                         ui.end_row();
                         let st = if self.should_exit {
                             "退出中"
@@ -618,6 +677,19 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_session();
         self.drain_video();
+        // 诊断：首帧之后 ≥2s 无新帧 → 打一条断流日志（每次断流只记一次）。
+        // 与 HUD「距上帧」同源，但控制台可留档，事后与 phone 端 stats 对账。
+        if self.latest.is_some()
+            && !self.stall_logged
+            && self.last_frame_at.elapsed() >= Duration::from_secs(2)
+        {
+            self.stall_logged = true;
+            eprintln!(
+                "[viewer] 视频断流 {:.1}s（累计丢帧 {}，HUD 帧率应已归零）",
+                self.last_frame_at.elapsed().as_secs_f32(),
+                self.session.video_lost()
+            );
+        }
         self.tick_hud();
         if self.should_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -669,7 +741,6 @@ impl eframe::App for ViewerApp {
             let _ = ui_rect;
         }
         self.upload_texture(ctx);
-        self.tick_upload_counter();
         self.hud_ui(ctx);
         self.handle_extra(ctx);
         self.handle_keys(ctx);
@@ -680,10 +751,13 @@ impl eframe::App for ViewerApp {
     }
 }
 
-/// 计一次“本次呈现”用于帧率统计。
-impl ViewerApp {
-    fn tick_upload_counter(&mut self) {
-        self.hud.disp += 1;
+/// 时长格式化：`MM:SS`，满 1 小时为 `H:MM:SS`（HUD「运行时长」用）。
+fn fmt_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
     }
 }
 
@@ -703,8 +777,19 @@ fn letterbox(avail: Vec2, aspect: f32) -> Vec2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_display, even_dim, letterbox, target_display};
+    use std::time::Duration;
+
+    use super::{cap_display, even_dim, fmt_elapsed, letterbox, target_display};
     use egui::Vec2;
+
+    #[test]
+    fn elapsed_formats_minutes_and_hours() {
+        assert_eq!(fmt_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(fmt_elapsed(Duration::from_secs(65)), "01:05");
+        assert_eq!(fmt_elapsed(Duration::from_secs(3599)), "59:59");
+        assert_eq!(fmt_elapsed(Duration::from_secs(3600)), "1:00:00");
+        assert_eq!(fmt_elapsed(Duration::from_secs(7325)), "2:02:05");
+    }
 
     #[test]
     fn cap_keeps_normal_sizes_unchanged() {

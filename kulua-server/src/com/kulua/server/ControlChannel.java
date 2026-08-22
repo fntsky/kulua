@@ -1,6 +1,5 @@
 package com.kulua.server;
 
-import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
@@ -17,7 +16,6 @@ import kulua.direct.SetClipboard;
  * 剪贴板推送（phone → PC）由 ClientConnection 的 Clipboard 监听完成。
  */
 public final class ControlChannel {
-    private static final String TAG = "kulua-server";
 
     private ControlChannel() {
         // not instantiable
@@ -29,7 +27,7 @@ public final class ControlChannel {
                 && !msg.hasInjectScroll() && !msg.hasBackOrScreenOn() && !msg.hasSetClipboard()
                 && !msg.hasStartApp() && !msg.hasResizeDisplay() && !msg.hasCreateDisplay()
                 && !msg.hasDestroyDisplay() && !msg.hasSetAudioCodec()) {
-            Log.w(TAG, "empty/unknown ctrl msg from " + client.addr());
+            Server.w("empty/unknown ctrl msg from " + client.addr());
             return;
         }
         if (msg.hasInjectKeycode()) {
@@ -42,7 +40,7 @@ public final class ControlChannel {
         } else if (msg.hasInjectText()) {
             kulua.direct.InjectText m = msg.getInjectText();
             if (m.getText().length() > 1024 * 1024) {
-                Log.w(TAG, "inject text too long");
+                Server.w("inject text too long");
             } else {
                 Device.injectText(m.getText(), (int) m.getDisplayId());
             }
@@ -68,11 +66,11 @@ public final class ControlChannel {
         } else if (msg.hasSetClipboard()) {
             SetClipboard m = msg.getSetClipboard();
             if (m.getText().length() > 16 * 1024 * 1024) {
-                Log.w(TAG, "clipboard text too long");
+                Server.w("clipboard text too long");
                 return;
             }
             boolean ok = Clipboard.set(m.getText());
-            Log.i(TAG, "set clipboard (seq=" + m.getSequence() + ") paste=" + m.getPaste()
+            Server.i("set clipboard (seq=" + m.getSequence() + ") paste=" + m.getPaste()
                     + " ok=" + ok);
             Clipboard.broadcastChange(m.getText());
             if (m.getPaste()) {
@@ -88,23 +86,23 @@ public final class ControlChannel {
             kulua.direct.ResizeDisplay m = msg.getResizeDisplay();
             DisplayRegistry.DisplayEntry entry = client.displays().get(m.getDisplayId());
             if (entry != null && entry.encoder != null) {
-                Log.i(TAG, "resize display #" + m.getDisplayId() + " to "
+                Server.i("resize display #" + m.getDisplayId() + " to "
                         + m.getWidth() + "x" + m.getHeight());
                 entry.encoder.resize(m.getWidth(), m.getHeight());
             } else {
-                Log.w(TAG, "resize unknown display #" + m.getDisplayId());
+                Server.w("resize unknown display #" + m.getDisplayId());
             }
         } else if (msg.hasCreateDisplay()) {
             kulua.direct.CreateDisplay m = msg.getCreateDisplay();
             client.createDisplay(m.getWidth(), m.getHeight(), m.getDpi());
         } else if (msg.hasDestroyDisplay()) {
             kulua.direct.DestroyDisplay m = msg.getDestroyDisplay();
-            Log.i(TAG, "destroy display #" + m.getDisplayId());
+            Server.i("destroy display #" + m.getDisplayId());
             client.displays().destroy(m.getDisplayId());
         } else if (msg.hasSetAudioCodec()) {
             int codecIndex = (int) msg.getSetAudioCodec().getCodec();
             String name = codecNameForIndex(codecIndex);
-            Log.i(TAG, "audio codec hot-switch → " + name + " (" + client.addr() + ")");
+            Server.i("audio codec hot-switch → " + name + " (" + client.addr() + ")");
             client.startAudio(name, true);
         }
     }

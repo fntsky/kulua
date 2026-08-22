@@ -5,7 +5,6 @@ import android.app.Application;
 import android.app.Instrumentation;
 import android.content.pm.ApplicationInfo;
 import android.os.Build;
-import android.util.Log;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -25,7 +24,6 @@ import java.lang.reflect.Method;
 @SuppressLint("PrivateApi,BlockedPrivateApi")
 public final class Workarounds {
 
-    private static final String TAG = "kulua-server";
 
     private static final Class<?> ACTIVITY_THREAD_CLASS;
     private static final Object ACTIVITY_THREAD;
@@ -80,7 +78,7 @@ public final class Workarounds {
             mBoundApplicationField.set(ACTIVITY_THREAD, appBindData);
         } catch (Throwable t) {
             // workaround，失败不致命（日志记录便于排查）
-            Log.d(TAG, "fillAppInfo failed: " + t.getMessage());
+            Server.d("fillAppInfo failed: " + t.getMessage());
         }
     }
 
@@ -93,7 +91,7 @@ public final class Workarounds {
             mInitialApplicationField.setAccessible(true);
             mInitialApplicationField.set(ACTIVITY_THREAD, app);
         } catch (Throwable t) {
-            Log.d(TAG, "fillAppContext failed: " + t.getMessage());
+            Server.d("fillAppContext failed: " + t.getMessage());
         }
     }
 
@@ -111,7 +109,7 @@ public final class Workarounds {
             field.setAccessible(true);
             field.set(ACTIVITY_THREAD, configurationController);
         } catch (Throwable t) {
-            Log.d(TAG, "fillConfigurationController failed: " + t.getMessage());
+            Server.d("fillConfigurationController failed: " + t.getMessage());
         }
     }
 }

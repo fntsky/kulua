@@ -297,6 +297,7 @@ impl UdpSession {
                 let mut last_ack = 0u32;
                 let mut last_hb = Instant::now();
                 let mut last_open = Instant::now();
+                let mut last_rtx_warn = Instant::now();
                 while !closed.load(Ordering::SeqCst) {
                     let now = Instant::now();
                     // ACK flush
@@ -312,10 +313,28 @@ impl UdpSession {
                     // control 重传
                     {
                         let mut tx = ctrl_tx.lock();
-                        for wire in tx.due_timeouts(now) {
+                        let wires = tx.due_timeouts(now);
+                        // 诊断：重传压力 = 对端 ACK 断供（phone ctrl 循环被阻塞/
+                        // 链路拥塞），提前告警，别等判死才发现
+                        if !wires.is_empty()
+                            && tx.pending() >= 8
+                            && now.duration_since(last_rtx_warn) >= Duration::from_secs(2)
+                        {
+                            last_rtx_warn = now;
+                            eprintln!(
+                                "[kulua] ctrl 重传压力：pending={} 本轮重传 {} 片",
+                                tx.pending(),
+                                wires.len()
+                            );
+                        }
+                        for wire in wires {
                             let _ = socket.send(&wire);
                         }
                         if tx.is_stalled() {
+                            eprintln!(
+                                "[kulua] ctrl 判死：pending={} 分片持续无 ACK（对端卡死或链路中断）",
+                                tx.pending()
+                            );
                             let _ = ev_tx.send(Event::Error("control 确认超时，连接失效".into()));
                             closed.store(true, Ordering::SeqCst);
                             break;

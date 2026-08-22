@@ -6,7 +6,6 @@ import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.util.Log;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -27,7 +26,6 @@ import java.util.Arrays;
  */
 public final class AudioCapture {
 
-    private static final String TAG = "kulua-server";
 
     private static final int SAMPLE_RATE = 48000;
     private static final int CHANNELS = 2;
@@ -65,7 +63,7 @@ public final class AudioCapture {
             }
         } catch (IOException | RuntimeException e) {
             if (running) {
-                Log.e(TAG, "audio capture ended: " + e.getMessage());
+                Server.e("audio capture ended: " + e.getMessage());
             }
         } finally {
             releaseAll();

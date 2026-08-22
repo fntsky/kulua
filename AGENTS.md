@@ -121,6 +121,10 @@ Core (device mgmt + session orchestration)
   （protobuf 明确的字段，不再手工 u32be 前缀）
 - **禁止**恢复 broad kill（`grep com.genymobile.scrcpy` 全量击杀）——会误杀融合窗口；
   清理一律用 `scrcpy::kill_by_scid`（遍历 /proc cmdline 匹配 scid）
+- **kulua-server 自愈退出**（v0.8.0+）：不做任何主动清理——最后一个客户端断开
+  （BYE / 心跳连续 10 拍未收到 ≈55s）后 server 进程自动退出释放端口；启动后 30s
+  无客户端接入同样自动退出。不残留进程，EADDRINUSE 自然消失；多窗口 = 多个 viewer
+  连同一个 server，互不影响
 - 融合窗口由 `fusion-viewer` crate 自研实现：直连 session 已部署的 kulua-server
   （`--connect ip:port`，scid 由端口推导），CreateDisplay 创建虚拟显示器（连接驱动，
   server 回 DisplayReady）；config 帧 avcC→Annex-B 后作为 extradata 喂给 FFmpeg
@@ -133,7 +137,11 @@ Core (device mgmt + session orchestration)
   + 名称补位 30 列 + 包名；名称超 30 字符时包名在下一行（续行）；格式与官方 scrcpy 一致
 - 融合模式要求 Android 10+（API 29），`app.open` 前先校验 `ro.build.version.sdk`
 - `deploy_scrcpy` 部署参数：`scid=<hex>` + `port=<n>`（UDP 端口）+ 可选
-  `audio_codec` / `audio_bit_rate`，server 端 `Options` 解析（不再有 localabstract）
+  `audio_codec` / `audio_bit_rate` / `video_bit_rate`，server 端 `Options` 解析
+  （不再有 localabstract）
+- kulua-server 日志 tag 带 版本（`kulua-server/<version>`，`Server.VERSION` 手动递增），
+  用于确认手机上实际部署的构建；每 10s 每客户端一条 `stats` 健康日志（media_msgs /
+  ctrl_pending / STALLED / 端点状态），是判断「编码器死了 vs 可靠层锁存」的首要依据
 
 ## Skills
 

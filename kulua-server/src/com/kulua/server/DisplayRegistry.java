@@ -2,7 +2,6 @@ package com.kulua.server;
 
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
-import android.util.Log;
 import android.view.Surface;
 
 import java.util.HashMap;
@@ -16,7 +15,6 @@ import java.util.Map;
  */
 public final class DisplayRegistry {
 
-    private static final String TAG = "kulua-server";
 
     // 隐藏常量（对照 scrcpy NewDisplayCapture.java 的 flags 组合）
     private static final int FLAG_PUBLIC = android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC;
@@ -50,7 +48,7 @@ public final class DisplayRegistry {
         int id = nextId++;
         DisplayEntry entry = new DisplayEntry(id);
         displays.put(id, entry);
-        Log.i(TAG, "create display #" + id + " " + width + "x" + height + "@" + dpi);
+        Server.i("create display #" + id + " " + width + "x" + height + "@" + dpi);
         return entry;
     }
 
@@ -88,7 +86,7 @@ public final class DisplayRegistry {
         if (entry == null) {
             return;
         }
-        Log.i(TAG, "destroy display #" + id);
+        Server.i("destroy display #" + id);
         entry.encoder.stop();
         if (entry.virtualDisplay != null) {
             entry.virtualDisplay.release();

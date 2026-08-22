@@ -21,6 +21,9 @@ public final class Options {
     /** 音频码率（bps），0 = 编码器默认 */
     public int audioBitRate;
 
+    /** 视频码率（bps）。缺省 8M；WiFi 多窗口时建议按 `video_bit_rate=` 调低 */
+    public int videoBitRate = 8_000_000;
+
     /** ctrl 端口 = 配置端口（protobuf Frame 控制流）。 */
     public int ctrlPort() {
         return port;
@@ -70,6 +73,14 @@ public final class Options {
         if (audioBitRate != null) {
             try {
                 options.audioBitRate = Integer.parseInt(audioBitRate);
+            } catch (NumberFormatException ignored) {
+                // 非法码率忽略，用默认
+            }
+        }
+        String videoBitRate = map.get("video_bit_rate");
+        if (videoBitRate != null) {
+            try {
+                options.videoBitRate = Integer.parseInt(videoBitRate);
             } catch (NumberFormatException ignored) {
                 // 非法码率忽略，用默认
             }

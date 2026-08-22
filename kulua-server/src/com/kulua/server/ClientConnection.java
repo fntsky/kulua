@@ -1,12 +1,13 @@
 package com.kulua.server;
 
-import android.util.Log;
 
 import com.google.protobuf.ByteString;
 
 import java.net.InetSocketAddress;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import kulua.direct.CtrlMsg;
 import kulua.direct.Frame;
@@ -24,10 +25,14 @@ import kulua.direct.HelloAck;
  * 关键帧 / config 走可靠 control 流（{@code MediaConfig}）。
  */
 final class ClientConnection {
-    private static final String TAG = "kulua-server";
 
     /** 视频 codec id（4B ASCII "h264"）。 */
     static final int VIDEO_CODEC_ID = 0x68323634;
+
+    /** 视频编码码率（Options.video_bit_rate，编码器创建用）。 */
+    int videoBitRate() {
+        return options.videoBitRate;
+    }
 
     /** 媒体流标识：audio（与 MediaConfig.stream 数值一致，Rust 侧同值）。 */
     static final int MEDIA_STREAM_AUDIO = 1;
@@ -55,9 +60,22 @@ final class ClientConnection {
     private volatile long lastActivityNanos = System.nanoTime();
     private volatile boolean closed;
 
+    // ── 心跳巡检（UdpServer 每 5s 一拍调用 tickHeartbeat）──
+    /** 本拍内收到过心跳（onFrame 置位，tick 消费）。 */
+    private final AtomicBoolean heartbeatSeen = new AtomicBoolean(false);
+    /** 连续多少拍没收到心跳。 */
+    private final AtomicInteger heartbeatMisses = new AtomicInteger();
+
     private final AtomicInteger mediaMsgId = new AtomicInteger(1);
     /** 每流递增的媒体消息序号（音频/视频各自调用）。 */
     private final AtomicInteger mediaSeq = new AtomicInteger(1);
+
+    // ── 诊断计数/限频（只用于日志，不参与协议）──
+    /** 已发送的媒体消息数（stats 日志用）。 */
+    private final AtomicLong mediaMsgsSent = new AtomicLong();
+    /** 媒体端点未注册丢弃的上次告警时间。 */
+    private volatile long lastMediaDropWarnNanos;
+    private Thread statsThread;
 
     private final Clipboard.ChangeListener clipboardListener = this::onClipboardChanged;
 
@@ -71,6 +89,7 @@ final class ClientConnection {
         this.ctrlSender = new ReliableControl.Sender(server.sink(addr));
         this.ctrlSender.start();
         watchdog();
+        startStats();
         sendHelloAck();
         Clipboard.addChangeListener(clipboardListener);
         if (wantAudio) {
@@ -89,7 +108,7 @@ final class ClientConnection {
                     return;
                 }
                 if (System.nanoTime() - lastActivityNanos >= UdpServer.SESSION_TIMEOUT_NANOS) {
-                    Log.i(TAG, "client idle timeout: " + addr);
+                    Server.i("client idle timeout: " + addr);
                     close(ClientCloseReason.REASON_IDLE);
                     return;
                 }
@@ -99,12 +118,41 @@ final class ClientConnection {
         t.start();
     }
 
+    /**
+     * 每 10s 打一条会话健康统计（诊断用，量级极低）：
+     * 媒体消息数 / ctrl 窗口积压 / 是否锁存 / 媒体端点是否已注册。
+     * 卡死后对照：media_msgs 不再增长 = 编码器死了；STALLED = 可靠层锁存。
+     */
+    private void startStats() {
+        statsThread = new Thread(() -> {
+            while (!closed) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (closed) {
+                    return;
+                }
+                Server.i("stats cid=" + clientId + " " + addr
+                        + " media_msgs=" + mediaMsgsSent.get()
+                        + " ctrl_pending=" + ctrlSender.pending()
+                        + (ctrlSender.isStalled() ? " STALLED" : "")
+                        + " v_ep=" + (videoEndpoint != null)
+                        + " a_ep=" + (audioEndpoint != null));
+            }
+        }, "client-stats-" + addr.getPort());
+        statsThread.setDaemon(true);
+        statsThread.start();
+    }
+
     /** 会话关闭原因（日志用）。 */
     enum ClientCloseReason {
         REASON_IDLE,
         REASON_BYE,
         REASON_STALLED,
         REASON_CTRL_DEAD,
+        REASON_NO_HEARTBEAT,
     }
 
     InetSocketAddress addr() {
@@ -121,8 +169,17 @@ final class ClientConnection {
      */
     void registerMediaEndpoint(int stream, InetSocketAddress src) {
         if (stream == MEDIA_STREAM_VIDEO) {
+            if (!src.equals(videoEndpoint)) {
+                // 诊断：端点首次注册/变更（变更 = 客户端换端口/网络切换，值得记录）
+                Server.i("video endpoint cid=" + clientId + " -> " + src
+                        + (videoEndpoint == null ? " (first)" : " (changed)"));
+            }
             videoEndpoint = src;
         } else if (stream == MEDIA_STREAM_AUDIO) {
+            if (!src.equals(audioEndpoint)) {
+                Server.i("audio endpoint cid=" + clientId + " -> " + src
+                        + (audioEndpoint == null ? " (first)" : " (changed)"));
+            }
             audioEndpoint = src;
         }
         touch();
@@ -130,6 +187,19 @@ final class ClientConnection {
 
     void touch() {
         lastActivityNanos = System.nanoTime();
+    }
+
+    /**
+     * 5s 心跳巡检（UdpServer 主循环每拍调用）：本拍内收到过心跳则清零计数，
+     * 否则连续未收次数 +1。返回当前连续未收次数（超过 MAX_HEARTBEAT_MISS
+     * 由调用方拆除会话）。
+     */
+    int tickHeartbeat() {
+        if (heartbeatSeen.compareAndSet(true, false)) {
+            heartbeatMisses.set(0);
+            return 0;
+        }
+        return heartbeatMisses.incrementAndGet();
     }
 
     long lastActivityNanos() {
@@ -154,13 +224,14 @@ final class ClientConnection {
                 close(ClientCloseReason.REASON_BYE);
                 break;
             case HEARTBEAT:
-                // 保活（touch 已刷新）
+                // 保活（touch 已刷新）+ 心跳巡检计数清零依据
+                heartbeatSeen.set(true);
                 break;
             case DATA:
                 onData(frame);
                 break;
             default:
-                Log.w(TAG, "unhandled frame type from " + addr + ": " + frame.getType());
+                Server.w("unhandled frame type from " + addr + ": " + frame.getType());
                 break;
         }
     }
@@ -184,7 +255,7 @@ final class ClientConnection {
                 CtrlMsg msg = CtrlMsg.parseFrom(bytes);
                 ControlChannel.handle(this, msg);
             } catch (Exception e) {
-                Log.w(TAG, "bad ctrl msg from " + addr, e);
+                Server.w("bad ctrl msg from " + addr, e);
             }
         }
     }
@@ -246,13 +317,14 @@ final class ClientConnection {
 
     /** 创建视频虚拟显示器（fusion-viewer 的 CreateDisplay）。 */
     void createDisplay(int width, int height, int dpi) {
+        long t0 = android.os.SystemClock.elapsedRealtime();
         DisplayRegistry.DisplayEntry entry = displays.create(width, height, dpi);
         DisplayEncoder encoder = new DisplayEncoder(entry.id, this, displays, width, height, dpi);
         displays.attachEncoder(entry.id, encoder);
         try {
             encoder.start();
         } catch (Exception e) {
-            Log.e(TAG, "start display encoder failed #" + entry.id, e);
+            Server.e("start display encoder failed #" + entry.id, e);
             displays.destroy(entry.id);
             return;
         }
@@ -260,13 +332,18 @@ final class ClientConnection {
         // START_APP/触摸，早于 attach 会被 systemDisplayId 兜底成 0（真屏）。
         // 编码线程创建成功或失败都会放行 latch，失败用 isRunning 区分。
         boolean vdInTime = encoder.awaitVirtualDisplay(2000);
+        // 诊断：这段等待发生在共享 ctrl 循环线程上，耗时直接决定其他客户端
+        // 的 ctrl 停摆时长（输入失效/ACK 延迟），必须可观测。
+        Server.i("display #" + entry.id + " encoder wait="
+                + (android.os.SystemClock.elapsedRealtime() - t0) + "ms"
+                + " vdInTime=" + vdInTime + " running=" + encoder.isRunning());
         if (!encoder.isRunning()) {
-            Log.e(TAG, "display #" + entry.id + " encoder failed before ready");
+            Server.e("display #" + entry.id + " encoder failed before ready");
             displays.destroy(entry.id);
             return;
         }
         if (!vdInTime) {
-            Log.w(TAG, "display #" + entry.id + " virtual display attach slow (>2s)");
+            Server.w("display #" + entry.id + " virtual display attach slow (>2s)");
         }
         sendCtrlMsg(CtrlMsg.newBuilder()
                 .setDisplayReady(kulua.direct.DisplayReady.newBuilder()
@@ -276,7 +353,8 @@ final class ClientConnection {
                         .setHeight(height)
                         .setDpi(dpi))
                 .build());
-        Log.i(TAG, "display #" + entry.id + " created for " + addr);
+        Server.i("display #" + entry.id + " created for " + addr
+                + " total=" + (android.os.SystemClock.elapsedRealtime() - t0) + "ms");
     }
 
     DisplayRegistry displays() {
@@ -308,8 +386,17 @@ final class ClientConnection {
         InetSocketAddress dst =
                 stream == MEDIA_STREAM_AUDIO ? audioEndpoint : videoEndpoint;
         if (dst == null) {
+            // 诊断：OPEN 未到/已拆除时静默丢帧是协议行为，但持续发生说明
+            // 端点注册链路有问题（viewer OPEN 没到/被防火墙拦），限频告警
+            long now = System.nanoTime();
+            if (now - lastMediaDropWarnNanos >= 3_000_000_000L) {
+                lastMediaDropWarnNanos = now;
+                Server.w("media dropped (endpoint not registered): cid=" + clientId
+                        + " stream=" + stream);
+            }
             return;
         }
+        mediaMsgsSent.incrementAndGet();
         int msgId = mediaMsgId.getAndIncrement();
         int total = (data.length + ReliableControl.MAX_FRAGMENT - 1)
                 / ReliableControl.MAX_FRAGMENT;
@@ -339,7 +426,13 @@ final class ClientConnection {
             return;
         }
         closed = true;
-        Log.i(TAG, "close client " + addr + " (" + reason + ")");
+        if (statsThread != null) {
+            statsThread.interrupt();
+        }
+        // 诊断：关闭时带上可靠层现场，区分「正常 BYE」和「锁存后变僵尸被拆」
+        Server.i("close client " + addr + " cid=" + clientId + " (" + reason + ")"
+                + " ctrl_pending=" + ctrlSender.pending()
+                + (ctrlSender.isStalled() ? " SENDER_STALLED" : ""));
         ctrlSender.stop();
         Clipboard.removeChangeListener(clipboardListener);
         if (audio != null) {

@@ -2,6 +2,7 @@ package com.kulua.server;
 
 import com.google.protobuf.ByteString;
 
+
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -19,6 +20,7 @@ import kulua.direct.Frame;
  * - Receiver：按 {@code seq} 缓冲，连续完整后按序投递整条消息，回复累积 ACK。
  */
 public final class ReliableControl {
+
 
     public static final int WINDOW = 32;
     public static final long INITIAL_RTO_NANOS = 200_000_000L;
@@ -59,12 +61,19 @@ public final class ReliableControl {
         void sendDatagram(byte[] wire);
     }
 
+    /** 窗口积压告警阈值（接近但未判死，提示 ACK 断供趋势）。 */
+    private static final int BACKLOG_WARN = 24;
+    /** 告警最小间隔（防刷屏）。 */
+    private static final long WARN_INTERVAL_NANOS = 2_000_000_000L;
+
     /** 一条未确认分片。 */
     private static final class OutEntry {
         final int seq;
         final byte[] wire;
         long lastSentNanos;
         int lossCount;
+        /** 是否已打过重传压力告警（每条只告警一次，防刷屏）。 */
+        boolean warned;
 
         OutEntry(int seq, byte[] wire, long lastSentNanos) {
             this.seq = seq;
@@ -81,6 +90,7 @@ public final class ReliableControl {
         private volatile boolean stalled;
         private int nextSeq = 1;
         private int nextMsgId = 1;
+        private long lastWarnNanos;
         private Thread timer;
 
         public Sender(Sink sink) {
@@ -125,6 +135,13 @@ public final class ReliableControl {
             if (closed.get() || stalled) {
                 return;
             }
+            // 诊断：窗口积压说明 PC 端 ACK 断供（viewer 卡住/链路拥塞），提前告警
+            long now = System.nanoTime();
+            if (window.size() >= BACKLOG_WARN && now - lastWarnNanos >= WARN_INTERVAL_NANOS) {
+                lastWarnNanos = now;
+                Server.w("ctrl window backlog: pending=" + window.size()
+                        + " (ACK 断供趋势，对端可能卡顿/丢包)");
+            }
             int msgId = nextMsgId++;
             int total = payload.length == 0 ? 1
                     : (payload.length + MAX_FRAGMENT - 1) / MAX_FRAGMENT;
@@ -166,11 +183,29 @@ public final class ReliableControl {
                     e.lossCount++;
                     if (e.lossCount > LOSS_LIMIT) {
                         stalled = true;
+                        // 诊断：锁存现场（此后该客户端的 MediaConfig/DisplayReady/
+                        // 剪贴板推送全部静默丢弃，必须能看到这一行才能定位僵尸会话）
+                        OutEntry oldest = window.peekFirst();
+                        Server.e("reliable sender STALLED: pending=" + window.size()
+                                + " oldest_seq=" + (oldest == null ? -1 : oldest.seq)
+                                + " oldest_age_ms=" + (oldest == null ? -1
+                                        : (now - oldest.lastSentNanos) / 1_000_000)
+                                + " loss=" + e.lossCount + " seq=" + e.seq);
                         return;
+                    }
+                    if (e.lossCount == LOSS_LIMIT / 2 && !e.warned) {
+                        e.warned = true;
+                        Server.w("reliable retransmit pressure: seq=" + e.seq
+                                + " loss=" + e.lossCount + " pending=" + window.size());
                     }
                     sink.sendDatagram(e.wire);
                 }
             }
+        }
+
+        /** 当前未确认分片数（诊断统计用）。 */
+        public synchronized int pending() {
+            return window.size();
         }
 
         public boolean isStalled() {

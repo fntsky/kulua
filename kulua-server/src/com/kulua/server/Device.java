@@ -2,7 +2,6 @@ package com.kulua.server;
 
 import android.content.Context;
 import android.hardware.input.InputManager;
-import android.util.Log;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.KeyCharacterMap;
@@ -18,7 +17,6 @@ import java.io.IOException;
  */
 public final class Device {
 
-    private static final String TAG = "kulua-server";
 
     private Device() {
         // not instantiable
@@ -35,7 +33,7 @@ public final class Device {
                     "injectInputEvent", InputEvent.class, int.class);
             return (Boolean) method.invoke(getInputManager(), event, mode);
         } catch (Exception e) {
-            Log.e(TAG, "injectInputEvent reflection failed", e);
+            Server.e("injectInputEvent reflection failed", e);
             return false;
         }
     }
@@ -99,7 +97,7 @@ public final class Device {
                 KeyEvent[] events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
                         .getEvents(new char[]{c});
                 if (events == null || events.length == 0) {
-                    Log.w(TAG, "cannot map char: " + c);
+                    Server.w("cannot map char: " + c);
                     continue;
                 }
                 for (KeyEvent event : events) {
@@ -111,7 +109,7 @@ public final class Device {
 
         // 非 ASCII：剪贴板 + 粘贴
         if (!Clipboard.set(text)) {
-            Log.w(TAG, "clipboard set failed for paste");
+            Server.w("clipboard set failed for paste");
             return false;
         }
         long now = System.currentTimeMillis();
@@ -123,7 +121,7 @@ public final class Device {
                 KeyEvent.KEYCODE_PASTE, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0,
                 InputDevice.SOURCE_KEYBOARD);
         boolean up = injectEvent(pasteUp, displayId);
-        Log.i(TAG, "paste non-ascii text (" + text.length() + " chars) down=" + down
+        Server.i("paste non-ascii text (" + text.length() + " chars) down=" + down
                 + " up=" + up);
         return down && up;
     }
@@ -144,14 +142,14 @@ public final class Device {
                 java.lang.reflect.Method method = InputEvent.class.getMethod("setDisplayId", int.class);
                 method.invoke(event, displayId);
             } catch (Exception e) {
-                Log.e(TAG, "setDisplayId failed", e);
+                Server.e("setDisplayId failed", e);
                 return false;
             }
         }
         // INJECT_INPUT_EVENT_MODE_ASYNC 是隐藏常量，值为 0
         boolean ok = injectInputEvent(event, 0);
         if (!ok) {
-            Log.w(TAG, "injectInputEvent failed: " + event);
+            Server.w("injectInputEvent failed: " + event);
         }
         return ok;
     }
@@ -165,7 +163,7 @@ public final class Device {
                 //    -c LAUNCHER` 会 "unable to resolve Intent"（实测），应用根本没启动。
                 //    用隐藏命令 resolve-activity 拿到真实组件后用 `-n` 启动，最可靠。
                 String component = resolveLauncher(packageName);
-                System.err.println("[kulua] startApp " + packageName
+                System.err.println("[kulua/" + Server.VERSION + "] startApp " + packageName
                         + " display=" + displayId + " component=" + component);
 
                 java.util.List<String> command = new java.util.ArrayList<>();
@@ -189,7 +187,7 @@ public final class Device {
                 }
                 // 诊断：System.err 会随 daemon 的 `adb shell` stderr 转发显示出来
                 // （Log.i 只进 logcat，daemon 看不到）。
-                System.err.println("[kulua] startApp cmd=" + String.join(" ", command));
+                System.err.println("[kulua/" + Server.VERSION + "] startApp cmd=" + String.join(" ", command));
 
                 Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
                 // 异步等待：`am start` 每次要冷启动一个 app_process 虚拟机（1~3s），
@@ -203,14 +201,14 @@ public final class Device {
                 }
                 int exit = process.waitFor();
                 String msg = out.toString().trim();
-                System.err.println("[kulua] startApp done " + packageName
+                System.err.println("[kulua/" + Server.VERSION + "] startApp done " + packageName
                         + " display=" + displayId + " exit=" + exit
                         + (msg.isEmpty() ? "" : " out=" + msg));
-                Log.i(TAG, "start app " + packageName + " on display " + displayId
+                Server.i("start app " + packageName + " on display " + displayId
                         + " exit=" + exit);
             } catch (Exception e) {
-                System.err.println("[kulua] startApp failed " + packageName + ": " + e);
-                Log.e(TAG, "start app failed: " + packageName, e);
+                System.err.println("[kulua/" + Server.VERSION + "] startApp failed " + packageName + ": " + e);
+                Server.e("start app failed: " + packageName, e);
             }
         }, "am-start-" + packageName).start();
     }
@@ -244,7 +242,7 @@ public final class Device {
             }
             return null;
         } catch (Exception e) {
-            Log.w(TAG, "resolveLauncher failed: " + packageName, e);
+            Server.w("resolveLauncher failed: " + packageName, e);
             return null;
         }
     }

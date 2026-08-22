@@ -176,12 +176,11 @@ mod tests {
                 msg_id: 0,
                 frag: 0,
                 frag_total: 0,
-                media_pts: 0,
-                media_flags: 0,
                 payload: Some(Payload::HelloAck(kulua_proto::generated::HelloAck {
                     scid: scid_for_port(port),
                     audio_codec: 0,
                     video_codec: 0x68323634,
+                    client_id: 1,
                 })),
             };
             let mut wire = Vec::with_capacity(64);
@@ -207,8 +206,6 @@ mod tests {
                             msg_id: 1,
                             frag: 0,
                             frag_total: 0,
-                            media_pts: 0,
-                            media_flags: 0,
                             payload: Some(Payload::Data(
                                 CtrlMsg {
                                     msg: Some(ctrl_msg::Msg::DisplayReady(

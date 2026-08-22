@@ -16,8 +16,46 @@ import java.io.IOException;
 
 public final class Server {
 
-    /** logcat tag，与其余类保持一致（logcat -s kulua-server 过滤用）。 */
+    /** logcat tag，固定不变（`logcat -s kulua-server` 过滤用；版本在消息尾部）。 */
     public static final String TAG = "kulua-server";
+
+    /**
+     * 服务端版本号：拼进每条日志消息尾部（[v0.8.0]），用于确认手机上跑的是
+     * 哪个构建。协议/行为有变更时手动递增。
+     */
+    public static final String VERSION = "0.8.0";
+
+    private static final String V_SUFFIX = " [v" + VERSION + "]";
+
+    /** Log.i 包装：tag 固定 kulua-server，消息尾追加版本。 */
+    public static void i(String msg) {
+        android.util.Log.i(TAG, msg + V_SUFFIX);
+    }
+
+    /** Log.w 包装：同 {@link #i(String)}。 */
+    public static void w(String msg) {
+        android.util.Log.w(TAG, msg + V_SUFFIX);
+    }
+
+    /** Log.w 包装（带异常）：同 {@link #i(String)}。 */
+    public static void w(String msg, Throwable t) {
+        android.util.Log.w(TAG, msg + V_SUFFIX, t);
+    }
+
+    /** Log.d 包装：同 {@link #i(String)}。 */
+    public static void d(String msg) {
+        android.util.Log.d(TAG, msg + V_SUFFIX);
+    }
+
+    /** Log.e 包装（无异常）：同 {@link #i(String)}。 */
+    public static void e(String msg) {
+        android.util.Log.e(TAG, msg + V_SUFFIX);
+    }
+
+    /** Log.e 包装（带异常）：同 {@link #i(String)}。 */
+    public static void e(String msg, Throwable t) {
+        android.util.Log.e(TAG, msg + V_SUFFIX, t);
+    }
 
     public static final String SERVER_PATH;
 
@@ -52,7 +90,7 @@ public final class Server {
         android.os.Looper.prepare();
 
         Options options = Options.parse(args);
-        android.util.Log.i(TAG, "kulua-server " + options.scid);
+        android.util.Log.i(TAG, "kulua-server v" + VERSION + " scid=" + options.scid);
 
         // 一次性模式：枚举应用后退出（不监听 socket）
         if (options.listApps) {
