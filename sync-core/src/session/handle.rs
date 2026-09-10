@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::adb_cmd::AdbOps;
+use crate::session::audio::{AudioTarget, SharedRuntime};
 use crate::types::Device;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 // ── session 生命周期状态 ──
 // 存储于 Handle 共享的 AtomicU8，session 在阶段边界写入，Core 每 tick 读取推送。
@@ -55,19 +56,17 @@ pub struct Handle {
     pub clipboard_enabled: Arc<AtomicBool>,
     /// Core 通过此标志动态控制通知同步
     pub notification_enabled: Arc<AtomicBool>,
-    /// Core 通过此标志动态控制音频开关（重启 session 后生效）
-    pub audio_enabled: Arc<AtomicBool>,
     /// 音量百分比（0-100），Core 可实时调整
     pub volume: Arc<AtomicU16>,
     /// session 生命周期状态（session 写，Core tick 读并推送）
     pub session_state: Arc<AtomicU8>,
     /// 音频缓冲延迟（ms）：audio_task 写，Core tick 读推 UI
     pub audio_latency: Arc<AtomicU64>,
-    /// 当前音频编码器（握手索引：0=raw 1=opus 2=aac 3=flac）。
-    /// Core 修改后发 audio_restart_tx，session 重连 audio 即热切换（不重启 session）
-    pub audio_codec: Arc<AtomicU8>,
-    /// Core → session 的音频重启信号（编码热切换时发送）
-    pub audio_restart_tx: mpsc::Sender<()>,
+    /// 音频目标（Core 写，Session 读并下发 SetAudio）。watch 天然把连续操作
+    /// 合并到最新目标，不会积压成一串中间态命令。
+    pub audio_target: tokio::sync::watch::Sender<AudioTarget>,
+    /// 音频运行态（Session 写，Core tick 读推 UI）：off/starting/on/stopping/failed
+    pub audio_runtime: SharedRuntime,
 }
 impl Handle {
     /// 当前生命周期状态

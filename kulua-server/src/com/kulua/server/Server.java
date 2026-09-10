@@ -23,7 +23,7 @@ public final class Server {
      * 服务端版本号：拼进每条日志消息尾部（[v0.8.0]），用于确认手机上跑的是
      * 哪个构建。协议/行为有变更时手动递增。
      */
-    public static final String VERSION = "0.8.0";
+    public static final String VERSION = "0.8.3";
 
     private static final String V_SUFFIX = " [v" + VERSION + "]";
 

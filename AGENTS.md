@@ -45,10 +45,14 @@ Core (device mgmt + session orchestration)
 | `session` | 单设备生命周期管理 | 不直接调用 adb 进程 |
 | `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 直连地址解析 | 不管理设备列表 |
 | `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，解析 + 60s 缓存） | 不管理窗口进程 |
-| `fusion` | 融合窗口管理（fusion-viewer.exe 查找/启动/回收/优雅关闭） | 不解析 scrcpy 协议 |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 | 不发起 adb 连接 |
 | `cli` | 终端交互界面 | 不包含业务逻辑 |
 | `types` | 共享类型定义（`Device`, `AdbError`, `DeviceState`） | 不包含实现逻辑 |
+
+**融合窗口（UI 进程内）**：Tauri WebviewWindow + WebCodecs 硬解。daemon 只校验并回传
+直连地址（`app.open` 响应 `window_id + addr`），窗口生命周期 / UDP video 客户端 /
+输入注入全部在 `ui/src-tauri/src/lib.rs`（`fusion_*` 命令）与 `ui/fusion.html`
+（WebCodecs 解码渲染）中，不再有独立 viewer 进程。
 
 ### Functions: Single Responsibility
 
@@ -82,17 +86,15 @@ Core (device mgmt + session orchestration)
 - ✅ 自动配对 + 连接已发现的设备
 - ✅ Push 自研 kulua-server.jar 到手机并启动（`kulua-server/` Java 工程：单进程多虚拟显示器 + 剪贴板 + 音频回传）
 - ✅ 剪贴板双向同步（手机→PC + PC→手机）
+- ✅ 音频会话内热切换（开关 + 编码统一为 `SetAudio`/`AudioState`，带代次过滤：
+  关闭释放 PC 播放资源、开启沿用同一 UDP 会话，剪贴板/通知/融合窗口不受影响）
 - ✅ scid 会话隔离（`0x4B4Cxxxx`，server 参数 `scid=<hex>`，按 scid 精准 kill）
 - ✅ 应用列表（`apps.rs`，server 一次性模式 `list_apps=true`，60s 缓存）
-- ✅ 融合模式窗口（`fusion-viewer` crate：winit 窗口 + FFmpeg 软解 + 自研控制协议，
-  完全自研不依赖官方 scrcpy.exe；连接模式 `--connect ip:port` 直连 session 的
-  kulua-server，多窗口 = 多个 UDP 客户端各自 CreateDisplay 虚拟显示器；`fusion.rs`
-  管理其进程生命周期）
 - ✅ GUI 应用选择器（搜索 / 隐藏系统应用 / 刷新 / 打开反馈）
-- ✅ 系统剪贴板集成（Windows 使用 `clipboard-win`，跨平台抽象待补）
-- ❌ 交互式 CLI
-- ❌ `adb connect` 阶段 mDNS 监听（`_adb-tls-connect._tcp.local.`）被注释掉
-- ⚠️ 仍有历史 dead code 待清理（`protocol/clipboard.rs` 旧分析实现）
+- ✅ 融合模式窗口（Tauri WebviewWindow + WebCodecs 硬解，无独立 viewer 进程：
+  daemon `app.open` 回传直连地址 → UI 建 `fusion.html` 窗口并自建 video-only
+  UDP 客户端（`ui/src-tauri/src/lib.rs` 的 `fusion_start`），编码帧经 Channel API
+  推给页面 JS 用 WebCodecs 解码渲染；多窗口 = 多个 WebviewWindow）
 
 ## Key Dependencies
 
@@ -114,9 +116,17 @@ Core (device mgmt + session orchestration)
   - 可靠性：CTRL 流滑动窗口(32) + 累积 ACK + 超时重传（RTO 200ms 指数退避），两端
     实现一致（`kulua-proto/src/reliable.rs` ↔ `kulua-server/.../ReliableControl.java`）
   - HELLO{scid,audio} → HELLO_ACK；媒体 config（SPS/PPS、AudioSpecificConfig）走可靠
-    MediaConfig；audio/video 数据帧尽力而为（≤1200B 分片，丢片整帧丢弃）
+    MediaConfig；audio/video 数据帧尽力而为（33B 定长头分片，丢片整帧丢弃）
   - server 按源地址（IP:port）解复用客户端会话，60s 空闲拆除；PC 发 HEARTBEAT 保活
-  - 音频编码热切换：daemon 发 `SetAudioCodec` → phone 重起捕获 → 回 `AudioReady`
+  - **音频可在会话内存活启停/换编码（不重启会话）**：Core 写 `watch<AudioTarget>`
+    （连续操作合并到最新目标）→ Session 发 `SetAudio{enabled,codec,revision}` →
+    phone 专用执行器串行启停 → 回 `AudioState{revision,enabled,codec_id,error}`；
+    PC 用运行态 `off/starting/on/stopping/failed` 推 UI。媒体数据报头带同一
+    `revision`，PC 只接受当前代次（旧音频不得串入新播放）；daemon 会话**恒开音频
+    端口并注册端点**，否则中途开启时 phone 无处发送。等不到回执换代次重试
+    （2s×3），断流 3s 判失败并按 10s 换代次自救
+  - 关音频会释放 PC 播放资源（rodio sink + 输出设备）；phone 侧停采集并释放
+    AudioRecord/MediaCodec（起停 join 采集线程，跑在专用执行器上，不占 ctrl 线程）
 - 控制消息语义沿用 scrcpy v4.0 + 多显示器扩展：touch/scroll/start_app/resize 带 displayId
   （protobuf 明确的字段，不再手工 u32be 前缀）
 - **禁止**恢复 broad kill（`grep com.genymobile.scrcpy` 全量击杀）——会误杀融合窗口；
@@ -125,14 +135,17 @@ Core (device mgmt + session orchestration)
   （BYE / 心跳连续 10 拍未收到 ≈55s）后 server 进程自动退出释放端口；启动后 30s
   无客户端接入同样自动退出。不残留进程，EADDRINUSE 自然消失；多窗口 = 多个 viewer
   连同一个 server，互不影响
-- 融合窗口由 `fusion-viewer` crate 自研实现：直连 session 已部署的 kulua-server
-  （`--connect ip:port`，scid 由端口推导），CreateDisplay 创建虚拟显示器（连接驱动，
-  server 回 DisplayReady）；config 帧 avcC→Annex-B 后作为 extradata 喂给 FFmpeg
-  （vivo 等设备 IDR 不带 SPS/PPS）
-- 构建 fusion-viewer 需要干净 PATH（msys2/mingw64 会污染 ffmpeg-sys-next 的 C 编译），
-  统一用 `scripts\build-viewer.cmd` 执行 cargo（含 anaconda 的 protoc，供 prost-build）
-- viewer 只做视频 + 输入注入：音频/剪贴板继续由 Kulua session 负责（session 的
-  control/audio 连接与 viewer 的 control/video 连接共存于同一 server 进程，互不干扰）
+- 融合窗口由 UI 进程内嵌实现（`ui/fusion.html` + `ui/src-tauri/src/lib.rs` 的
+  `fusion_*` 命令）：daemon `app.open` 只校验并回传 `(window_id, addr)`；UI 建
+  WebviewWindow 后由 `fusion_start` 自建 video-only UDP 客户端（HELLO →
+  CreateDisplay → DisplayReady → START_APP），编码帧经 Tauri Channel API 推给
+  页面 JS，WebCodecs `VideoDecoder` 硬解（avcC config 直接作 `description`，
+  不再手工 avcC→Annex-B 转换），`drawImage(VideoFrame)` GPU 渲染到 canvas。
+  无 FFmpeg / ffmpeg-sys-next 依赖（已删除 fusion-viewer crate）
+- 融合窗口只做视频 + 输入注入：音频/剪贴板继续由 Kulua session 负责（session 的
+  control/audio 连接与窗口的 control/video 连接共存于同一 server 进程，互不干扰）；
+  ctrl 注入走 mpsc channel 转发给 pump 任务（UdpSession 被 pump 独占），
+  drop 全部 ctrl_tx 即 BYE 收尾
 - 应用列表解析：kulua-server（AppLister.java）输出 `List of apps:` 后每行 ` * `（系统）/ ` - `（普通）
   + 名称补位 30 列 + 包名；名称超 30 字符时包名在下一行（续行）；格式与官方 scrcpy 一致
 - 融合模式要求 Android 10+（API 29），`app.open` 前先校验 `ro.build.version.sdk`

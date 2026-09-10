@@ -1,8 +1,5 @@
 ﻿param(
-    [switch]$Release,
-    # FFmpeg 运行时目录（含 avcodec-62.dll / avutil-60.dll / swresample-6.dll，融合窗口用）。
-    # 默认依次查找：./vendor/scrcpy-win64、$env:SCRCPY_HOME。
-    [string]$FfmpegDir = ""
+    [switch]$Release
 )
 
 $config = if ($Release) { "release" } else { "debug" }
@@ -12,23 +9,12 @@ $ErrorActionPreference = "Stop"
 Write-Host "===== Kulua Build =====" -ForegroundColor Cyan
 
 # ── 1. daemon ──
-Write-Host "`n[1/4] Building daemon..." -ForegroundColor Yellow
+Write-Host "`n[1/3] Building daemon..." -ForegroundColor Yellow
 cargo build --package daemon $targetFlag
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-# ── 2. fusion-viewer（自研融合窗口客户端） ──
-# 必须用干净 PATH（msys2/mingw64 会污染 ffmpeg-sys-next 的 C 头文件探测），
-# 统一走 scripts/build-viewer.cmd
-Write-Host "`n[2/4] Building fusion-viewer..." -ForegroundColor Yellow
-if (-not (Test-Path "scripts/build-viewer.cmd")) {
-    Write-Host "  WARNING: scripts/build-viewer.cmd not found, skipping fusion-viewer build" -ForegroundColor Yellow
-} else {
-    cmd /c "scripts\build-viewer.cmd build -p fusion-viewer $targetFlag"
-    if ($LASTEXITCODE -ne 0) { exit 1 }
-}
-
-# ── 3. UI ──
-Write-Host "`n[3/4] Building UI (exe, no installer)..." -ForegroundColor Yellow
+# ── 2. UI ──
+Write-Host "`n[2/3] Building UI (exe, no installer)..." -ForegroundColor Yellow
 Push-Location ui
 npm install --silent
 if ($Release) {
@@ -43,7 +29,7 @@ Pop-Location
 # ── 3. 打包发布文件夹 ──
 if ($Release) {
     $dist = "dist/kulua"
-    Write-Host "`n[4/4] Packaging release to $dist ..." -ForegroundColor Yellow
+    Write-Host "`n[3/3] Packaging release to $dist ..." -ForegroundColor Yellow
 
     # 清理旧打包残留（如早期版本的官方 scrcpy-server jar），避免混淆
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -127,36 +113,6 @@ if ($Release) {
         Write-Host "  WARNING: adb.exe not found -- place it manually in $dist/ so daemon can find it" -ForegroundColor Red
     }
 
-    # ── fusion-viewer.exe + FFmpeg DLL（自研融合窗口客户端运行时） ──
-    if ($FfmpegDir -eq "") {
-        $FfmpegDir = if (Test-Path "./vendor/scrcpy-win64") {
-            "./vendor/scrcpy-win64"
-        } elseif ($env:SCRCPY_HOME -and (Test-Path "$env:SCRCPY_HOME/avcodec-62.dll")) {
-            $env:SCRCPY_HOME
-        } else {
-            ""
-        }
-    }
-    $viewerExe = "target/$config/fusion-viewer.exe"
-    if (Test-Path $viewerExe) {
-        Copy-Item $viewerExe "$dist/"
-    } else {
-        Write-Host "  WARNING: fusion-viewer.exe not found at $viewerExe" -ForegroundColor Red
-    }
-    $ffmpegFound = $false
-    if ($FfmpegDir -ne "" -and (Test-Path "$FfmpegDir/avcodec-62.dll")) {
-        foreach ($f in @("avcodec-62.dll", "avutil-60.dll", "swresample-6.dll")) {
-            if (Test-Path "$FfmpegDir/$f") {
-                Copy-Item "$FfmpegDir/$f" "$dist/"
-            }
-        }
-        Write-Host "  FFmpeg 运行时 from $FfmpegDir" -ForegroundColor Green
-        $ffmpegFound = $true
-    }
-    if (-not $ffmpegFound) {
-        Write-Host "  WARNING: FFmpeg DLL 未找到 -- 融合模式（应用窗口）不可用；可传 -FfmpegDir <目录> 或设置 SCRCPY_HOME" -ForegroundColor Yellow
-    }
-
     # ── 验证 ──
     Write-Host "`n$dist 内容：" -ForegroundColor Cyan
     Get-ChildItem $dist | Select-Object Name, Length | Format-Table -AutoSize
@@ -166,7 +122,6 @@ if ($Release) {
     Write-Host "  sync-ui.exe — 桌面 GUI（可选）"
     if ($adbFound) { Write-Host "  adb.exe     — 已捆绑（含 DLL），无需预装 ADB" }
     if ($jarFound) { Write-Host "  kulua-server.jar — 自研设备端服务（剪贴板/多窗口视频/音频）" }
-    if ($ffmpegFound) { Write-Host "  fusion-viewer.exe — 自研融合窗口客户端（+ FFmpeg DLL）" }
     Write-Host "`n使用方法：直接双击 daemon.exe 即可启动全部功能" -ForegroundColor Green
 } else {
     Write-Host "`n===== Debug build done =====" -ForegroundColor Green

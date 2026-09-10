@@ -43,22 +43,6 @@ pub fn show_desktop_notification(info: &NotifInfo) {
     }
 }
 
-/// 为单个设备启动通知轮询线程。
-///
-/// 线程每 2 秒执行 `adb shell cmd notification list`，对比前后 key 集合，
-/// 对新增的 key 执行 `cmd notification get` 获取详情并通过 channel 发送。
-///
-/// 首次轮询仅初始化 key 集合，不发送通知（避免历史通知刷屏）。
-pub fn spawn_notification_poller(
-    adb: Arc<dyn AdbOps>,
-    device: Device,
-    notif_tx: std_mpsc::Sender<NotifInfo>,
-) -> (JoinHandle<()>, Arc<AtomicBool>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let handle = spawn_notification_poller_with_stop(adb, device, notif_tx, stop.clone());
-    (handle, stop)
-}
-
 /// 与 [`spawn_notification_poller`] 相同，但允许外部传入同一个 stop 标志，
 /// 这样上层可以同时停止底层轮询线程和桥接任务，避免线程泄漏。
 fn spawn_notification_poller_with_stop(

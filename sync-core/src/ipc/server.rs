@@ -4,11 +4,12 @@
 //! Request / Response / Event 的 payload 为 Protobuf 编码。
 
 use crate::app::Command;
-use crate::ipc::proto::{self, event, request, response};
+use crate::ipc::proto::{self, event, response};
 use crate::ipc::types::*;
 use crate::notification::NotifInfo;
 use crate::types::Device;
 
+use super::handlers;
 use crate::wireless_pair::WirelessPairing;
 use futures::SinkExt;
 use prost::Message;
@@ -22,7 +23,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 /// 统一的 RPC 错误码（-1）。
-const ERROR_CODE: i32 = -1;
+pub(super) const ERROR_CODE: i32 = -1;
 
 // ── IpcServer ──
 
@@ -84,7 +85,6 @@ pub fn serve(
     device_watch: watch::Receiver<HashMap<String, Device>>,
     merged_watch: watch::Receiver<Vec<Device>>,
     session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
-    fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
     clip_tx: broadcast::Sender<String>,
     notif_tx: broadcast::Sender<NotifInfo>,
     pair_info: WirelessPairing,
@@ -103,12 +103,11 @@ pub fn serve(
                             let dw = device_watch.clone();
                             let mw = merged_watch.clone();
                             let sw = session_watch.clone();
-                            let fw = fusion_watch.clone();
                             let clip_sub = clip_tx.subscribe();
                             let notif_sub = notif_tx.subscribe();
                             let pi = pair_info.clone();
                             tokio::spawn(handle_ipc_connection(
-                                stream, cmd_tx, dw, mw, sw, fw, clip_sub, notif_sub, pi,
+                                stream, cmd_tx, dw, mw, sw, clip_sub, notif_sub, pi,
                             ));
                         }
                         Err(e) => {
@@ -131,7 +130,6 @@ async fn handle_ipc_connection(
     mut device_watch: watch::Receiver<HashMap<String, Device>>,
     mut merged_watch: watch::Receiver<Vec<Device>>,
     mut session_watch: watch::Receiver<Vec<super::types::SessionSummary>>,
-    mut fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
     mut clip_sub: broadcast::Receiver<String>,
     mut notif_sub: broadcast::Receiver<NotifInfo>,
     pair_info: WirelessPairing,
@@ -177,23 +175,6 @@ async fn handle_ipc_connection(
                 let sessions = session_watch.borrow().iter().map(proto::SessionSummary::from).collect();
                 let event = proto::Event {
                     data: Some(event::Payload::SessionUpdated(proto::SessionListData { sessions })),
-                };
-                let payload = event.encode_to_vec();
-                if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
-                    break;
-                }
-            }
-
-            _ = fusion_watch.changed() => {
-                let windows = fusion_watch
-                    .borrow()
-                    .iter()
-                    .map(proto::AppWindowInfo::from)
-                    .collect();
-                let event = proto::Event {
-                    data: Some(event::Payload::AppWindowsUpdated(proto::AppWindowsUpdated {
-                        windows,
-                    })),
                 };
                 let payload = event.encode_to_vec();
                 if framed.send((FRAME_TYPE_EVENT, payload)).await.is_err() {
@@ -288,6 +269,9 @@ async fn on_frame(
 // ── 方法路由 ──
 
 /// 根据 method 分发到对应的处理函数，返回 Protobuf 响应。
+///
+/// 各方法自身的参数校验与命令下发见 [`super::handlers`]；此处只保留
+/// 「方法名 → 处理函数」的分派骨架。
 async fn dispatch_request(
     req: &proto::Request,
     cmd_tx: &mpsc::Sender<Command>,
@@ -296,312 +280,32 @@ async fn dispatch_request(
     pair_info: &WirelessPairing,
 ) -> proto::Response {
     match req.method.as_str() {
-        "device.list" => {
-            let devices = merged_watch
-                .borrow()
-                .iter()
-                .map(proto::Device::from)
-                .collect();
-            make_result(
-                req.id,
-                response::Payload::DeviceList(response::DeviceList { devices }),
-            )
-        }
-
-        "device.adb_list" => {
-            let devices = device_watch
-                .borrow()
-                .values()
-                .map(proto::Device::from)
-                .collect();
-            make_result(
-                req.id,
-                response::Payload::AdbList(response::DeviceList { devices }),
-            )
-        }
-
-        "device.connect" => {
-            let Some(request::Payload::DeviceConnect(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 device.connect 参数");
-            };
-            if params.serial.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 serial 参数");
-            }
-            if cmd_tx
-                .send(Command::Connect(params.serial.clone()))
-                .await
-                .is_err()
-            {
-                return make_error(req.id, ERROR_CODE, "core 正在关闭");
-            }
-            make_ok(req.id)
-        }
-
-        "device.disconnect" => {
-            let Some(request::Payload::DeviceDisconnect(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 device.disconnect 参数");
-            };
-            if params.serial.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 serial 参数");
-            }
-            if cmd_tx
-                .send(Command::Disconnect(params.serial.clone()))
-                .await
-                .is_err()
-            {
-                return make_error(req.id, ERROR_CODE, "core 正在关闭");
-            }
-            make_ok(req.id)
-        }
-
-        "clipboard.get" => {
-            let text = match clipboard_win::get_clipboard_string() {
-                Ok(t) => t,
-                Err(_) => String::new(),
-            };
-            make_result(
-                req.id,
-                response::Payload::ClipboardGet(response::ClipboardGet { text }),
-            )
-        }
-
-        "pairing.info" => make_result(
-            req.id,
-            response::Payload::PairingInfo(response::PairingInfo {
-                dns_id: pair_info.dns_id.clone(),
-                psk: pair_info.psk.clone(),
-                wifi_string: pair_info.get_info(),
-            }),
-        ),
-
-        "session.update" => {
-            let Some(request::Payload::SessionUpdate(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 session.update 参数");
-            };
-            let clipboard_sync = params.clipboard_sync.unwrap_or(true);
-            let notification_sync = params.notification_sync.unwrap_or(true);
-            let audio_sync = params.audio_sync.unwrap_or(false);
-            let volume = params.volume.unwrap_or(80).min(100) as u16;
-
-            if params.uuid.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 uuid 参数");
-            }
-            match params.uuid.parse::<uuid::Uuid>() {
-                Ok(parsed) => {
-                    if cmd_tx
-                        .send(Command::UpdateConfig {
-                            uuid: parsed,
-                            clipboard_sync,
-                            notification_sync,
-                            audio_sync,
-                            volume,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return make_error(req.id, ERROR_CODE, "core 正在关闭");
-                    }
-                    make_ok(req.id)
-                }
-                Err(_) => make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
-            }
-        }
-
-        "session.retry" => {
-            let Some(request::Payload::SessionRetry(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 session.retry 参数");
-            };
-            if params.uuid.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 uuid 参数");
-            }
-            match params.uuid.parse::<uuid::Uuid>() {
-                Ok(parsed) => {
-                    if cmd_tx.send(Command::Retry(parsed)).await.is_err() {
-                        return make_error(req.id, ERROR_CODE, "core 正在关闭");
-                    }
-                    make_ok(req.id)
-                }
-                Err(_) => make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
-            }
-        }
-
-        "session.start" => {
-            let Some(request::Payload::SessionStart(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 session.start 参数");
-            };
-            if params.serial.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 serial 参数");
-            }
-            if cmd_tx
-                .send(Command::StartSession(params.serial.clone()))
-                .await
-                .is_err()
-            {
-                return make_error(req.id, ERROR_CODE, "core 正在关闭");
-            }
-            make_ok(req.id)
-        }
+        "device.list" => handlers::device_list(req, merged_watch),
+        "device.adb_list" => handlers::device_adb_list(req, device_watch),
+        "device.connect" => handlers::device_connect(req, cmd_tx).await,
+        "device.disconnect" => handlers::device_disconnect(req, cmd_tx).await,
+        "clipboard.get" => handlers::clipboard_get(req),
+        "pairing.info" => handlers::pairing_info(req, pair_info),
+        "session.update" => handlers::session_update(req, cmd_tx).await,
+        "session.retry" => handlers::session_retry(req, cmd_tx).await,
+        "session.start" => handlers::session_start(req, cmd_tx).await,
 
         // ── 融合模式 ──
-        "app.list" => {
-            let Some(request::Payload::AppListParams(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 app.list 参数");
-            };
-            let uuid = match params.uuid.parse::<uuid::Uuid>() {
-                Ok(u) => u,
-                Err(_) => return make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
-            };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if cmd_tx
-                .send(Command::ListApps {
-                    uuid,
-                    force: params.force,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return make_error(req.id, ERROR_CODE, "core 正在关闭");
-            }
-            // 枚举最长 20s + 调度余量；等不到回复视为 core 异常
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(Ok(reply))) => make_result(
-                    req.id,
-                    response::Payload::AppList(response::AppList {
-                        apps: reply.apps.iter().map(proto::AppInfo::from).collect(),
-                        fusion_supported: reply.fusion_supported,
-                    }),
-                ),
-                Ok(Ok(Err(message))) => make_error(req.id, ERROR_CODE, &message),
-                Ok(Err(_)) => make_error(req.id, ERROR_CODE, "core 正在关闭"),
-                Err(_) => make_error(req.id, ERROR_CODE, "应用枚举超时"),
-            }
-        }
-
-        "app.open" => {
-            let Some(request::Payload::AppOpenParams(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 app.open 参数");
-            };
-            let uuid = match params.uuid.parse::<uuid::Uuid>() {
-                Ok(u) => u,
-                Err(_) => return make_error(req.id, ERROR_CODE, "无效 uuid 格式"),
-            };
-            if params.package_name.is_empty() {
-                return make_error(req.id, ERROR_CODE, "缺少 package_name 参数");
-            }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if cmd_tx
-                .send(Command::OpenApp {
-                    uuid,
-                    package_name: params.package_name.clone(),
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return make_error(req.id, ERROR_CODE, "core 正在关闭");
-            }
-            match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-                Ok(Ok(Ok(window_id))) => make_result(
-                    req.id,
-                    response::Payload::AppOpen(response::AppOpen { window_id }),
-                ),
-                Ok(Ok(Err(message))) => make_error(req.id, ERROR_CODE, &message),
-                Ok(Err(_)) => make_error(req.id, ERROR_CODE, "core 正在关闭"),
-                Err(_) => make_error(req.id, ERROR_CODE, "打开应用超时"),
-            }
-        }
+        "app.list" => handlers::app_list(req, cmd_tx).await,
+        "app.open" => handlers::app_open(req, cmd_tx).await,
 
         // ── 设置 ──
-        "settings.get" => {
-            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
-            let state = crate::autostart::current_state(&exe);
-            make_result(
-                req.id,
-                response::Payload::Settings(settings_payload(state.enabled, state.supported)),
-            )
-        }
-
-        "settings.set_autostart" => {
-            let Some(request::Payload::SetAutostart(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 settings.set_autostart 参数");
-            };
-            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
-            match crate::autostart::set_enabled(&exe, params.enabled) {
-                Ok(state) => make_result(
-                    req.id,
-                    response::Payload::Settings(settings_payload(state.enabled, state.supported)),
-                ),
-                Err(e) => make_error(req.id, ERROR_CODE, &format!("设置自启动失败: {e}")),
-            }
-        }
-
-        "settings.set_scrcpy_params" => {
-            let Some(request::Payload::SetScrcpyParams(params)) = &req.params else {
-                return make_error(req.id, ERROR_CODE, "缺少 settings.set_scrcpy_params 参数");
-            };
-            let mut config = crate::settings::read();
-            if let Some(v) = params.video_bit_rate {
-                config.video_bit_rate = v;
-            }
-            if let Some(v) = params.video_max_size {
-                config.video_max_size = v;
-            }
-            if let Some(v) = params.video_max_fps {
-                config.video_max_fps = v;
-            }
-            if let Some(v) = params.audio_bit_rate {
-                config.audio_bit_rate = v;
-            }
-            if let Some(v) = &params.audio_codec {
-                // 白名单校验：只接受 scrcpy 支持的音频编码器
-                if matches!(v.as_str(), "opus" | "aac" | "flac" | "raw") {
-                    config.audio_codec = v.clone();
-                } else {
-                    return make_error(req.id, ERROR_CODE, &format!("不支持的音频编码器: {v}"));
-                }
-            }
-            match crate::settings::write(&config) {
-                Ok(()) => {
-                    // 通知 Core 重启所有设备会话，使新编码参数立即生效
-                    if cmd_tx.send(Command::RestartAllSessions).await.is_err() {
-                        return make_error(req.id, ERROR_CODE, "core 正在关闭");
-                    }
-                    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
-                    let state = crate::autostart::current_state(&exe);
-                    make_result(
-                        req.id,
-                        response::Payload::Settings(settings_payload(
-                            state.enabled,
-                            state.supported,
-                        )),
-                    )
-                }
-                Err(e) => make_error(req.id, ERROR_CODE, &format!("保存 scrcpy 参数失败: {e}")),
-            }
-        }
+        "settings.get" => handlers::settings_get(req),
+        "settings.set_autostart" => handlers::settings_set_autostart(req),
+        "settings.set_scrcpy_params" => handlers::settings_set_scrcpy_params(req, cmd_tx).await,
 
         _ => make_error(req.id, ERROR_CODE, &format!("未知方法: {}", req.method)),
     }
 }
 
-/// 由 config + 自启动状态组装 `settings.*` 的响应载荷。
-fn settings_payload(autostart_enabled: bool, autostart_supported: bool) -> response::Settings {
-    let config = crate::settings::read();
-    response::Settings {
-        autostart_enabled,
-        autostart_supported,
-        video_bit_rate: config.video_bit_rate,
-        video_max_size: config.video_max_size,
-        video_max_fps: config.video_max_fps,
-        audio_bit_rate: config.audio_bit_rate,
-        audio_codec: config.audio_codec.clone(),
-    }
-}
-
 // ── 响应构造辅助 ──
 
-fn make_result(id: u64, result: response::Payload) -> proto::Response {
+pub(super) fn make_result(id: u64, result: response::Payload) -> proto::Response {
     proto::Response {
         id,
         result: Some(result),
@@ -609,7 +313,7 @@ fn make_result(id: u64, result: response::Payload) -> proto::Response {
     }
 }
 
-fn make_ok(id: u64) -> proto::Response {
+pub(super) fn make_ok(id: u64) -> proto::Response {
     proto::Response {
         id,
         result: None,
@@ -617,7 +321,7 @@ fn make_ok(id: u64) -> proto::Response {
     }
 }
 
-fn make_error(id: u64, code: i32, message: &str) -> proto::Response {
+pub(super) fn make_error(id: u64, code: i32, message: &str) -> proto::Response {
     proto::Response {
         id,
         result: None,
@@ -631,6 +335,7 @@ fn make_error(id: u64, code: i32, message: &str) -> proto::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::proto::request;
     use crate::types::{DeviceIdentity, DeviceState};
     use tokio::sync::watch;
 
@@ -958,7 +663,7 @@ mod tests {
                         } => {
                             assert_eq!(parsed.to_string(), uuid);
                             assert_eq!(package_name, "com.android.settings");
-                            reply.send(Ok(42)).expect("reply 应送达");
+                            reply.send(Ok((42, "192.168.1.5:27183".into()))).expect("reply 应送达");
                         }
                         other => panic!("expected Command::OpenApp, got {:?}", other),
                     }
@@ -968,6 +673,7 @@ mod tests {
         match resp.result {
             Some(response::Payload::AppOpen(open)) => {
                 assert_eq!(open.window_id, 42);
+                assert_eq!(open.addr, "192.168.1.5:27183");
             }
             other => panic!("expected typed AppOpen, got {:?}", other),
         }

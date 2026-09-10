@@ -2,5 +2,5 @@
 resolver = "2"
 
 members = [
-    "daemon", "sync-core", "ui/src-tauri", "fusion-viewer", "kulua-proto",
+    "daemon", "sync-core", "ui/src-tauri", "kulua-proto",
 ]

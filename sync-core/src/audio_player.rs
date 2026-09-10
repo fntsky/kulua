@@ -81,6 +81,22 @@ impl AudioCodec {
             Self::Flac => 3,
         }
     }
+
+    /// [`Self::handshake_byte`] 的逆：索引 → 编码器（未知索引返回 None）。
+    pub fn from_handshake_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Raw),
+            1 => Some(Self::Opus),
+            2 => Some(Self::Aac),
+            3 => Some(Self::Flac),
+            _ => None,
+        }
+    }
+
+    /// 是否需要 codec config（AudioSpecificConfig / STREAMINFO）才能建解码器。
+    pub fn needs_config(self) -> bool {
+        matches!(self, Self::Aac | Self::Flac)
+    }
 }
 
 /// 解码器统一接口：把一帧编码数据解码为 f32 交错 PCM。
@@ -179,11 +195,6 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// 创建 OPUS 播放器（48 kHz 立体声）。
-    pub fn new_opus() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new(AudioCodec::Opus, None)
-    }
-
     /// 创建播放器。
     ///
     /// - `codec`: 音频编码器

@@ -39,11 +39,12 @@ pub enum Command {
         force: bool,
         reply: oneshot::Sender<Result<AppListReply, String>>,
     },
-    /// 打开应用的融合窗口（app.open）；reply 回传 window_id
+    /// 打开应用的融合窗口（app.open）；reply 回传 (window_id, addr)。
+    /// addr 为 phone 直连地址，UI 用它自建 video-only UDP 客户端。
     OpenApp {
         uuid: Uuid,
         package_name: String,
-        reply: oneshot::Sender<Result<u64, String>>,
+        reply: oneshot::Sender<Result<(u64, String), String>>,
     },
 }
 
@@ -123,13 +124,10 @@ pub struct Core {
     merged_watch: watch::Receiver<Vec<Device>>,
 
     // ── 融合窗口 ──
-    /// 融合窗口管理器（scrcpy.exe 进程生命周期）
-    fusion: crate::fusion::FusionManager,
+    /// 融合窗口 id 计数器（窗口生命周期由 UI 进程管理，daemon 只分配 id）
+    next_window_id: u64,
     /// 应用列表缓存（按设备 UUID，TTL 60s）
     app_cache: crate::apps::AppCache,
-    /// 融合窗口列表 watch（IPC app.windows-updated 事件用）
-    fusion_tx: watch::Sender<Vec<crate::fusion::AppWindowInfo>>,
-    fusion_watch: watch::Receiver<Vec<crate::fusion::AppWindowInfo>>,
 
     // ── 剪贴板防回环 ──
     clipboard_last_seen: Option<String>,
@@ -179,7 +177,6 @@ impl Core {
         let (device_name_tx, device_name_rx) = mpsc::channel::<(String, String)>(32);
 
         let (session_tx, session_watch) = watch::channel(Vec::new());
-        let (fusion_tx, fusion_watch) = watch::channel(Vec::new());
 
         Self {
             adb_cmd: Arc::new(AdbCmd::new()),
@@ -210,13 +207,10 @@ impl Core {
             last_clipboard_error_print: Instant::now(),
             session_tx,
             session_watch,
-            fusion: crate::fusion::FusionManager::new(),
+            next_window_id: 1,
             app_cache: crate::apps::AppCache::new(),
-            fusion_tx,
-            fusion_watch,
         }
     }
-
     pub fn get_token(&self) -> CancellationToken {
         self.token.clone()
     }
@@ -238,7 +232,6 @@ impl Core {
                 self.device_watch.clone(),
                 self.merged_watch.clone(),
                 self.session_watch.clone(),
-                self.fusion_watch.clone(),
                 self.clip_broadcast.clone(),
                 self.notif_broadcast.clone(),
                 self.pair_info.clone(),
@@ -257,46 +250,47 @@ impl Core {
                 Some(text) = self.phone_clip_rx.recv()  => self.on_phone_clipboard(text),
                 Some(n)    = self.notif_rx.recv()       => self.on_notification(n),
                 Some(cmd)  = cmd_rx.recv()              => self.on_command(cmd).await,
-                Some((serial, name)) = self.device_name_rx.recv() => {
-                    // 更新 devices 中匹配的设备名称
-                    if let Some(entry) = self.devices.values_mut().find(|e| e.device.serial == serial) {
-                        entry.device.name = name.clone();
-                    }
-                }
-                _ = tick.tick() => {
-                    self.poll_system_clipboard();
-                    // 回收已退出的融合窗口，并把“退出/失败”状态一次性推给 UI
-                    let exited = self.fusion.tick();
-                    if !exited.is_empty() {
-                        let mut windows = self.fusion.windows_info();
-                        windows.extend(exited);
-                        let _ = self.fusion_tx.send(windows);
-                    } else {
-                        self.push_fusion_windows();
-                    }
-                    let from_track = self.device_watch.borrow_and_update().clone();
-                    // 原始列表含 Offline/Unauthorized 等，仅 Device 状态进入设备合并（卡片语义不变）
-                    let online: HashMap<String, Device> = from_track
-                        .iter()
-                        .filter(|(_, d)| d.state == DeviceState::Device)
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    for (serial, dev) in &online {
-                        self.insert_device(serial, dev.state.clone());
-                        if dev.state == DeviceState::Device {
-                            self.pending_serials.retain(|e| e.addr != *serial);
-                        }
-                    }
-                    self.try_connect_pending(&online);
-                    self.push_merged_devices();
-                    self.check_dead_sessions();
-                    self.stop_disconnected_sessions(&online).await;
-                    self.push_session_list();
-                }
+                Some((serial, name)) = self.device_name_rx.recv() => self.on_device_name(serial, name),
+                _ = tick.tick() => self.on_tick().await,
             }
         }
 
         self.stop_all().await;
+    }
+
+    /// 主循环 tick（150ms）：剪贴板轮询 → 设备合并 → 推进待连接环 → 收尾并推送列表。
+    async fn on_tick(&mut self) {
+        self.poll_system_clipboard();
+        let from_track = self.device_watch.borrow_and_update().clone();
+        // 原始列表含 Offline/Unauthorized 等，仅 Device 状态进入设备合并（卡片语义不变）
+        let online: HashMap<String, Device> = from_track
+            .iter()
+            .filter(|(_, d)| d.state == DeviceState::Device)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (serial, dev) in &online {
+            self.insert_device(serial, dev.state.clone());
+            if dev.state == DeviceState::Device {
+                self.pending_serials.retain(|e| e.addr != *serial);
+            }
+        }
+        self.try_connect_pending(&online);
+        self.push_merged_devices();
+        self.check_dead_sessions();
+        self.stop_disconnected_sessions(&online).await;
+        self.push_session_list();
+    }
+
+    /// session 回传的设备名称 → 更新 devices 中匹配条目（UI 卡片显示用）。
+    fn on_device_name(&mut self, serial: String, name: String) {
+        // 更新 devices 中匹配的设备名称
+        if let Some(entry) = self
+            .devices
+            .values_mut()
+            .find(|e| e.device.serial == serial)
+        {
+            entry.device.name = name.clone();
+        }
     }
 
     /// 将 adb 上报的设备插入/合并到 `devices` 映射。
@@ -434,169 +428,11 @@ impl Core {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Connect(addr) => {
-                // USB 设备自动连接，无需加入 pending 环
-                if DeviceAddrKind::classify(&addr) != DeviceAddrKind::Usb {
-                    // 去重后加入环尾
-                    if !self.pending_serials.iter().any(|e| e.addr == addr) {
-                        self.pending_serials
-                            .push_back(PendingEntry { addr, attempts: 0 });
-                    }
-                }
-            }
-            Command::Disconnect(serial) => {
-                // 寻找匹配设备并停止 session
-                let found_handle = self.devices.values_mut().find_map(|entry| {
-                    if entry.device.serial == serial
-                        || entry.device.id == serial
-                        || entry.device.identity.contains_addr(&serial)
-                    {
-                        entry.session.take()
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(mut handle) = found_handle {
-                    handle.stop(self.adb_cmd.as_ref()).await;
-                }
-
-                // 清理 pending_serials 中的对应地址
-                self.pending_serials.retain(|e| e.addr != serial);
-                // 放弃 Disconnect 中对 session_configs 的清理（config 随 DeviceEntry 保留）
-            }
-            Command::Retry(uuid) => {
-                // 仅 failed 墓碑可重试；活跃 session / 无墓碑 → no-op
-                let has_tombstone = self
-                    .devices
-                    .get(&uuid)
-                    .is_some_and(|entry| entry.session.as_ref().is_some_and(|h| h.is_failed()));
-                if !has_tombstone {
-                    return;
-                }
-                // 拔墓碑（task 已结束，stop 立即返回并清理 adb forward）
-                let (mut handle, device) = match self
-                    .devices
-                    .get_mut(&uuid)
-                    .map(|entry| (entry.session.take(), entry.device.clone()))
-                {
-                    Some((Some(h), d)) => (h, d),
-                    _ => return,
-                };
-                handle.stop(self.adb_cmd.as_ref()).await;
-                // 设备已不在 adb 列表 → 等重连后由用户点击 ADB 列表重建
-                let online = self
-                    .device_watch
-                    .borrow()
-                    .get(&device.serial)
-                    .is_some_and(|d| d.state == DeviceState::Device);
-                if online {
-                    self.start_session(device).await;
-                }
-            }
-            Command::RestartAllSessions => {
-                // 全局 scrcpy 编码参数变更。
-                // 音频编码可热切换（不重启 session）：更新 session 的 codec 原子 +
-                // 发 audio 重启信号，session 重连 audio 连接即用新编码；
-                // control/剪贴板/通知不受影响。仅未运行的 session 才全量重建。
-                let new_codec_byte = crate::audio_player::AudioCodec::from_name(
-                    &crate::settings::read().audio_codec,
-                )
-                .handshake_byte();
-                let mut needs_restart: Vec<Device> = Vec::new();
-                for entry in self.devices.values_mut() {
-                    if let Some(handle) = &entry.session {
-                        if handle.state() != SESSION_STATE_RUNNING {
-                            // 未运行（connecting/failed）→ 全量重建
-                            needs_restart.push(entry.device.clone());
-                            continue;
-                        }
-                        // 运行中 → 热切换编码：更新原子 + 发重启信号
-                        handle.audio_codec.store(new_codec_byte, Ordering::SeqCst);
-                        let _ = handle.audio_restart_tx.try_send(());
-                        println!(
-                            "[hot-swap] {} audio codec -> {} (session 不重启)",
-                            entry.device.serial,
-                            crate::audio_player::AudioCodec::from_name(
-                                &crate::settings::read().audio_codec
-                            )
-                            .name()
-                        );
-                    }
-                }
-                // 未运行的 session 全量重建（含 failed 墓碑，等价重试）
-                for device in &needs_restart {
-                    if let Some(mut handle) = self
-                        .devices
-                        .get_mut(&device.uuid)
-                        .and_then(|e| e.session.take())
-                    {
-                        handle.stop(self.adb_cmd.as_ref()).await;
-                    }
-                }
-                if !needs_restart.is_empty() {
-                    println!(
-                        "Restarting {} device sessions after settings change",
-                        needs_restart.len()
-                    );
-                    for device in needs_restart {
-                        self.start_session(device).await;
-                    }
-                }
-            }
-            Command::StartSession(serial) => {
-                // 设备条目缺失（daemon 刚启动、索引未建）→ 按 adb 原始列表补录
-                if !self.devices.values().any(|e| {
-                    e.device.serial == serial
-                        || e.device.id == serial
-                        || e.device.identity.contains_addr(&serial)
-                }) {
-                    let state = self
-                        .device_watch
-                        .borrow()
-                        .get(&serial)
-                        .map(|d| d.state.clone())
-                        .unwrap_or(DeviceState::Offline);
-                    println!("[debug] device 条目缺失，state={:?}", state);
-                    if state != DeviceState::Device {
-                        return;
-                    }
-                    self.insert_device(&serial, state);
-                }
-
-                let uuid = match self.devices.values().find(|e| {
-                    e.device.serial == serial
-                        || e.device.id == serial
-                        || e.device.identity.contains_addr(&serial)
-                }) {
-                    Some(entry) => entry.device.uuid,
-                    None => return,
-                };
-                // 已有活跃 session（connecting/running）→ no-op，维持“一设备一 session”
-                let has_active = self
-                    .devices
-                    .get(&uuid)
-                    .and_then(|e| e.session.as_ref())
-                    .is_some_and(|h| !h.is_failed());
-                if has_active {
-                    return;
-                }
-
-                // 仅 Device 状态可建会话
-                let device = match self.devices.get(&uuid) {
-                    Some(entry) if entry.device.state == DeviceState::Device => {
-                        entry.device.clone()
-                    }
-                    _ => return,
-                };
-
-                // failed 墓碑 → 拔掉重建（等价 UI 重试按钮）
-                if let Some(mut handle) = self.devices.get_mut(&uuid).and_then(|e| e.session.take())
-                {
-                    handle.stop(self.adb_cmd.as_ref()).await;
-                }
-                self.start_session(device).await;
-            }
+            Command::Connect(addr) => self.cmd_connect(addr),
+            Command::Disconnect(serial) => self.cmd_disconnect(serial).await,
+            Command::Retry(uuid) => self.cmd_retry(uuid).await,
+            Command::StartSession(serial) => self.cmd_start_session(serial).await,
+            Command::RestartAllSessions => self.cmd_restart_all_sessions().await,
             Command::UpdateConfig {
                 uuid,
                 clipboard_sync,
@@ -604,65 +440,258 @@ impl Core {
                 audio_sync,
                 volume,
             } => {
-                // 音频开关变更需要重启 session（redeploy scrcpy），待重启设备先记录
-                let mut restart_device = None;
-                // 更新配置
-                if let Some(entry) = self.devices.get_mut(&uuid) {
-                    let prev_audio = entry.config.audio_enabled;
-                    let prev_codec = entry.config.audio_codec.clone();
-                    entry.config = session::SessionConfig {
-                        clipboard_sync,
-                        notification_sync,
-                        audio_enabled: audio_sync,
-                        volume,
-                        // UpdateConfig 不带编码参数，保持原值（编码由 RestartAllSessions 热切换）
-                        audio_codec: prev_codec,
-                    };
-
-                    // 剪贴板和通知可直接切换原子标志
-                    if let Some(handle) = &entry.session {
-                        handle
-                            .clipboard_enabled
-                            .store(clipboard_sync, Ordering::SeqCst);
-                        handle
-                            .notification_enabled
-                            .store(notification_sync, Ordering::SeqCst);
-                        // 音量实时生效（无需重启 session）
-                        handle.volume.store(volume, Ordering::Relaxed);
-                        // 音频必须以旧值判断是否变化：若先 store 再比较，自比恒等，重启永不触发
-                        if prev_audio != audio_sync {
-                            handle.audio_enabled.store(audio_sync, Ordering::SeqCst);
-                            restart_device = Some(entry.device.clone());
-                        }
-                    }
-                }
-
-                // 音频开关变更 → 停旧 session，用新参数 redeploy（仅在有活跃 session 时）
-                if let Some(device) = restart_device {
-                    if let Some(mut handle) = self.devices.get_mut(&uuid).unwrap().session.take() {
-                        handle.stop(self.adb_cmd.as_ref()).await;
-                    }
-                    println!(
-                        "Audio {} for {}, restarting session",
-                        if audio_sync { "enabled" } else { "disabled" },
-                        uuid
-                    );
-                    self.start_session(device).await;
-                }
+                self.cmd_update_config(uuid, clipboard_sync, notification_sync, audio_sync, volume)
             }
             Command::ListApps { uuid, force, reply } => {
-                let result = self.handle_list_apps(uuid, force).await;
-                let _ = reply.send(result);
+                self.cmd_list_apps(uuid, force, reply).await
             }
             Command::OpenApp {
                 uuid,
                 package_name,
                 reply,
-            } => {
-                let result = self.handle_open_app(uuid, package_name).await;
-                let _ = reply.send(result);
+            } => self.cmd_app_open(uuid, package_name, reply).await,
+        }
+    }
+
+    /// `Command::Connect`：非 USB 地址去重后加入待连接环（USB 由 adb 自动连接）。
+    fn cmd_connect(&mut self, addr: String) {
+        // USB 设备自动连接，无需加入 pending 环
+        if DeviceAddrKind::classify(&addr) != DeviceAddrKind::Usb {
+            // 去重后加入环尾
+            if !self.pending_serials.iter().any(|e| e.addr == addr) {
+                self.pending_serials
+                    .push_back(PendingEntry { addr, attempts: 0 });
             }
         }
+    }
+
+    /// `Command::Disconnect`：停止匹配设备的 session，并清理待连接环中的对应地址。
+    async fn cmd_disconnect(&mut self, serial: String) {
+        // 寻找匹配设备并停止 session
+        let found_handle = self.devices.values_mut().find_map(|entry| {
+            if entry.device.serial == serial
+                || entry.device.id == serial
+                || entry.device.identity.contains_addr(&serial)
+            {
+                entry.session.take()
+            } else {
+                None
+            }
+        });
+
+        if let Some(mut handle) = found_handle {
+            handle.stop(self.adb_cmd.as_ref()).await;
+        }
+
+        // 清理 pending_serials 中的对应地址
+        self.pending_serials.retain(|e| e.addr != serial);
+        // 放弃 Disconnect 中对 session_configs 的清理（config 随 DeviceEntry 保留）
+    }
+
+    /// `Command::Retry`：仅 failed 墓碑可重试（拔墓碑后在线则重建），否则 no-op。
+    async fn cmd_retry(&mut self, uuid: Uuid) {
+        // 仅 failed 墓碑可重试；活跃 session / 无墓碑 → no-op
+        let has_tombstone = self
+            .devices
+            .get(&uuid)
+            .is_some_and(|entry| entry.session.as_ref().is_some_and(|h| h.is_failed()));
+        if !has_tombstone {
+            return;
+        }
+        // 拔墓碑（task 已结束，stop 立即返回并清理 adb forward）
+        let (mut handle, device) = match self
+            .devices
+            .get_mut(&uuid)
+            .map(|entry| (entry.session.take(), entry.device.clone()))
+        {
+            Some((Some(h), d)) => (h, d),
+            _ => return,
+        };
+        handle.stop(self.adb_cmd.as_ref()).await;
+        // 设备已不在 adb 列表 → 等重连后由用户点击 ADB 列表重建
+        let online = self
+            .device_watch
+            .borrow()
+            .get(&device.serial)
+            .is_some_and(|d| d.state == DeviceState::Device);
+        if online {
+            self.start_session(device).await;
+        }
+    }
+
+    /// `Command::RestartAllSessions`：编码变更——运行中的 session 热切换音频目标，
+    /// 未运行的（含 failed 墓碑）全量重建。
+    async fn cmd_restart_all_sessions(&mut self) {
+        // 全局 scrcpy 编码参数变更。
+        // 音频编码可热切换（不重启 session）：只更新 Handle 的音频目标，
+        // Session 会下发 SetAudio 并在 phone 上重建采集链路；
+        // control/剪贴板/通知/端口都不受影响。仅未运行的 session 才全量重建。
+        let codec =
+            crate::audio_player::AudioCodec::from_name(&crate::settings::read().audio_codec);
+        let new_codec_byte = codec.handshake_byte();
+        let mut needs_restart: Vec<Device> = Vec::new();
+        for entry in self.devices.values_mut() {
+            if let Some(handle) = &entry.session {
+                if handle.state() != SESSION_STATE_RUNNING {
+                    // 未运行（connecting/failed）→ 全量重建
+                    needs_restart.push(entry.device.clone());
+                    continue;
+                }
+                // 运行中 → 热切换编码：开关保持用户配置，只换 codec
+                let enabled = handle.audio_target.borrow().enabled;
+                entry.config.audio_codec = codec.name().to_string();
+                let _ = handle
+                    .audio_target
+                    .send(session::AudioTarget::new(enabled, new_codec_byte));
+                println!(
+                    "[hot-swap] {} audio codec -> {} (session 不重启)",
+                    entry.device.serial,
+                    codec.name()
+                );
+            }
+        }
+        // 未运行的 session 全量重建（含 failed 墓碑，等价重试）
+        for device in &needs_restart {
+            if let Some(mut handle) = self
+                .devices
+                .get_mut(&device.uuid)
+                .and_then(|e| e.session.take())
+            {
+                handle.stop(self.adb_cmd.as_ref()).await;
+            }
+        }
+        if !needs_restart.is_empty() {
+            println!(
+                "Restarting {} device sessions after settings change",
+                needs_restart.len()
+            );
+            for device in needs_restart {
+                self.start_session(device).await;
+            }
+        }
+    }
+
+    /// `Command::StartSession`：点击 ADB 列表设备建会话（failed 墓碑视为可重建）。
+    async fn cmd_start_session(&mut self, serial: String) {
+        // 设备条目缺失（daemon 刚启动、索引未建）→ 按 adb 原始列表补录
+        if !self.devices.values().any(|e| {
+            e.device.serial == serial
+                || e.device.id == serial
+                || e.device.identity.contains_addr(&serial)
+        }) {
+            let state = self
+                .device_watch
+                .borrow()
+                .get(&serial)
+                .map(|d| d.state.clone())
+                .unwrap_or(DeviceState::Offline);
+            println!("[debug] device 条目缺失，state={:?}", state);
+            if state != DeviceState::Device {
+                return;
+            }
+            self.insert_device(&serial, state);
+        }
+
+        let uuid = match self.devices.values().find(|e| {
+            e.device.serial == serial
+                || e.device.id == serial
+                || e.device.identity.contains_addr(&serial)
+        }) {
+            Some(entry) => entry.device.uuid,
+            None => return,
+        };
+        // 已有活跃 session（connecting/running）→ no-op，维持“一设备一 session”
+        let has_active = self
+            .devices
+            .get(&uuid)
+            .and_then(|e| e.session.as_ref())
+            .is_some_and(|h| !h.is_failed());
+        if has_active {
+            return;
+        }
+
+        // 仅 Device 状态可建会话
+        let device = match self.devices.get(&uuid) {
+            Some(entry) if entry.device.state == DeviceState::Device => entry.device.clone(),
+            _ => return,
+        };
+
+        // failed 墓碑 → 拔掉重建（等价 UI 重试按钮）
+        if let Some(mut handle) = self.devices.get_mut(&uuid).and_then(|e| e.session.take()) {
+            handle.stop(self.adb_cmd.as_ref()).await;
+        }
+        self.start_session(device).await;
+    }
+
+    /// `Command::UpdateConfig`：写入配置并实时下发到 session（音频开关为会话内热切换）。
+    fn cmd_update_config(
+        &mut self,
+        uuid: Uuid,
+        clipboard_sync: bool,
+        notification_sync: bool,
+        audio_sync: bool,
+        volume: u16,
+    ) {
+        // 更新配置（音频开关现在也能热切换，不再需要重启 session）
+        if let Some(entry) = self.devices.get_mut(&uuid) {
+            let prev_audio = entry.config.audio_enabled;
+            let prev_codec = entry.config.audio_codec.clone();
+            entry.config = session::SessionConfig {
+                clipboard_sync,
+                notification_sync,
+                audio_enabled: audio_sync,
+                volume,
+                // UpdateConfig 不带编码参数，保持原值（编码由 RestartAllSessions 热切换）
+                audio_codec: prev_codec,
+            };
+
+            // 剪贴板/通知/音量/音频都通过共享状态实时生效，无需重启会话
+            if let Some(handle) = &entry.session {
+                handle
+                    .clipboard_enabled
+                    .store(clipboard_sync, Ordering::SeqCst);
+                handle
+                    .notification_enabled
+                    .store(notification_sync, Ordering::SeqCst);
+                // 音量实时生效（无需重启 session）
+                handle.volume.store(volume, Ordering::Relaxed);
+                // 音频开关：只更新目标，Session 下发 SetAudio 启停采集/播放；
+                // session、端口、剪贴板、融合窗口全部保持
+                if prev_audio != audio_sync {
+                    let codec = handle.audio_target.borrow().codec;
+                    let _ = handle
+                        .audio_target
+                        .send(session::AudioTarget::new(audio_sync, codec));
+                    println!(
+                        "Audio {} for {} (会话内热切换，不重启)",
+                        if audio_sync { "enabled" } else { "disabled" },
+                        uuid
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Command::ListApps`：枚举应用（缓存优先）并把结果回传给 IPC 调用方。
+    async fn cmd_list_apps(
+        &mut self,
+        uuid: Uuid,
+        force: bool,
+        reply: oneshot::Sender<Result<AppListReply, String>>,
+    ) {
+        let result = self.handle_list_apps(uuid, force).await;
+        let _ = reply.send(result);
+    }
+
+    /// `Command::OpenApp`：拉起融合窗口并把 (window_id, addr) 回传给 IPC 调用方。
+    async fn cmd_app_open(
+        &mut self,
+        uuid: Uuid,
+        package_name: String,
+        reply: oneshot::Sender<Result<(u64, String), String>>,
+    ) {
+        let result = self.handle_open_app(uuid, package_name).await;
+        let _ = reply.send(result);
     }
 
     /// `app.list` 处理：校验设备在线 → 缓存命中直接返回 → miss 时阻塞枚举（20s 超时）。
@@ -674,7 +703,8 @@ impl Core {
             .map(|e| e.device.clone())
             .filter(|d| d.state == DeviceState::Device)
             .ok_or_else(|| "设备不在线".to_string())?;
-        let fusion_supported = self.fusion.is_supported();
+        // 融合窗口由 UI 进程内嵌 WebCodecs 渲染，不再依赖外部 viewer exe
+        let fusion_supported = true;
 
         if !force && let Some(apps) = self.app_cache.get(uuid) {
             return Ok(AppListReply {
@@ -706,9 +736,12 @@ impl Core {
     }
 
     /// `app.open` 处理：校验设备/包名/Android 版本（虚拟显示器要求 SDK ≥ 29）与
-    /// session 状态（viewer 连接模式需要 session 已部署 kulua-server），
-    /// 然后拉起 fusion-viewer 融合窗口。
-    async fn handle_open_app(&mut self, uuid: Uuid, package_name: String) -> Result<u64, String> {
+    /// session 状态，然后拉起融合窗口，返回 (window_id, addr)。
+    async fn handle_open_app(
+        &mut self,
+        uuid: Uuid,
+        package_name: String,
+    ) -> Result<(u64, String), String> {
         let device = self
             .devices
             .get(&uuid)
@@ -755,15 +788,11 @@ impl Core {
             ));
         }
 
-        // 应用名优先取自缓存（枚举过才有），否则退回包名
-        let label = self
-            .app_cache
-            .get(uuid)
-            .and_then(|apps| apps.iter().find(|a| a.package_name == package_name))
-            .map(|a| a.label.clone())
-            .unwrap_or_default();
-        self.fusion
-            .open_window(device.serial.clone(), package_name, label, addr)
+        // 窗口生命周期归 UI 进程（Tauri WebviewWindow + WebCodecs），daemon
+        // 只分配 id 并回传直连地址。
+        let window_id = self.next_window_id;
+        self.next_window_id += 1;
+        Ok((window_id, addr))
     }
 
     fn on_notification(&mut self, notif: NotifInfo) {
@@ -891,31 +920,29 @@ impl Core {
             .devices
             .values()
             .filter_map(|entry| {
-                entry.session.as_ref().map(|handle| SessionSummary {
-                    uuid: entry.device.uuid,
-                    id: entry.device.id.clone(),
-                    serial: entry.device.serial.clone(),
-                    name: entry.device.name.clone(),
-                    state: format!("{:?}", entry.device.state),
-                    session_state: handle.state_str().to_string(),
-                    audio_buffer_ms: handle.audio_latency.load(Ordering::SeqCst),
-                    clipboard_sync: entry.config.clipboard_sync,
-                    notification_sync: entry.config.notification_sync,
-                    audio_enabled: handle.audio_enabled.load(Ordering::SeqCst),
-                    volume: entry.config.volume,
+                entry.session.as_ref().map(|handle| {
+                    let audio = session::snapshot(&handle.audio_runtime);
+                    SessionSummary {
+                        uuid: entry.device.uuid,
+                        id: entry.device.id.clone(),
+                        serial: entry.device.serial.clone(),
+                        name: entry.device.name.clone(),
+                        state: format!("{:?}", entry.device.state),
+                        session_state: handle.state_str().to_string(),
+                        audio_buffer_ms: handle.audio_latency.load(Ordering::SeqCst),
+                        clipboard_sync: entry.config.clipboard_sync,
+                        notification_sync: entry.config.notification_sync,
+                        // 目标是用户期望（UI 开关呈现它），运行态单独呈现切换中/失败
+                        audio_enabled: handle.audio_target.borrow().enabled,
+                        audio_state: session::audio_state_str(audio.state).to_string(),
+                        audio_error: audio.error,
+                        volume: entry.config.volume,
+                    }
                 })
             })
             .collect();
         if *self.session_watch.borrow() != sessions {
             let _ = self.session_tx.send(sessions);
-        }
-    }
-
-    /// 推送融合窗口快照到 `fusion_tx`（IPC app.windows-updated 事件用）。
-    fn push_fusion_windows(&self) {
-        let windows = self.fusion.windows_info();
-        if *self.fusion_watch.borrow() != windows {
-            let _ = self.fusion_tx.send(windows);
         }
     }
 
@@ -943,25 +970,33 @@ impl Core {
         let jar_path = self.jar_path.clone();
 
         // 从设备条目中读取配置开关
-        let cfg = self
+        let mut cfg = self
             .devices
             .get(&device.uuid)
             .map(|entry| entry.config.clone())
             .unwrap_or_default();
+        // 音频编码的真源是全局设置（部署参数与音频目标必须同源）：per-device 的副本
+        // 可能是陈旧默认值（如 opus vs 设置里的 aac），会让"开关一次"偷偷换编码。
+        cfg.audio_codec = crate::settings::read().audio_codec.clone();
+        if let Some(entry) = self.devices.get_mut(&device.uuid) {
+            entry.config.audio_codec = cfg.audio_codec.clone();
+        }
         // 共享原子标志，Core 后续可随时切换
         let clipboard_enabled = Arc::new(AtomicBool::new(cfg.clipboard_sync));
         let notification_enabled = Arc::new(AtomicBool::new(cfg.notification_sync));
-        let audio_enabled = Arc::new(AtomicBool::new(cfg.audio_enabled));
         let volume = Arc::new(AtomicU16::new(cfg.volume));
         // 生命周期状态：session 与 Handle 共享，阶段边界写入（docs/session-state-design.md）
         let session_state = Arc::new(AtomicU8::new(SESSION_STATE_CONNECTING));
         // 音频缓冲延迟（ms）：audio_task 写，Core tick 读推 UI
         let audio_latency = Arc::new(AtomicU64::new(0));
-        // 音频编码器索引（热切换：Core 改原子 + 发重启信号，session 重连 audio）
-        let audio_codec = Arc::new(AtomicU8::new(
+        // 音频目标（watch）：Core 只写"用户期望"，Session 负责下发 SetAudio 并
+        // 维护运行态；连续操作会被 watch 合并到最新目标，不会积压中间态命令。
+        let audio_target = session::AudioTarget::new(
+            cfg.audio_enabled,
             crate::audio_player::AudioCodec::from_name(&cfg.audio_codec).handshake_byte(),
-        ));
-        let (audio_restart_tx, audio_restart_rx) = mpsc::channel::<()>(1);
+        );
+        let (audio_target_tx, audio_target_rx) = tokio::sync::watch::channel(audio_target);
+        let audio_runtime = session::shared_runtime();
 
         let mut sess = session::Session::new(
             adb,
@@ -974,13 +1009,12 @@ impl Core {
             stop_rx,
             clipboard_enabled.clone(),
             notification_enabled.clone(),
-            audio_enabled.clone(),
             volume.clone(),
             self.device_name_tx.clone(),
             session_state.clone(),
             audio_latency.clone(),
-            audio_codec.clone(),
-            audio_restart_rx,
+            audio_target_rx,
+            audio_runtime.clone(),
             // 全局 scrcpy 编码参数（config 真源，新会话生效）
             crate::settings::ScrcpyParams::from(&crate::settings::read()),
         );
@@ -994,12 +1028,11 @@ impl Core {
             task,
             clipboard_enabled,
             notification_enabled,
-            audio_enabled,
             volume,
             session_state,
             audio_latency,
-            audio_codec,
-            audio_restart_tx,
+            audio_target: audio_target_tx,
+            audio_runtime,
         };
 
         let uuid = handle.device.uuid;
@@ -1025,8 +1058,6 @@ impl Core {
                 handle.stop(self.adb_cmd.as_ref()).await;
             }
         }
-        // daemon 退出：优雅关闭所有融合窗口（taskkill WM_CLOSE → 超时强杀）
-        self.fusion.shutdown();
     }
 
     /// 推送合并后设备列表（IPC device.list / device.updated 事件用）
@@ -1132,10 +1163,8 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
-            fusion: crate::fusion::FusionManager::new(),
+            next_window_id: 1,
             app_cache: crate::apps::AppCache::new(),
-            fusion_tx: watch::channel(Vec::new()).0,
-            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };
@@ -1166,8 +1195,14 @@ mod tests {
     }
 
     /// 测试夹具：插入一台设备 + 一个“运行中”的音频 session（audio=true，port 用哨兵值 9999）。
-    /// 返回 (core, uuid, stop_rx, audio_enabled)，stop_rx 用于观察旧 session 是否被 stop。
-    fn core_with_running_audio_session() -> (Core, Uuid, oneshot::Receiver<()>, Arc<AtomicBool>) {
+    /// 返回 (core, uuid, stop_rx, audio_target_rx)：stop_rx 观察旧 session 是否被 stop，
+    /// target_rx 观察音频目标变化（Session 侧看到的就是它）。
+    fn core_with_running_audio_session() -> (
+        Core,
+        Uuid,
+        oneshot::Receiver<()>,
+        watch::Receiver<session::AudioTarget>,
+    ) {
         let (phone_clip_tx, _) = mpsc::channel(256);
         let (notif_tx, _) = mpsc::channel(64);
         let (clip_tx, _) = broadcast::channel(64);
@@ -1203,10 +1238,8 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
-            fusion: crate::fusion::FusionManager::new(),
+            next_window_id: 1,
             app_cache: crate::apps::AppCache::new(),
-            fusion_tx: watch::channel(Vec::new()).0,
-            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };
@@ -1220,7 +1253,8 @@ mod tests {
             name: String::new(),
             identity: DeviceIdentity::default(),
         };
-        let audio_enabled = Arc::new(AtomicBool::new(true));
+        // 音频目标（watch：测试可观察目标变化是否下发）
+        let (audio_target_tx, audio_target_rx) = watch::channel(session::AudioTarget::new(true, 2)); // aac
         // stop_tx 留在假 handle 中：stop 被调用时会 send，测试通过 stop_rx 观察
         let (stop_tx, stop_rx) = oneshot::channel();
         core.devices.insert(
@@ -1234,12 +1268,11 @@ mod tests {
                     task: tokio::spawn(async {}),
                     clipboard_enabled: Arc::new(AtomicBool::new(true)),
                     notification_enabled: Arc::new(AtomicBool::new(true)),
-                    audio_enabled: audio_enabled.clone(),
                     volume: Arc::new(AtomicU16::new(80)),
                     session_state: Arc::new(AtomicU8::new(crate::session::SESSION_STATE_RUNNING)),
                     audio_latency: Arc::new(AtomicU64::new(0)),
-                    audio_codec: Arc::new(AtomicU8::new(2)), // aac
-                    audio_restart_tx: mpsc::channel::<()>(1).0,
+                    audio_target: audio_target_tx,
+                    audio_runtime: session::shared_runtime(),
                 }),
                 config: session::SessionConfig {
                     clipboard_sync: true,
@@ -1250,14 +1283,14 @@ mod tests {
                 },
             },
         );
-        (core, uuid, stop_rx, audio_enabled)
+        (core, uuid, stop_rx, audio_target_rx)
     }
 
     #[tokio::test]
-    async fn test_update_config_audio_toggle_restarts_session() {
-        // 回归：音频开关变更必须 stop 旧 session 并 redeploy。
-        // 曾因 store 先于 need_restart 判断执行，重启永不触发（音频永远关不掉）。
-        let (mut core, uuid, mut stop_rx, _) = core_with_running_audio_session();
+    async fn test_update_config_audio_toggle_is_hot_swap() {
+        // 会话内热开关：只更新音频目标，session/端口/剪贴板/融合窗口都不动。
+        // （旧行为是 stop + redeploy 整个 session。）
+        let (mut core, uuid, mut stop_rx, target_rx) = core_with_running_audio_session();
 
         core.on_command(Command::UpdateConfig {
             uuid,
@@ -1268,20 +1301,20 @@ mod tests {
         })
         .await;
 
-        // 旧 session 必须收到 stop 信号
-        assert!(stop_rx.try_recv().is_ok(), "音频关闭必须停止旧 session");
-        // 新 session 已部署（port = port_counter 分配），音频标志 = 新值
+        assert!(stop_rx.try_recv().is_err(), "热开关不得停止 session");
         let entry = core.devices.get(&uuid).unwrap();
-        let new_handle = entry.session.as_ref().expect("重启后应有新 session");
-        assert_eq!(new_handle.port, 27183, "应重新部署 session");
-        assert!(!new_handle.audio_enabled.load(Ordering::SeqCst));
         assert!(!entry.config.audio_enabled);
+        let handle = entry.session.as_ref().expect("session 应保持存在");
+        assert_eq!(handle.port, 9999, "session 不应重建（端口不变）");
+        assert!(!handle.audio_target.borrow().enabled, "目标应变为关闭");
+        assert_eq!(handle.audio_target.borrow().codec, 2, "关闭不改编码");
+        assert!(!target_rx.borrow().enabled, "Session 应看到新目标");
     }
 
     #[tokio::test]
     async fn test_update_config_audio_unchanged_keeps_session() {
-        // 对照：音频值未变 → 不得重启（否则音量/剪贴板调整都会误杀 session）
-        let (mut core, uuid, mut stop_rx, audio_enabled) = core_with_running_audio_session();
+        // 对照：音频值未变 → 不得动 session（否则音量/剪贴板调整都会误杀会话）
+        let (mut core, uuid, mut stop_rx, target_rx) = core_with_running_audio_session();
 
         core.on_command(Command::UpdateConfig {
             uuid,
@@ -1296,8 +1329,7 @@ mod tests {
         let entry = core.devices.get(&uuid).unwrap();
         let handle = entry.session.as_ref().unwrap();
         assert_eq!(handle.port, 9999, "原 session 应保留");
-        // 同一个原子标志（handle 未被替换）
-        assert!(Arc::ptr_eq(&handle.audio_enabled, &audio_enabled));
+        assert!(target_rx.borrow().enabled, "目标未变");
         // 配置照常更新（剪贴板/通知/音量变更仍生效）
         assert!(!entry.config.clipboard_sync);
         assert!(!entry.config.notification_sync);
@@ -1341,10 +1373,8 @@ mod tests {
             session_watch,
             merged_tx: watch::channel(Vec::new()).0,
             merged_watch: watch::channel(Vec::new()).1,
-            fusion: crate::fusion::FusionManager::new(),
+            next_window_id: 1,
             app_cache: crate::apps::AppCache::new(),
-            fusion_tx: watch::channel(Vec::new()).0,
-            fusion_watch: watch::channel(Vec::new()).1,
             last_received_from_phone: None,
             last_clipboard_error_print: Instant::now(),
         };
@@ -1362,12 +1392,11 @@ mod tests {
             task: tokio::spawn(async {}),
             clipboard_enabled: Arc::new(AtomicBool::new(true)),
             notification_enabled: Arc::new(AtomicBool::new(true)),
-            audio_enabled: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU16::new(80)),
             session_state: Arc::new(AtomicU8::new(state)),
             audio_latency: Arc::new(AtomicU64::new(0)),
-            audio_codec: Arc::new(AtomicU8::new(2)), // aac
-            audio_restart_tx: mpsc::channel::<()>(1).0,
+            audio_target: watch::channel(session::AudioTarget::new(false, 2)).0, // aac
+            audio_runtime: session::shared_runtime(),
         });
         stop_rx
     }
@@ -1466,16 +1495,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restart_all_sessions_hot_swaps_running_session() {
-        // 编码参数变更：RUNNING session 应热切换（更新 codec 原子 + 发重启信号），
+    async fn test_restart_all_sessions_hot_swaps_codec() {
+        // 编码参数变更：RUNNING session 只换音频目标（Session 会下发 SetAudio），
         // 不重启 session（stop 不触发，端口不变）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
         let mut stop_rx =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
-        let (restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
-
-        // 把假 handle 的 restart 通道换成可观察的
+        // 当前目标是 opus，配置里的编码来自全局 settings（两边读同一来源）
+        let expected =
+            crate::audio_player::AudioCodec::from_name(&crate::settings::read().audio_codec)
+                .handshake_byte();
         {
             let handle = core
                 .devices
@@ -1484,7 +1514,9 @@ mod tests {
                 .session
                 .as_mut()
                 .unwrap();
-            handle.audio_restart_tx = restart_tx;
+            let _ = handle
+                .audio_target
+                .send(session::AudioTarget::new(false, 1)); // opus
         }
 
         core.on_command(Command::RestartAllSessions).await;
@@ -1494,8 +1526,16 @@ mod tests {
         let entry = core.devices.get(&device.uuid).unwrap();
         let handle = entry.session.as_ref().expect("session 应保持存在");
         assert_eq!(handle.port, 9999, "session 不应重建（端口不变）");
-        // 应收到 audio 重启信号（编码热切换）
-        assert!(restart_rx.try_recv().is_ok(), "应收到 audio 重启信号");
+        assert_eq!(
+            handle.audio_target.borrow().codec,
+            expected,
+            "音频目标应换成新编码（Session 据此下发 SetAudio）"
+        );
+        assert_eq!(
+            handle.audio_target.borrow().enabled,
+            false,
+            "编码切换不得改动开关目标"
+        );
     }
 
     #[tokio::test]

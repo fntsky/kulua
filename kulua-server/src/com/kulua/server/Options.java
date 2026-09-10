@@ -29,12 +29,12 @@ public final class Options {
         return port;
     }
 
-    /** video 端口 = ctrl + 1（25B 头媒体数据报）。 */
+    /** video 端口 = ctrl + 1（33B 头媒体数据报）。 */
     public int videoPort() {
         return port + 1;
     }
 
-    /** audio 端口 = ctrl + 2（25B 头媒体数据报）。 */
+    /** audio 端口 = ctrl + 2（33B 头媒体数据报）。 */
     public int audioPort() {
         return port + 2;
     }

@@ -6,6 +6,10 @@ use sync_core::ipc::proto::{self, event, request, response};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 
+mod fusion;
+
+use fusion::FusionSession;
+
 /// 通过长连接发送的 IPC 请求，响应通过 oneshot 回传。
 struct IpcRequest {
     id: u64,
@@ -15,7 +19,7 @@ struct IpcRequest {
 
 // ── State ──
 
-struct AppState {
+pub(crate) struct AppState {
     devices: Mutex<Vec<DeviceInfo>>,
     connected: Mutex<bool>,
     pairing_info: Mutex<Option<PairingInfo>>,
@@ -23,6 +27,9 @@ struct AppState {
     ipc_tx: Mutex<Option<mpsc::Sender<IpcRequest>>>,
     /// 自增请求 ID（1、2 保留给连接建立后的初始握手）
     next_id: AtomicU64,
+    /// 活跃融合窗口会话：window label → 元数据 + ctrl 发送端。
+    /// UdpSession 本体被 video pump 任务独占；ctrl 指令经 channel 转发。
+    fusion_sessions: Mutex<HashMap<String, FusionSession>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -71,7 +78,12 @@ struct SessionInfo {
     audio_buffer_ms: u64,
     clipboard_sync: bool,
     notification_sync: bool,
+    /// 音频目标（用户期望的开关）
     audio_enabled: bool,
+    /// 音频运行态：off | starting | on | stopping | failed
+    audio_state: String,
+    /// 运行态为 failed 时的原因
+    audio_error: String,
     volume: u32,
 }
 
@@ -100,21 +112,6 @@ struct AppInfo {
     package_name: String,
     label: String,
     system: bool,
-}
-
-/// 融合窗口信息（`app.windows-updated` 事件项）。
-#[derive(Clone, serde::Serialize)]
-struct AppWindowInfo {
-    window_id: u64,
-    serial: String,
-    package_name: String,
-    label: String,
-    state: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct AppWindowsInfo {
-    windows: Vec<AppWindowInfo>,
 }
 
 /// `app.list` 的完整结果：应用列表 + 融合模式是否可用。
@@ -154,6 +151,8 @@ fn session_to_info(session: &proto::SessionSummary) -> SessionInfo {
         clipboard_sync: session.clipboard_sync,
         notification_sync: session.notification_sync,
         audio_enabled: session.audio_enabled,
+        audio_state: session.audio_state.clone(),
+        audio_error: session.audio_error.clone(),
         volume: session.volume,
     }
 }
@@ -359,23 +358,51 @@ async fn get_apps(
     }
 }
 
-/// 在融合窗口（自研 fusion-viewer 连接 kulua-server 的虚拟显示器）中打开指定应用，返回 window_id。
+/// 打开应用的融合窗口：daemon 拉起 kulua-server 虚拟显示器会话元数据，
+/// UI 创建 WebviewWindow 并自建 video-only UDP 客户端直连 phone。
+///
+/// 返回 window_id；视频流由 `fusion_start` 命令启动（融合窗口 JS 加载后调用）。
 #[tauri::command]
 async fn open_app(
+    app: AppHandle,
     state: State<'_, AppState>,
     uuid: String,
     package_name: String,
 ) -> Result<u64, String> {
-    let params = request::Payload::AppOpenParams(request::AppOpenParams { uuid, package_name });
+    let params = request::Payload::AppOpenParams(request::AppOpenParams {
+        uuid: uuid.clone(),
+        package_name: package_name.clone(),
+    });
     let resp = ipc_request(&state, "app.open", Some(params)).await?;
     check_response(&resp)?;
     match resp.result {
-        Some(response::Payload::AppOpen(open)) => Ok(open.window_id),
+        Some(response::Payload::AppOpen(open)) => {
+            if open.addr.is_empty() {
+                return Err("daemon 未返回设备直连地址".into());
+            }
+            let label = format!("fusion-{}", open.window_id);
+            let title = format!("{} — Kulua", package_name);
+
+            // 融合窗口页面：/fusion.html?addr=..&port=..&package=..&window_id=..
+            // addr 是 ip:port（URL 安全），包名是 Java 标识符（URL 安全），直接拼接。
+            let port = open.addr.rsplit(':').next().unwrap_or("").to_string();
+            let url = format!(
+                "/fusion.html?addr={}&port={}&package={}&window_id={}",
+                open.addr, port, package_name, open.window_id
+            );
+
+            tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+                .title(&title)
+                .inner_size(1280.0, 960.0)
+                .min_inner_size(480.0, 360.0)
+                .build()
+                .map_err(|e| format!("创建融合窗口失败: {}", e))?;
+
+            Ok(open.window_id)
+        }
         _ => Err("daemon 返回了意外的 app.open 结果".into()),
     }
 }
-
-// ── IPC Client ──
 
 async fn connect_daemon(app: AppHandle) {
     let port_path = std::env::temp_dir().join("sync-daemon.port");
@@ -485,22 +512,6 @@ async fn connect_daemon(app: AppHandle) {
                                     };
                                     let _ = app.emit("notification-received", &payload);
                                 }
-                                Some(event::Payload::AppWindowsUpdated(data)) => {
-                                    let payload = AppWindowsInfo {
-                                        windows: data
-                                            .windows
-                                            .iter()
-                                            .map(|w| AppWindowInfo {
-                                                window_id: w.window_id,
-                                                serial: w.serial.clone(),
-                                                package_name: w.package_name.clone(),
-                                                label: w.label.clone(),
-                                                state: w.state.clone(),
-                                            })
-                                            .collect(),
-                                    };
-                                    let _ = app.emit("app-windows-updated", &payload);
-                                }
                                 None => {}
                             }
                         }
@@ -590,6 +601,7 @@ pub fn run() {
             ipc_tx: Mutex::new(None),
             // 1/2 保留给启动握手的 device.list / pairing.info
             next_id: AtomicU64::new(3),
+            fusion_sessions: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_devices,
@@ -604,7 +616,31 @@ pub fn run() {
             set_scrcpy_params,
             get_apps,
             open_app,
+            fusion::fusion_start,
+            fusion::fusion_touch,
+            fusion::fusion_scroll,
+            fusion::fusion_key,
+            fusion::fusion_text,
+            fusion::fusion_back,
+            fusion::fusion_resize,
+            fusion::fusion_close,
         ])
+        .on_window_event(|window, event| {
+            // 融合窗口销毁 → 通知主窗口更新计数（UI 本地维护窗口列表）
+            if matches!(event, tauri::WindowEvent::Destroyed)
+                && window.label().starts_with("fusion-")
+            {
+                let _ = window
+                    .app_handle()
+                    .emit("fusion-window-closed", window.label());
+                let _ = window
+                    .app_handle()
+                    .state::<AppState>()
+                    .fusion_sessions
+                    .lock()
+                    .remove(window.label());
+            }
+        })
         .setup(|app| {
             let h = app.handle().clone();
             tauri::async_runtime::spawn(async move {

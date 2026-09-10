@@ -18,7 +18,8 @@ import kulua.direct.HelloAck;
  *
  * 职责：
  * - 与 PC 端 control 流的可靠收发（Receiver 处理 PC→phone，Sender 推送 phone→PC）
- * - 本客户端的虚拟显示器（DisplayRegistry）+ 音频捕获（AudioCapture）
+ * - 本客户端的虚拟显示器（DisplayRegistry）+ 音频生命周期（{@link AudioLink}，
+ *   采集器本身见 {@link AudioCapture}）
  * - 空闲超时 / BYE 拆除
  *
  * 媒体（audio/video）由各自编码线程通过 {@link #sendMedia} 推给 PC；
@@ -54,7 +55,8 @@ final class ClientConnection {
     private final ReliableControl.Receiver ctrlReceiver = new ReliableControl.Receiver();
 
     private final DisplayRegistry displays = new DisplayRegistry();
-    private AudioCapture audio;
+    /** 音频生命周期控制面（启停串行在它自己的线程上）。 */
+    private final AudioLink audio;
     private final boolean wantAudio;
 
     private volatile long lastActivityNanos = System.nanoTime();
@@ -92,9 +94,10 @@ final class ClientConnection {
         startStats();
         sendHelloAck();
         Clipboard.addChangeListener(clipboardListener);
-        if (wantAudio) {
-            startAudio(options.audioCodec, false);
-        }
+        // 初始音频来自 HELLO（会话级）：代次从 0 起，之后一切启停/编码变更走 SetAudio。
+        audio = new AudioLink(this, wantAudio, options.audioBitRate, options.audioCodec);
+        // 字段赋值后再启动：采集线程的就绪/失败回执要经本会话转发
+        audio.start();
     }
 
     /** 启动空闲超时看门狗：60s 无任何 datagram → 拆除本客户端。 */
@@ -139,7 +142,9 @@ final class ClientConnection {
                         + " ctrl_pending=" + ctrlSender.pending()
                         + (ctrlSender.isStalled() ? " STALLED" : "")
                         + " v_ep=" + (videoEndpoint != null)
-                        + " a_ep=" + (audioEndpoint != null));
+                        + " a_ep=" + (audioEndpoint != null)
+                        + " audio=" + (audio.enabled() ? "on" : "off")
+                        + " rev=" + audio.revision());
             }
         }, "client-stats-" + addr.getPort());
         statsThread.setDaemon(true);
@@ -298,21 +303,20 @@ final class ClientConnection {
         }
     }
 
-    /** 启动音频捕获（wantAudio 客户端的音频流/热切换）。 */
-    void startAudio(String codecName, boolean hotSwitch) {
-        if (audio != null) {
-            audio.stop();
-            audio = null;
-        }
-        audio = new AudioCapture(codecName, options.audioBitRate, this);
-        audio.start();
-        if (hotSwitch) {
-            // codec 热切换后回执（首次由 HELLO_ACK 带出）
-            sendCtrlMsg(CtrlMsg.newBuilder()
-                    .setAudioReady(kulua.direct.AudioReady.newBuilder()
-                            .setCodecId(codecIdFor(codecName)))
-                    .build());
-        }
+    /**
+     * 应用音频目标（SetAudio）：转发给 {@link AudioLink}（启停串行在它的专用线程上，
+     * 不能占 ctrl 线程）。
+     */
+    void applyAudio(boolean enabled, int codecIndex, long revision) {
+        audio.applyAudio(enabled, codecIndex, revision);
+    }
+
+    /**
+     * 采集线程的音频状态变化（就绪 / 失败 / 自愈恢复）：转发给 {@link AudioLink}
+     * 转成 AudioState 回执。
+     */
+    void onAudioCaptureState(long revision, boolean enabled, String error) {
+        audio.onAudioCaptureState(revision, enabled, error);
     }
 
     /** 创建视频虚拟显示器（fusion-viewer 的 CreateDisplay）。 */
@@ -366,23 +370,29 @@ final class ClientConnection {
         ctrlSender.sendCtrlMsg(msg);
     }
 
-    /** 可靠发送媒体 config 帧（AAC ADTS / FLAC STREAMINFO / H.264 SPS+PPS）。 */
-    void sendMediaConfig(int stream, byte[] data) {
+    /**
+     * 可靠发送媒体 config 帧（AAC AudioSpecificConfig / FLAC STREAMINFO / H.264 SPS+PPS）。
+     *
+     * {@code revision} 是该 config 所属音频代次（视频恒 0）：PC 只接受当前代次的
+     * config，避免旧代次的参数集被用来初始化解码器。
+     */
+    void sendMediaConfig(int stream, byte[] data, long revision) {
         sendCtrlMsg(CtrlMsg.newBuilder()
                 .setMediaConfig(kulua.direct.MediaConfig.newBuilder()
                         .setStream(stream)
-                        .setData(ByteString.copyFrom(data)))
+                        .setData(ByteString.copyFrom(data))
+                        .setRevision(revision))
                 .build());
     }
 
     /**
-     * 尽力而为发送媒体分片（audio/video）：25B 定长头 + ≤1200B 负载，
+     * 尽力而为发送媒体分片（audio/video）：33B 定长头 + ≤1200B 负载，
      * 从对应媒体端口 socket 发往登记端点。
      *
-     * 每条消息共享 {@code msgSeq}/{@code msgId}，分片携带 pts/flags（接收侧以
-     * frag==0 的值为准）；端点未登记（OPEN 未到/已拆除）时静默丢弃。
+     * 每条消息共享 {@code msgSeq}/{@code msgId}，分片携带 pts/revision/flags
+     * （接收侧以 frag==0 的值为准）；端点未登记（OPEN 未到/已拆除）时静默丢弃。
      */
-    void sendMedia(int stream, int msgSeq, long pts, int flags, byte[] data) {
+    void sendMedia(int stream, int msgSeq, long pts, long revision, int flags, byte[] data) {
         InetSocketAddress dst =
                 stream == MEDIA_STREAM_AUDIO ? audioEndpoint : videoEndpoint;
         if (dst == null) {
@@ -404,7 +414,7 @@ final class ClientConnection {
             int start = i * ReliableControl.MAX_FRAGMENT;
             int len = Math.min(data.length - start, ReliableControl.MAX_FRAGMENT);
             server.sendMediaRaw(stream, dst, MediaDatagram.encode(
-                    clientId, msgId, msgSeq, i, total, pts, flags, data, start, len));
+                    clientId, msgId, msgSeq, i, total, pts, revision, flags, data, start, len));
         }
     }
 
@@ -435,10 +445,8 @@ final class ClientConnection {
                 + (ctrlSender.isStalled() ? " SENDER_STALLED" : ""));
         ctrlSender.stop();
         Clipboard.removeChangeListener(clipboardListener);
-        if (audio != null) {
-            audio.stop();
-            audio = null;
-        }
+        // 音频收尾排在在途切换之后（可能正在重启采集），且不阻塞 ctrl/看门狗线程
+        audio.close();
         displays.destroyAll();
         server.removeClient(this);
     }

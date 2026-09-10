@@ -1,46 +1,31 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import QRCode from "qrcode";
+import type {
+  AdbDevice,
+  AdbRow,
+  AppInfo,
+  DeviceConfig,
+  DeviceInfo,
+  LocalFusionWindow,
+  PairingInfo,
+  ScrcpyDraft,
+  SettingsPayload,
+  SettingsState,
+} from "./types";
+import { sessionStateText } from "./utils";
+import AdbList from "./components/AdbList.vue";
+import AppPickerModal from "./components/AppPickerModal.vue";
+import DeviceCard from "./components/DeviceCard.vue";
+import PairingQr from "./components/PairingQr.vue";
+import SettingsPanel from "./components/SettingsPanel.vue";
 
-interface DeviceInfo {
-  uuid: string;
-  serial: string;
-  state: string;
-  name: string;
-}
-
-interface PairingInfo {
-  dns_id: string;
-  psk: string;
-  wifi_string: string;
-}
-interface DeviceConfig {
-  clipboardSync: boolean;
-  notificationSync: boolean;
-  audioSync: boolean;
-  volume: number;
-}
-// 设备上的一个可启动应用（app.list 结果项）
-interface AppInfo {
-  package_name: string;
-  label: string;
-  system: boolean;
-}
-// 融合窗口信息（app.windows-updated 事件项）
-interface AppWindowInfo {
-  window_id: number;
-  serial: string;
-  package_name: string;
-  label: string;
-  state: string;
-}
 const connected = ref(false);
 const theme = ref(localStorage.getItem("theme") || "dark");
 watch(theme, (v) => {
   localStorage.setItem("theme", v);
-  nextTick(() => rerenderQR());
+  // 主题变化后的二维码重绘由 PairingQr 监听 theme prop 自行完成
 });
 function toggleTheme() {
   theme.value = theme.value === "dark" ? "light" : "dark";
@@ -51,26 +36,6 @@ function setTheme(mode: "dark" | "light") {
 const devices = ref<DeviceInfo[]>([]);
 // 当前页面：设备卡片 / ADB 连接 / 设置
 const view = ref<"devices" | "adb" | "settings">("devices");
-// 设置：开机自启动 + 编码参数
-interface SettingsState {
-  autostartEnabled: boolean;
-  autostartSupported: boolean;
-  videoBitRate: number; // bps
-  videoMaxSize: number; // px, 0=不限
-  videoMaxFps: number; // fps, 0=不限
-  audioBitRate: number; // bps
-  audioCodec: string; // opus/aac/flac/raw
-}
-// daemon 返回的原始设置字段（snake_case）
-type SettingsPayload = {
-  autostart_enabled: boolean;
-  autostart_supported: boolean;
-  video_bit_rate: number;
-  video_max_size: number;
-  video_max_fps: number;
-  audio_bit_rate: number;
-  audio_codec: string;
-};
 const settings = ref<SettingsState>({
   autostartEnabled: false,
   autostartSupported: false,
@@ -81,7 +46,7 @@ const settings = ref<SettingsState>({
   audioCodec: "opus",
 });
 // 设置页本地编辑中的编码参数（Mbps / kbps 显示单位）
-const scrcpyDraft = ref({
+const scrcpyDraft = ref<ScrcpyDraft>({
   videoBitRateMbps: 8,
   videoMaxSize: 0,
   videoMaxFps: 0,
@@ -152,7 +117,7 @@ async function saveScrcpyParams() {
   }
 }
 // adb 原始设备列表（含 Offline/Unauthorized）
-const adbDevices = ref<Array<{ serial: string; state: string }>>([]);
+const adbDevices = ref<AdbDevice[]>([]);
 const adbStateTextMap: Record<string, string> = {
   Device: "已连接",
   Offline: "离线",
@@ -167,18 +132,19 @@ function adbName(serial: string): string {
 }
 const error = ref("");
 const pairingInfo = ref<PairingInfo | null>(null);
-const qrCanvas = ref<HTMLCanvasElement | null>(null);
 const deviceConfigs = ref<Record<string, DeviceConfig>>({});
 // session 生命周期状态（来自 sessions-updated，按 uuid）
 const sessionStates = ref<Record<string, string>>({});
 // 音频缓冲延迟 ms（来自 sessions-updated，按 uuid）
 const audioBuffers = ref<Record<string, number>>({});
-const sessionStateText: Record<string, string> = {
-  connecting: "连接中",
-  running: "运行中",
-  failed: "连接失败",
-  stopped: "已停止",
-};
+// 音频运行态（off | starting | on | stopping | failed）与失败原因
+const audioStates = ref<Record<string, string>>({});
+const audioErrors = ref<Record<string, string>>({});
+// 切换中（命令已下发，等设备回执）：UI 开关已显示目标值，这里给出"尚未生效"反馈
+function audioPending(uuid: string): boolean {
+  const s = audioStates.value[uuid];
+  return s === "starting" || s === "stopping";
+}
 function getDeviceConfig(uuid: string): DeviceConfig {
   if (!deviceConfigs.value[uuid]) {
     deviceConfigs.value[uuid] = {
@@ -287,6 +253,18 @@ async function startAdbSession(serial: string, state: string) {
     console.error("start_session failed:", e);
   }
 }
+// ADB 列表的展示行（派生数据在此算好，AdbList 只负责渲染）
+const adbRows = computed<AdbRow[]>(() =>
+  adbDevices.value.map((d) => ({
+    serial: d.serial,
+    state: d.state,
+    stateText: adbStateText(d.state),
+    name: adbName(d.serial),
+    sessionState: adbSessionState(d.serial),
+    sessionStateText: adbSessionStateText(d.serial),
+    clickable: canStartAdbSession(d.serial, d.state),
+  }))
+);
 // 会话总数（含 failed 墓碑），tab 徽标用
 const sessionCount = computed(() => Object.keys(sessionStates.value).length);
 // ── 应用选择器（融合模式）──
@@ -300,12 +278,12 @@ const hideSystemApps = ref(false);
 // 正在打开的应用包名（点击后 loading 防重复）
 const openingApp = ref<string | null>(null);
 const openFeedback = ref("");
-// daemon 是否找到 fusion-viewer.exe（false 时提示不可用）
+// 融合模式由 UI 进程内嵌 WebCodecs 渲染，恒可用
 const fusionSupported = ref(true);
-// 融合窗口列表（app.windows-updated 事件，全设备）
-const fusionWindows = ref<AppWindowInfo[]>([]);
+// 融合窗口列表（UI 本地维护：open_app 成功时记录，fusion-window-closed 时移除）
+const fusionWindows = ref<LocalFusionWindow[]>([]);
 
-function fusionWindowsOf(serial: string): AppWindowInfo[] {
+function fusionWindowsOf(serial: string): LocalFusionWindow[] {
   return fusionWindows.value.filter((w) => w.serial === serial);
 }
 
@@ -345,9 +323,16 @@ async function openApp(app: AppInfo) {
   openingApp.value = app.package_name;
   openFeedback.value = "";
   try {
-    await invoke<number>("open_app", {
+    const windowId = await invoke<number>("open_app", {
       uuid: appPicker.value.uuid,
       packageName: app.package_name,
+    });
+    // 本地记录窗口（serial 从设备列表取，用于按设备计数显示）
+    const dev = devices.value.find((d) => d.uuid === appPicker.value!.uuid);
+    fusionWindows.value.push({
+      windowId,
+      serial: dev?.serial ?? "",
+      label: app.label || app.package_name,
     });
     openFeedback.value = `正在打开 ${app.label || app.package_name}…`;
   } catch (e) {
@@ -358,20 +343,6 @@ async function openApp(app: AppInfo) {
   }
 }
 
-// 搜索 + 隐藏系统应用过滤
-const filteredApps = computed(() => {
-  let list = apps.value;
-  if (hideSystemApps.value) {
-    list = list.filter((a) => !a.system);
-  }
-  const q = appsSearch.value.trim().toLowerCase();
-  if (q) {
-    list = list.filter(
-      (a) => a.label.toLowerCase().includes(q) || a.package_name.toLowerCase().includes(q)
-    );
-  }
-  return list;
-});
 function updateUI(conn: boolean, devs: DeviceInfo[]) {
   connected.value = conn;
   devices.value = devs;
@@ -396,25 +367,6 @@ async function refresh() {
   }
 }
 
-async function renderQR(info: PairingInfo) {
-  pairingInfo.value = info;
-  await nextTick();
-  renderQRCanvas();
-}
-function renderQRCanvas() {
-  const info = pairingInfo.value;
-  if (!info || !qrCanvas.value) return;
-  const isDark = theme.value === "dark";
-  QRCode.toCanvas(qrCanvas.value, info.wifi_string, {
-    width: 200,
-    margin: 2,
-    color: { dark: isDark ? "#e0e0e0" : "#333", light: isDark ? "#16213e" : "#fff" },
-  }).catch((e) => console.error("QR render error:", e));
-}
-function rerenderQR() {
-  renderQRCanvas();
-}
-
 onMounted(async () => {
   listen<DeviceInfo[]>("devices-updated", (e) => {
     updateUI(connected.value, e.payload);
@@ -431,27 +383,36 @@ onMounted(async () => {
     adbDevices.value = e.payload;
   });
   listen<PairingInfo>("pairing-info-updated", (e) => {
-    renderQR(e.payload);
+    pairingInfo.value = e.payload;
   });
-  listen<{ windows: AppWindowInfo[] }>("app-windows-updated", (e) => {
-    fusionWindows.value = e.payload.windows;
+  listen<string>("fusion-window-closed", (e) => {
+    // 融合窗口销毁（Rust 侧 Destroyed 事件）→ 移出本地列表
+    const closedId = Number(e.payload.replace("fusion-", ""));
+    fusionWindows.value = fusionWindows.value.filter((w) => w.windowId !== closedId);
   });
-  listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; volume: number; session_state: string; audio_buffer_ms: number }> }>("sessions-updated", (e) => {
+  listen<{ sessions: Array<{ uuid: string; clipboard_sync: boolean; notification_sync: boolean; audio_enabled: boolean; audio_state: string; audio_error: string; volume: number; session_state: string; audio_buffer_ms: number }> }>("sessions-updated", (e) => {
     // 全量推送：同步重建状态表（列表外的 uuid 状态清除）
     const next: Record<string, string> = {};
     const nextBuffers: Record<string, number> = {};
+    const nextAudioStates: Record<string, string> = {};
+    const nextAudioErrors: Record<string, string> = {};
     for (const s of e.payload.sessions) {
       deviceConfigs.value[s.uuid] = {
         clipboardSync: s.clipboard_sync,
         notificationSync: s.notification_sync,
+        // 开关呈现"目标值"：设备回执慢/失败也不回弹，另用状态标记呈现进度与错误
         audioSync: s.audio_enabled,
         volume: s.volume,
       };
       next[s.uuid] = s.session_state;
       nextBuffers[s.uuid] = s.audio_buffer_ms;
+      nextAudioStates[s.uuid] = s.audio_state;
+      nextAudioErrors[s.uuid] = s.audio_error;
     }
     sessionStates.value = next;
     audioBuffers.value = nextBuffers;
+    audioStates.value = nextAudioStates;
+    audioErrors.value = nextAudioErrors;
   });
 
   // load existing state
@@ -461,7 +422,7 @@ onMounted(async () => {
     .catch((e) => console.error("get_adb_devices failed:", e));
   const existing = await invoke<PairingInfo | null>("get_pairing_info");
   if (existing) {
-    renderQR(existing);
+    pairingInfo.value = existing;
   }
   loadSettings();
 });
@@ -485,222 +446,49 @@ onMounted(async () => {
       <div v-if="view === 'devices'" class="device-list">
         <div v-if="!connected" class="hint">正在连接 daemon…</div>
         <div v-else-if="devices.length === 0" class="hint">暂无在线设备</div>
-        <div
+        <DeviceCard
           v-for="d in devices"
           :key="d.uuid"
-          class="device-card"
-        >
-          <div class="device-header">
-            <div class="device-title">
-              <span class="device-name">{{ d.name || d.serial }}</span>
-              <span class="serial">{{ d.serial }}</span>
-            </div>
-            <div class="device-states">
-              <span class="state" :class="stateClass(d.state)">{{ d.state }}</span>
-              <span v-if="sessionStates[d.uuid]" class="session-state" :class="'session-' + sessionStates[d.uuid]">
-                {{ sessionStateText[sessionStates[d.uuid]] || sessionStates[d.uuid] }}
-              </span>
-              <span v-else class="session-state session-none">未建立会话</span>
-            </div>
-          </div>
-          <div class="device-toggles">
-            <div class="toggle-row" @click="toggleClipboardSync(d.uuid)">
-              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).clipboardSync }" />
-              <span class="toggle-label">剪贴板</span>
-            </div>
-            <div class="toggle-row" @click="toggleNotificationSync(d.uuid)">
-              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).notificationSync }" />
-              <span class="toggle-label">通知</span>
-            </div>
-            <div class="toggle-row" @click="toggleAudioSync(d.uuid)">
-              <div class="toggle-switch" :class="{ active: getDeviceConfig(d.uuid).audioSync }" />
-              <span class="toggle-label">音频</span>
-              <span
-                v-if="getDeviceConfig(d.uuid).audioSync && audioBuffers[d.uuid] > 0"
-                class="audio-latency"
-                :class="{ high: audioBuffers[d.uuid] >= 200 }"
-                :title="'播放队列积压 ' + audioBuffers[d.uuid] + 'ms（延迟高时优先检查此项）'"
-              >
-                缓冲 {{ audioBuffers[d.uuid] }}ms
-              </span>
-            </div>
-            <div class="toggle-row" style="gap:4px">
-              <input
-                class="volume-slider"
-                type="range"
-                min="0" max="100"
-                :value="getDeviceConfig(d.uuid).volume"
-                @input="setVolume(d.uuid, Number(($event.target as HTMLInputElement).value))"
-              />
-              <span class="toggle-label">{{ getDeviceConfig(d.uuid).volume }}</span>
-            </div>
-          </div>
-          <div v-if="sessionStates[d.uuid] === 'failed'" class="retry-row">
-            <button class="retry-btn" @click="retrySession(d.uuid)">重试</button>
-          </div>
-          <!-- 融合模式：session 运行中才能打开应用窗口 -->
-          <div v-if="sessionStates[d.uuid] === 'running'" class="fusion-row">
-            <button class="apps-btn" @click="openAppPicker(d.uuid, d.name || d.serial)">
-              应用
-            </button>
-            <span v-if="fusionWindowsOf(d.serial).length > 0" class="fusion-count">
-              {{ fusionWindowsOf(d.serial).length }} 个窗口
-            </span>
-          </div>
-        </div>
+          :device="d"
+          :config="getDeviceConfig(d.uuid)"
+          :session-state="sessionStates[d.uuid]"
+          :audio-state="audioStates[d.uuid]"
+          :audio-error="audioErrors[d.uuid]"
+          :audio-buffer="audioBuffers[d.uuid] ?? 0"
+          :audio-pending="audioPending(d.uuid)"
+          :fusion-window-count="fusionWindowsOf(d.serial).length"
+          @toggle-clipboard="toggleClipboardSync(d.uuid)"
+          @toggle-notification="toggleNotificationSync(d.uuid)"
+          @update-audio="toggleAudioSync(d.uuid)"
+          @update-volume="setVolume(d.uuid, $event)"
+          @retry="retrySession(d.uuid)"
+          @open-fusion="openAppPicker(d.uuid, d.name || d.serial)"
+        />
       </div>
       <!-- adb raw device list -->
-      <div v-else-if="view === 'adb'" class="adb-list">
-        <div v-if="!connected" class="hint">正在连接 daemon…</div>
-        <div v-else-if="adbDevices.length === 0" class="hint">无 ADB 设备</div>
-        <template v-else>
-          <div class="adb-tip">点击在线设备建立会话（每台设备一个会话）</div>
-          <div
-            v-for="d in adbDevices"
-            :key="d.serial"
-            class="adb-row"
-            :class="{ clickable: canStartAdbSession(d.serial, d.state) }"
-            @click="startAdbSession(d.serial, d.state)"
-          >
-            <div class="device-title">
-              <span class="device-name">{{ adbName(d.serial) || d.serial }}</span>
-              <span class="serial">{{ d.serial }}</span>
-            </div>
-            <div class="adb-states">
-              <span v-if="adbSessionState(d.serial)" class="session-state" :class="'session-' + adbSessionState(d.serial)">
-                {{ adbSessionStateText(d.serial) }}
-              </span>
-              <span class="state" :class="stateClass(d.state)">{{ adbStateText(d.state) }}</span>
-            </div>
-          </div>
-        </template>
-      </div>
+      <AdbList
+        v-else-if="view === 'adb'"
+        :connected="connected"
+        :rows="adbRows"
+        @start-session="startAdbSession"
+      />
       <!-- 设置 -->
-      <div v-else class="settings-panel">
-        <div class="section">外观</div>
-        <div class="settings-card">
-          <div class="toggle-row">
-            <span class="toggle-label">主题</span>
-            <div class="theme-segment">
-              <span
-                class="theme-option"
-                :class="{ active: theme === 'dark' }"
-                @click="setTheme('dark')"
-              >深色</span>
-              <span
-                class="theme-option"
-                :class="{ active: theme === 'light' }"
-                @click="setTheme('light')"
-              >浅色</span>
-            </div>
-          </div>
-        </div>
-        <div class="section">常规</div>
-        <div v-if="!connected" class="hint">正在连接 daemon…</div>
-        <template v-else>
-          <div v-if="settingsError" class="settings-error">{{ settingsError }}</div>
-          <div class="settings-card">
-            <div
-              class="toggle-row"
-              :class="{ disabled: !settings.autostartSupported }"
-              @click="toggleAutostart"
-            >
-              <div class="toggle-switch" :class="{ active: settings.autostartEnabled }" />
-              <span class="toggle-label">开机自启动</span>
-              <span v-if="!settings.autostartSupported" class="settings-note">当前平台不支持</span>
-            </div>
-            <div class="settings-help">
-              开启后，登录系统时自动在后台运行 daemon（托盘驻留），点击托盘“打开”再显示窗口。
-            </div>
-          </div>
-        </template>
-        <div class="section">编码设置</div>
-        <div v-if="!connected" class="hint">正在连接 daemon…</div>
-        <template v-else>
-          <div class="settings-card">
-            <div class="settings-field">
-              <span class="settings-field-label">视频码率 (Mbps)</span>
-              <input
-                class="settings-input"
-                type="number"
-                min="0"
-                step="0.5"
-                v-model.number="scrcpyDraft.videoBitRateMbps"
-              />
-            </div>
-            <div class="settings-field">
-              <span class="settings-field-label">最大分辨率 (px，0=不限)</span>
-              <input
-                class="settings-input"
-                type="number"
-                min="0"
-                step="1"
-                v-model.number="scrcpyDraft.videoMaxSize"
-              />
-            </div>
-            <div class="settings-field">
-              <span class="settings-field-label">最大帧率 (fps，0=不限)</span>
-              <input
-                class="settings-input"
-                type="number"
-                min="0"
-                step="1"
-                v-model.number="scrcpyDraft.videoMaxFps"
-              />
-            </div>
-            <div class="settings-field">
-              <span class="settings-field-label">音频码率 (kbps)</span>
-              <input
-                class="settings-input"
-                type="number"
-                min="0"
-                step="8"
-                v-model.number="scrcpyDraft.audioBitRateKbps"
-              />
-            </div>
-            <div class="settings-field">
-              <span class="settings-field-label">音频编码器</span>
-              <select class="settings-input" v-model="scrcpyDraft.audioCodec">
-                <option value="opus">OPUS（默认）</option>
-                <option value="aac">AAC</option>
-                <option value="flac">FLAC</option>
-                <option value="raw">RAW（PCM）</option>
-              </select>
-            </div>
-            <div class="settings-save-row">
-              <button class="save-btn" @click="saveScrcpyParams">保存</button>
-              <span class="settings-help-inline">0 表示不限制 / 使用 server 默认值；音频编码保存后立即生效（热切换，不重启会话）</span>
-            </div>
-          </div>
-        </template>
-      </div>
+      <SettingsPanel
+        v-else
+        :connected="connected"
+        :settings="settings"
+        :draft="scrcpyDraft"
+        :settings-error="settingsError"
+        :theme="theme"
+        @set-theme="setTheme"
+        @toggle-autostart="toggleAutostart"
+        @save="saveScrcpyParams"
+      />
       <!-- error -->
       <div v-if="error" class="error">{{ error }}</div>
     </div>
     <div class="right-panel">
-      <!-- pairing qr code -->
-      <div v-if="pairingInfo" class="qr-section">
-        <div class="section">连接二维码</div>
-        <div class="qr-card">
-          <canvas ref="qrCanvas" class="qr-canvas"></canvas>
-          <div class="qr-info">
-            <div class="qr-row">
-              <span class="qr-label">地址</span>
-              <span class="qr-value mono">{{ pairingInfo.dns_id }}</span>
-            </div>
-            <div class="qr-row">
-              <span class="qr-label">配对码</span>
-              <span class="qr-value mono">{{ pairingInfo.psk }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div v-else class="qr-placeholder">
-        <div class="section">连接二维码</div>
-        <div class="placeholder-card">
-          <span class="placeholder-text">等待 daemon 提供配对信息…</span>
-        </div>
-      </div>
+      <PairingQr :info="pairingInfo" :theme="theme" />
       <div class="status-bar">
         <span class="theme-btn" @click="toggleTheme" :title="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'">
           <svg v-if="theme === 'dark'" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -723,63 +511,23 @@ onMounted(async () => {
     </div>
 
     <!-- 应用选择器（融合模式弹层） -->
-    <div v-if="appPicker" class="modal-overlay" @click.self="appPicker = null">
-      <div class="modal">
-        <div class="modal-header">
-          <span class="modal-title">打开应用 — {{ appPicker.name }}</span>
-          <span class="modal-close" @click="appPicker = null">✕</span>
-        </div>
-        <div v-if="!fusionSupported" class="modal-error">
-          未找到 fusion-viewer.exe：请将其放入 daemon 同目录后重启 daemon。
-        </div>
-        <template v-else>
-          <div class="modal-toolbar">
-            <input
-              class="modal-search"
-              v-model="appsSearch"
-              placeholder="搜索应用名 / 包名"
-            />
-            <label class="modal-hide">
-              <input type="checkbox" v-model="hideSystemApps" /> 隐藏系统应用
-            </label>
-            <button class="modal-refresh" :disabled="appsLoading" @click="loadApps(true)">
-              刷新
-            </button>
-          </div>
-          <div v-if="appsLoading" class="modal-hint">正在枚举设备应用…</div>
-          <div v-else-if="appsError" class="modal-error">{{ appsError }}</div>
-          <div v-else-if="filteredApps.length === 0" class="modal-hint">没有匹配的应用</div>
-          <div v-else class="modal-list">
-            <div
-              v-for="a in filteredApps"
-              :key="a.package_name"
-              class="modal-app"
-              :class="{ system: a.system, disabled: openingApp !== null }"
-              @click="openApp(a)"
-            >
-              <div class="modal-app-name">
-                {{ a.label || a.package_name }}
-                <span v-if="openingApp === a.package_name" class="modal-opening">打开中…</span>
-              </div>
-              <div class="modal-app-pkg">
-                {{ a.package_name }}
-                <span v-if="a.system" class="modal-badge">系统</span>
-              </div>
-            </div>
-          </div>
-          <div v-if="openFeedback" class="modal-feedback">{{ openFeedback }}</div>
-          <div class="modal-help">点击应用后以融合模式（独立窗口）打开，可同时打开多个</div>
-        </template>
-      </div>
-    </div>
+    <AppPickerModal
+      v-if="appPicker"
+      :picker="appPicker"
+      :fusion-supported="fusionSupported"
+      :apps="apps"
+      :apps-loading="appsLoading"
+      :apps-error="appsError"
+      :opening-app="openingApp"
+      :open-feedback="openFeedback"
+      v-model:search="appsSearch"
+      v-model:hide-system="hideSystemApps"
+      @close="appPicker = null"
+      @refresh="loadApps(true)"
+      @open-app="openApp"
+    />
   </div>
 </template>
-
-<script lang="ts">
-function stateClass(s: string): string {
-  return s.replace(/[^a-zA-Z]/g, "");
-}
-</script>
 
 <style>
 :root {
@@ -919,6 +667,11 @@ body {
 .audio-latency.high {
   color: var(--red);
 }
+.audio-state {
+  font-size: 11px; font-weight: 500;
+}
+.audio-pending { color: #f0c040; }
+.audio-failed { color: var(--red); }
 .retry-row {
   display: flex; justify-content: flex-end;
 }

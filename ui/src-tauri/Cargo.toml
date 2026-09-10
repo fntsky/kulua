@@ -31,4 +31,5 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 futures = "0.3"
+kulua-proto = { path = "../../kulua-proto" }
 bytes = "1"

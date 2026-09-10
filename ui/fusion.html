@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<!--
+  Kulua 融合窗口页面（独立于 Vite 主 UI，无构建依赖）。
+
+  数据流：
+    Rust video pump（UdpSession → Channel）→ 本页 WebCodecs 解码 → canvas GPU 渲染
+    DOM 输入事件 → invoke('fusion_touch'/'fusion_key'/...) → Rust → UDP ctrl 注入
+
+  URL 参数：?addr=<ip:port>&port=<n>&package=<pkg>&window_id=<id>
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>融合窗口</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+  }
+  #video {
+    width: 100vw; height: 100vh;
+    display: block;
+    object-fit: contain;
+  }
+  /* HUD：左上角调试面板，F1 切换 */
+  #hud {
+    position: fixed; top: 8px; left: 8px;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    font: 12px/1.6 Consolas, "Courier New", monospace;
+    padding: 8px 12px;
+    border-radius: 6px;
+    pointer-events: none;
+    white-space: pre;
+    z-index: 10;
+  }
+  #err {
+    position: fixed; bottom: 12px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(180, 30, 30, 0.85);
+    color: #fff;
+    font: 13px/1.5 system-ui, sans-serif;
+    padding: 8px 16px;
+    border-radius: 6px;
+    display: none;
+    max-width: 80%;
+    z-index: 11;
+  }
+</style>
+</head>
+<body>
+<canvas id="video"></canvas>
+<div id="hud"></div>
+<div id="err"></div>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("video");
+  const hudEl = document.getElementById("hud");
+  const errEl = document.getElementById("err");
+
+  function showErr(msg) {
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+  }
+
+  // ── URL 参数（先于 Tauri API 校验，保证异常路径也有可见提示）──
+  const params = new URLSearchParams(window.location.search);
+  const addr = params.get("addr") || "";
+  const pkg = params.get("package") || "";
+  const windowId = params.get("window_id") || "";
+  const windowLabel = `fusion-${windowId}`;
+
+  if (!addr || !pkg) {
+    showErr("缺少 addr/package 参数，无法启动视频流");
+    return;
+  }
+
+  // ── Tauri API（withGlobalTauri: true 注入；缺失说明页面脱离了 Tauri 容器）──
+  if (typeof window.__TAURI__ === "undefined") {
+    showErr("Tauri API 不可用：页面必须在 Kulua 应用窗口内打开");
+    return;
+  }
+  const invoke = window.__TAURI__.core.invoke;
+  const Channel = window.__TAURI__.core.Channel;
+
+  let displayId = 0;
+  let closed = false;
+
+  // ── WebCodecs 解码器 ──
+  let decoder = null;
+  /** 解码器是否已配置（MediaConfig 到达前不解码帧）。 */
+  let configured = false;
+  /**
+   * Annex-B 格式参数集（SPS/PPS，含起始码）。
+   *
+   * 部分设备（vivo 等）MediaCodec 吐的 csd 是 Annex-B 而非 avcC 记录，且 IDR
+   * 帧不带内联参数集——此时 WebCodecs 只能走无 description 模式，并把参数集
+   * 手动前缀到每个关键帧，否则解码器拿不到 SPS/PPS。
+   */
+  let annexbParams = null;
+
+  /** csd 是否为 Annex-B（3/4 字节起始码开头）。avcC 记录首字节必为 1。 */
+  function isAnnexb(d) {
+    if (d.length < 4) return false;
+    if (d[0] === 0 && d[1] === 0 && d[2] === 0 && d[3] === 1) return true;
+    return d[0] === 0 && d[1] === 0 && d[2] === 1;
+  }
+
+  function makeDecoder() {
+    return new VideoDecoder({
+      output: (frame) => {
+        drawFrame(frame);
+      },
+      error: (e) => {
+        console.error("[fusion] decode error:", e);
+        showErr("解码错误: " + e.message);
+      },
+    });
+  }
+
+  function drawFrame(frame) {
+    // 首帧时把 canvas 尺寸对齐视频分辨率（后续 letterbox 由 CSS contain 完成）
+    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(frame, 0, 0);
+    stats.frames++;
+    hud.frames++;
+    stats.lastFrameAt = performance.now();
+    frame.close();
+  }
+
+  /** 处理 Rust pump 推来的载荷。 */
+  function handlePayload(p) {
+    if (closed) return;
+    const data = new Uint8Array(p.data);
+    if (p.is_config) {
+      // 可靠 ctrl 流送达的 csd：avcC 记录走 description，Annex-B 走关键帧前缀
+      if (decoder && decoder.state !== "closed") decoder.close();
+      decoder = makeDecoder();
+      const cfg = { codec: "avc1.640029", hardwareAcceleration: "prefer-hardware" };
+      if (isAnnexb(data)) {
+        annexbParams = data;
+        console.log("[fusion] csd is Annex-B (", data.length, "B ), prepending to keyframes");
+      } else {
+        annexbParams = null;
+        cfg.description = data;
+      }
+      decoder.configure(cfg);
+      configured = true;
+      return;
+    }
+    if (!configured) {
+      // config 未到：Annex-B 兜底初始化；delta 帧直接丢弃等关键帧
+      if (decoder === null) {
+        decoder = makeDecoder();
+        decoder.configure({ codec: "avc1.640029", hardwareAcceleration: "prefer-hardware" });
+        configured = true;
+      } else if (!p.is_key) {
+        stats.dropped++;
+        return;
+      }
+    }
+    if (decoder.state !== "configured") { stats.dropped++; return; }
+    let chunkData = data;
+    if (annexbParams && p.is_key) {
+      // Annex-B 模式：参数集前缀到每个关键帧（IDR 不内联 SPS/PPS 的设备）
+      chunkData = new Uint8Array(annexbParams.length + data.length);
+      chunkData.set(annexbParams);
+      chunkData.set(data, annexbParams.length);
+    }
+    try {
+      decoder.decode(new EncodedVideoChunk({
+        type: p.is_key ? "key" : "delta",
+        timestamp: Number(p.pts),
+        data: chunkData,
+      }));
+      stats.decoded++;
+    } catch (e) {
+      console.error("[fusion] chunk error:", e);
+      stats.errors++;
+    }
+  }
+  // ── HUD 统计 ──
+  const stats = { frames: 0, decoded: 0, dropped: 0, errors: 0, lastFrameAt: 0 };
+  const hud = { windowStart: performance.now(), frames: 0 };
+  let hudVisible = true;
+  let fps = 0;
+
+  setInterval(() => {
+    const now = performance.now();
+    const dt = (now - hud.windowStart) / 1000;
+    fps = hud.frames / Math.max(dt, 0.001);
+    hud.frames = 0;
+    hud.windowStart = now;
+    // 距上帧
+    const since = stats.lastFrameAt ? (now - stats.lastFrameAt) / 1000 : -1;
+    if (hudVisible) {
+      hudEl.textContent =
+        `fps     ${fps.toFixed(0)}\n` +
+        `frames  ${stats.frames}\n` +
+        `dropped ${stats.dropped}\n` +
+        `errors  ${stats.errors}\n` +
+        `since   ${since < 0 ? "—" : since.toFixed(1) + "s"}\n` +
+        `display ${displayId}`;
+    }
+  }, 250);
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "F1") {
+      e.preventDefault();
+      hudVisible = !hudVisible;
+      hudEl.style.display = hudVisible ? "block" : "none";
+    }
+  });
+
+  // ── 启动视频流 ──
+  async function start() {
+    const channel = new Channel();
+    channel.onmessage = handlePayload;
+    try {
+      displayId = await invoke("fusion_start", {
+        addr,
+        package: pkg,
+        windowLabel,
+        channel,
+      });
+      console.log("[fusion] started, display_id =", displayId);
+    } catch (e) {
+      showErr("启动失败: " + e);
+    }
+  }
+
+  // ── 输入注入 ──
+
+  /** 把 DOM 坐标换算成视频坐标（object-fit: contain 的 letterbox 逆变换）。 */
+  function toVideoCoords(e) {
+    const vw = canvas.width, vh = canvas.height;
+    if (!vw || !vh) return null;
+    const rect = canvas.getBoundingClientRect();
+    // 实际显示区域（contain 缩放后居中）
+    const scale = Math.min(rect.width / vw, rect.height / vh);
+    const dispW = vw * scale, dispH = vh * scale;
+    const offX = (rect.width - dispW) / 2, offY = (rect.height - dispH) / 2;
+    const x = e.clientX - rect.left - offX;
+    const y = e.clientY - rect.top - offY;
+    if (x < 0 || y < 0 || x > dispW || y > dispH) return null;
+    return [Math.round(x / scale), Math.round(y / scale)];
+  }
+
+  let mouseDown = false;
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    mouseDown = true;
+    canvas.setPointerCapture(e.pointerId);
+    const c = toVideoCoords(e);
+    if (!c) return;
+    invoke("fusion_touch", {
+      windowLabel, action: 0,
+      x: c[0], y: c[1],
+      screenWidth: canvas.width, screenHeight: canvas.height,
+      pressure: 1.0,
+    }).catch(() => {});
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!mouseDown) return;
+    const c = toVideoCoords(e);
+    if (!c) return;
+    invoke("fusion_touch", {
+      windowLabel, action: 2,
+      x: c[0], y: c[1],
+      screenWidth: canvas.width, screenHeight: canvas.height,
+      pressure: 1.0,
+    }).catch(() => {});
+  });
+
+  canvas.addEventListener("pointerup", (e) => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    const c = toVideoCoords(e) || [0, 0];
+    invoke("fusion_touch", {
+      windowLabel, action: 1,
+      x: c[0], y: c[1],
+      screenWidth: canvas.width, screenHeight: canvas.height,
+      pressure: 0,
+    }).catch(() => {});
+  });
+
+  // 滚轮 → Android 滚动
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const c = toVideoCoords(e);
+    if (!c) return;
+    invoke("fusion_scroll", {
+      windowLabel,
+      x: c[0], y: c[1],
+      screenWidth: canvas.width, screenHeight: canvas.height,
+      scrollX: e.deltaX * -8,
+      scrollY: e.deltaY * -8,
+    }).catch(() => {});
+  }, { passive: false });
+
+  // 右键 → 返回键（DOWN + UP 配对）
+  canvas.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    invoke("fusion_back", { windowLabel, action: 0 }).catch(() => {});
+    setTimeout(() => invoke("fusion_back", { windowLabel, action: 1 }).catch(() => {}), 60);
+  });
+
+  // 键盘：特殊键走 keycode，可打印字符走文本注入（含 IME 提交）
+  const KEY_MAP = {
+    Enter: 66, Backspace: 67, Tab: 61, Escape: 4, // Esc=BACK
+    ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22,
+    Home: 3, // HOME
+  };
+
+  document.addEventListener("keydown", (e) => {
+    if (e.repeat) return; // keycode 层不自动重复；文本层由系统处理
+    const kc = KEY_MAP[e.key];
+    if (kc !== undefined) {
+      e.preventDefault();
+      invoke("fusion_key", { windowLabel, action: 0, keycode: kc }).catch(() => {});
+      return;
+    }
+    if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      invoke("fusion_text", { windowLabel, text: e.key }).catch(() => {});
+    }
+  });
+
+  document.addEventListener("keyup", (e) => {
+    const kc = KEY_MAP[e.key];
+    if (kc !== undefined) {
+      invoke("fusion_key", { windowLabel, action: 1, keycode: kc }).catch(() => {});
+    }
+  });
+
+  // ── 窗口 resize → RESIZE_DISPLAY（防抖 1s，与旧 viewer 一致）──
+  let resizeTimer = null;
+  let lastSentSize = "";
+
+  new ResizeObserver(() => {
+    if (!displayId) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      // 目标分辨率 = 窗口物理尺寸 ÷ dpr × 1（保持 1:1 物理像素），偶数对齐，上限 2560
+      const dpr = window.devicePixelRatio || 1;
+      let w = Math.round(canvas.clientWidth * dpr) & ~1;
+      let h = Math.round(canvas.clientHeight * dpr) & ~1;
+      w = Math.min(w, 2560); h = Math.min(h, 1440);
+      const key = `${w}x${h}`;
+      if (key === lastSentSize || w < 64 || h < 64) return;
+      lastSentSize = key;
+      invoke("fusion_resize", { windowLabel, width: w, height: h }).catch(() => {});
+      console.log("[fusion] resize ->", key);
+    }, 1000);
+  }).observe(document.body);
+
+  // ── 关闭收尾 ──
+  window.addEventListener("beforeunload", () => {
+    closed = true;
+    invoke("fusion_close", { windowLabel }).catch(() => {});
+  });
+
+  start();
+})();
+</script>
+</body>
+</html>

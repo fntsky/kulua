@@ -47,14 +47,6 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    /// 获取优先级最高的已有地址
-    pub fn best_serial(&self) -> Option<&str> {
-        self.usb
-            .as_deref()
-            .or_else(|| self.mdns.as_deref())
-            .or_else(|| self.ip.as_deref())
-    }
-
     /// 合并另一个 identity（较高优先级的地址覆盖较低优先级的）
     pub fn merge(&mut self, other: &DeviceIdentity) {
         if other.usb.is_some() {

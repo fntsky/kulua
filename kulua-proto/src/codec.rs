@@ -1,7 +1,7 @@
 //! Frame 编解码与媒体分片 / 重装辅助。
 //!
 //! control 端口：每个 UDP datagram = 恰好一个 `Frame`（protobuf 二进制）。
-//! 媒体端口（video=P+1 / audio=P+2）：每个 UDP datagram = 25B 大端定长头 +
+//! 媒体端口（video=P+1 / audio=P+2）：每个 UDP datagram = 33B 大端定长头 +
 //! 负载，字段布局见 `proto/direct.proto` 头注释。协议语义见
 //! `docs/direct-udp-protocol.md`。
 
@@ -11,7 +11,9 @@ use crate::generated::CtrlMsg;
 pub const MAX_FRAGMENT: usize = 1200;
 
 /// 媒体数据报定长头大小（client_id..flags，大端）。
-pub const MEDIA_HDR_LEN: usize = 25;
+///
+/// 布局见 `proto/direct.proto` 头部注释：24..32 是音频代次 `revision`，视频恒 0。
+pub const MEDIA_HDR_LEN: usize = 33;
 /// `frag_total` 的 OPEN 注册包标记（负载为空；PC → phone 登记媒体端点）。
 pub const MEDIA_OPEN_TOTAL: u16 = 0xFFFF;
 
@@ -29,7 +31,7 @@ pub const VIDEO_PORT_OFFSET: u16 = 1;
 /// 音频端口相对 ctrl 端口（P）的偏移。
 pub const AUDIO_PORT_OFFSET: u16 = 2;
 
-/// 一个媒体数据报（25B 头解析结果；payload 借用输入缓冲）。
+/// 一个媒体数据报（33B 头解析结果；payload 借用输入缓冲）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaFragment<'a> {
     pub client_id: u32,
@@ -38,11 +40,13 @@ pub struct MediaFragment<'a> {
     pub frag: u16,
     pub frag_total: u16,
     pub pts: u64,
+    /// 音频代次（= 产生本帧的采集器对应的 `SetAudio.revision`；视频恒 0）。
+    pub revision: u64,
     pub flags: u8,
     pub payload: &'a [u8],
 }
 
-/// 编码一个媒体数据报（25B 大端头 + 负载）追加到 `out`。
+/// 编码一个媒体数据报（33B 大端头 + 负载）追加到 `out`。
 pub fn encode_media_datagram(f: &MediaFragment, out: &mut Vec<u8>) {
     out.reserve(MEDIA_HDR_LEN + f.payload.len());
     out.extend_from_slice(&f.client_id.to_be_bytes());
@@ -51,11 +55,12 @@ pub fn encode_media_datagram(f: &MediaFragment, out: &mut Vec<u8>) {
     out.extend_from_slice(&f.frag.to_be_bytes());
     out.extend_from_slice(&f.frag_total.to_be_bytes());
     out.extend_from_slice(&f.pts.to_be_bytes());
+    out.extend_from_slice(&f.revision.to_be_bytes());
     out.push(f.flags);
     out.extend_from_slice(f.payload);
 }
 
-/// 解析媒体数据报；长度不足 25B 返回 None（payload 允许为空 = OPEN）。
+/// 解析媒体数据报；长度不足 33B 返回 None（payload 允许为空 = OPEN）。
 pub fn decode_media_datagram(buf: &[u8]) -> Option<MediaFragment<'_>> {
     if buf.len() < MEDIA_HDR_LEN {
         return None;
@@ -71,24 +76,27 @@ pub fn decode_media_datagram(buf: &[u8]) -> Option<MediaFragment<'_>> {
         frag: be16(12)?,
         frag_total: be16(14)?,
         pts: u64::from_be_bytes(buf.get(16..24)?.try_into().ok()?),
-        flags: *buf.get(24)?,
+        revision: u64::from_be_bytes(buf.get(24..32)?.try_into().ok()?),
+        flags: *buf.get(32)?,
         payload: &buf[MEDIA_HDR_LEN..],
     })
 }
 /// 把一段媒体负载切成多个数据报（共享 msg_seq/msg_id；每片都带全量
-/// 元数据，接收侧以 frag==0 的 pts/flags 为准）。
+/// 元数据，接收侧以 frag==0 的 pts/revision/flags 为准）。
+#[allow(clippy::too_many_arguments)]
 pub fn media_datagrams(
     client_id: u32,
     msg_seq: u32,
     msg_id: u32,
     pts: u64,
+    revision: u64,
     flags: u32,
     data: &[u8],
 ) -> Vec<Vec<u8>> {
     let total = if data.is_empty() {
         1
     } else {
-        (data.len() + MAX_FRAGMENT - 1) / MAX_FRAGMENT
+        data.len().div_ceil(MAX_FRAGMENT)
     };
     (0..total)
         .map(|i| {
@@ -103,6 +111,7 @@ pub fn media_datagrams(
                     frag: i as u16,
                     frag_total: if total == 1 { 0 } else { total as u16 },
                     pts,
+                    revision,
                     flags: flags as u8,
                     payload: &data[start..end],
                 },
@@ -125,8 +134,6 @@ pub struct MediaReassembler {
     parts: std::collections::HashMap<u32, Part>,
     /// 最近一次投递时间（超时清残留用）。
     last_emit: std::time::Instant,
-    /// 已判定丢失的媒体消息数（序号跳变 / 分片超时被清扫），供 HUD 丢包率。
-    lost: u64,
 }
 
 #[derive(Debug)]
@@ -136,6 +143,7 @@ struct Part {
     frags: Vec<Option<Vec<u8>>>,
     n: usize,
     pts: u64,
+    revision: u64,
     flags: u32,
     touched: std::time::Instant,
 }
@@ -144,8 +152,16 @@ struct Part {
 #[derive(Debug, Clone)]
 pub struct AssembledMedia {
     pub pts: u64,
+    /// 音频代次（视频恒 0）；接收侧据此丢弃上一代的残留帧。
+    pub revision: u64,
     pub flags: u32,
     pub data: Vec<u8>,
+}
+
+impl Default for MediaReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MediaReassembler {
@@ -154,7 +170,6 @@ impl MediaReassembler {
             last_seq: 0,
             parts: std::collections::HashMap::new(),
             last_emit: std::time::Instant::now(),
-            lost: 0,
         }
     }
 
@@ -191,6 +206,7 @@ impl MediaReassembler {
             self.parts.remove(&frag.msg_id);
             return Some(AssembledMedia {
                 pts: frag.pts,
+                revision: frag.revision,
                 flags: frag.flags as u32,
                 data,
             });
@@ -202,6 +218,7 @@ impl MediaReassembler {
             frags: vec![None; total],
             n: 0,
             pts: frag.pts,
+            revision: frag.revision,
             flags: frag.flags as u32,
             touched: std::time::Instant::now(),
         });
@@ -229,6 +246,7 @@ impl MediaReassembler {
             }
             Some(AssembledMedia {
                 pts: done.pts,
+                revision: done.revision,
                 flags: done.flags,
                 data: out,
             })
@@ -237,28 +255,16 @@ impl MediaReassembler {
         }
     }
 
-    /// 清理超时残留分片（重装不完整且太久无进展）；每条被清的消息计一次丢帧。
+    /// 清理超时残留分片（重装不完整且太久无进展）。
     pub fn sweep(&mut self, timeout: std::time::Duration) {
         let now = std::time::Instant::now();
-        let before = self.parts.len();
         self.parts
             .retain(|_, p| now.duration_since(p.touched) < timeout);
-        self.lost += (before - self.parts.len()) as u64;
     }
 
-    /// 记录一次成功输出消息的序号，并估算其间跳过（丢失）的消息数。
+    /// 记录一次成功输出消息的序号（乱序/重复判定用）。
     fn note_emitted(&mut self, seq: u32) {
-        if self.last_seq != 0 && seq > self.last_seq {
-            let gap = (seq - self.last_seq - 1) as u64;
-            // 上限 1024：防止异常流（序号错乱）把计数刷爆
-            self.lost += gap.min(1024);
-        }
         self.last_seq = seq;
-    }
-
-    /// 已判定丢失的消息数（丢包率 = lost / (lost + 成功输出数)）。
-    pub fn lost(&self) -> u64 {
-        self.lost
     }
 }
 
@@ -288,7 +294,7 @@ mod tests {
     #[test]
     fn media_datagrams_roundtrip() {
         let data: Vec<u8> = (0..2500).map(|i| (i % 251) as u8).collect();
-        let bufs = media_datagrams(7, 42, 11, 123, MEDIA_FLAG_KEYFRAME, &data);
+        let bufs = media_datagrams(7, 42, 11, 123, 9, MEDIA_FLAG_KEYFRAME, &data);
         let frags = decode_all(&bufs);
         assert!(frags.len() > 1);
         let mut reassembler = MediaReassembler::new();
@@ -301,6 +307,7 @@ mod tests {
         let m = got.expect("应重装完成");
         assert_eq!(m.data, data);
         assert_eq!(m.pts, 123);
+        assert_eq!(m.revision, 9, "分片头必须携带音频代次");
         assert_eq!(m.flags, MEDIA_FLAG_KEYFRAME);
         assert!(frags.iter().all(|f| f.client_id == 7 && f.seq == 42));
     }
@@ -316,6 +323,7 @@ mod tests {
                 frag: 0,
                 frag_total: MEDIA_OPEN_TOTAL,
                 pts: 0,
+                revision: 0,
                 flags: 0,
                 payload: &[],
             },
@@ -330,7 +338,7 @@ mod tests {
 
     #[test]
     fn media_dedup_stale_seq() {
-        let bufs = media_datagrams(1, 5, 0, 0, 0, &[1u8, 2, 3]);
+        let bufs = media_datagrams(1, 5, 0, 0, 0, 0, &[1u8, 2, 3]);
         let frags = decode_all(&bufs);
         assert_eq!(frags.len(), 1);
         let mut r = MediaReassembler::new();
@@ -344,8 +352,8 @@ mod tests {
         // 消息 A(10) 与 B(11) 分片交错到达，各自 msg_id 不同
         let da: Vec<u8> = vec![9; 2500];
         let db: Vec<u8> = vec![8; 2500];
-        let bufs_a = media_datagrams(1, 10, 1, 0, 0, &da);
-        let bufs_b = media_datagrams(1, 11, 2, 0, 0, &db);
+        let bufs_a = media_datagrams(1, 10, 1, 0, 0, 0, &da);
+        let bufs_b = media_datagrams(1, 11, 2, 0, 0, 0, &db);
         let fa = decode_all(&bufs_a);
         let fb = decode_all(&bufs_b);
         let mut r = MediaReassembler::new();
@@ -367,7 +375,7 @@ mod tests {
     #[test]
     fn lost_fragment_cleaned_by_sweep() {
         let data: Vec<u8> = vec![1; 2500];
-        let bufs = media_datagrams(1, 1, 5, 0, 0, &data);
+        let bufs = media_datagrams(1, 1, 5, 0, 0, 0, &data);
         let frags = decode_all(&bufs);
         assert!(frags.len() >= 2);
         let mut r = MediaReassembler::new();
@@ -379,9 +387,37 @@ mod tests {
         assert!(r.parts.is_empty());
     }
 
+    /// 33B 媒体头的字节布局是 Java（`kulua-server/MediaDatagram.java`）与 Rust
+    /// 之间的契约。这里的黄金样本由 Java 编码器实际产出（javac + java 跑
+    /// `encode(0x01020304, 0x11121314, 0x05060708, 1, 2, 0x0A0B0C0D0E0F1011,
+    /// 0x0102030405060708, 3, "ABCD")`），字段位置/宽度/字节序被改动即在两端
+    /// 失配——这个测试会先失败。
+    #[test]
+    fn media_header_layout_matches_java_encoder() {
+        let hex = "010203041112131405060708000100020a0b0c0d0e0f101101020304050607080341424344";
+        let wire: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            wire.len(),
+            MEDIA_HDR_LEN + 4,
+            "头长必须与 Java HEADER_SIZE 一致"
+        );
+        let f = decode_media_datagram(&wire).expect("Java 产出的字节必须能被 Rust 解析");
+        assert_eq!(f.client_id, 0x0102_0304);
+        assert_eq!(f.msg_id, 0x1112_1314);
+        assert_eq!(f.seq, 0x0506_0708);
+        assert_eq!(f.frag, 1);
+        assert_eq!(f.frag_total, 2);
+        assert_eq!(f.pts, 0x0A0B_0C0D_0E0F_1011);
+        assert_eq!(f.revision, 0x0102_0304_0506_0708);
+        assert_eq!(f.flags, 3);
+        assert_eq!(f.payload, b"ABCD");
+    }
+
     #[test]
     fn short_datagram_rejected() {
-        assert!(decode_media_datagram(&[0u8; 24]).is_none());
-        assert!(decode_media_datagram(&[0u8; 25]).is_some());
+        assert!(decode_media_datagram(&[0u8; 32]).is_none());
+        assert!(decode_media_datagram(&[0u8; 33]).is_some());
     }
 }

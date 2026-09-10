@@ -16,7 +16,7 @@ option java_package = "kulua.direct";
 
 // 数据报外层（仅 control 端口 P 使用）。
 //
-// 音频/视频已迁出到独立 UDP 端口（video=P+1 / audio=P+2），用 25B 大端定长
+// 音频/视频已迁出到独立 UDP 端口（video=P+1 / audio=P+2），用 33B 大端定长
 // 二进制头承载（非 protobuf），手机端独立 socket 收发：
 //
 //   offset  size  field
@@ -26,7 +26,9 @@ option java_package = "kulua.direct";
 //   12      2     frag       （分片索引，0 起）
 //   14      2     frag_total （0 = 单包完整；0xFFFF = OPEN 注册包，负载为空）
 //   16      8     pts        （微秒；接收侧以 frag==0 的值为准）
-//   24      1     flags      （bit0=config bit1=keyframe）
+//   24      8     revision   （音频代次，= 产生本帧的采集器对应的 SetAudio.revision；
+//                              视频恒 0；接收侧只接受当前代次，避免旧音频串入新播放）
+//   32      1     flags      （bit0=config bit1=keyframe）
 //
 // WHY：单端口单 socket 时音视频分片共享发送缓冲（视频关键帧突发挤掉音频），
 // 且手机 ctrl 单循环要给每个媒体分片跑 protobuf 解析。分端口后三路流缓冲
@@ -107,19 +109,29 @@ message CtrlMsg {
     DestroyDisplay destroy_display = 10;
 
     // ── PC → phone：配置 ──
-    SetAudioCodec set_audio_codec = 30; // 音频编码热切换（不重建会话）
+    SetAudio set_audio = 31; // 音频开关 + 编码（一条命令，避免快速修改状态不一致）
 
     // ── phone → PC：剪贴板 / 确认 / 握手结果 ──
     ClipboardChanged clipboard_changed = 21;
     AckClipboard ack_clipboard = 22;
     MediaConfig media_config = 23;     // 音频/视频 config 帧（可靠投递）
-    AudioReady audio_ready = 24;       // 音频就绪（首连 / codec 热切换后回执）
+    AudioState audio_state = 32;       // 音频启停/编码切换的业务回执
     DisplayReady display_ready = 25;   // 视频显示器创建结果
   }
+
+  // 24/30：旧 AudioReady / SetAudioCodec（已被 AudioState / SetAudio 取代）。
+  reserved 24, 30;
 }
 
-message SetAudioCodec {
-  uint32 codec = 1; // 0=raw 1=opus 2=aac 3=flac（与 session proto 的索引一致）
+// 音频开关 + 编码一起下发（PC → phone）。
+//
+// WHY 合并成一条：开关与编码分开下发时，快速连续修改会出现「先按旧 codec 起采集、
+// 再按新 codec 重起」的中间态；revision 让 PC 能丢弃旧代次的音频。
+// 关闭不能用 codec=0 表达（0 已经表示 raw）。
+message SetAudio {
+  bool enabled = 1;     // 期望状态
+  uint32 codec = 2;     // 期望编码索引：0=raw 1=opus 2=aac 3=flac（enabled=false 时仅记录）
+  uint64 revision = 3;  // 本次目标代次；phone 用同一值标记媒体帧 / MediaConfig / AudioState
 }
 
 // 音频/视频 config 帧（AAC AudioSpecificConfig / FLAC STREAMINFO / H.264 SPS+PPS）。
@@ -127,12 +139,17 @@ message SetAudioCodec {
 message MediaConfig {
   uint32 stream = 1; // 流标识：1=AUDIO 2=VIDEO（与媒体端口序 video=P+1/audio=P+2 对应）
   bytes data = 2;    // config 原始字节（同原 12B 帧头 bit62 携带的内容）
+  uint64 revision = 3; // 音频代次（= SetAudio.revision；视频恒 0）
 }
 
-// 音频就绪（server → PC）：HELLO_ACK 已带初始 codec_id；
-// 这里用于 SetAudioCodec 热切换后的再次回执。
-message AudioReady {
-  uint32 codec_id = 1; // 4B ASCII codec id（0=禁用）
+// 音频状态回执（phone → PC）：传输层 ACK 只代表命令已收到，业务是否落地看这里。
+//
+// phone 在两种时机发送：切换执行完成（成功或失败），以及采集自愈后的恢复。
+message AudioState {
+  uint64 revision = 1; // 回显 SetAudio.revision
+  bool enabled = 2;    // 实际是否在采集
+  uint32 codec_id = 3; // 实际 codec（4B ASCII id，如 "aac"；0=未启用）
+  string error = 4;    // 非空 = 本次启用失败（采集器/编码器不可用）
 }
 
 message InjectKeycode {

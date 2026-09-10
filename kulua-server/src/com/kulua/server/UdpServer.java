@@ -14,7 +14,7 @@ import kulua.direct.Hello;
 
 /**
  * UDP 直连服务器：三端口分流 —— ctrl=P（protobuf Frame 控制流）、
- * video=P+1 / audio=P+2（25B 定长二进制头媒体数据报）。
+ * video=P+1 / audio=P+2（33B 定长二进制头媒体数据报）。
  *
  * ctrl 按源地址解复用客户端；媒体端口只做一件事：按数据报头里的 client_id
  * 找到会话，把源地址登记为该流的发送端点（负载不消费，phone 不重装媒体）。
@@ -206,7 +206,7 @@ public final class UdpServer {
     }
 
     /**
-     * 发送媒体数据报（25B 头已编码好）：按流选 socket，目标为登记端点。
+     * 发送媒体数据报（33B 头已编码好）：按流选 socket，目标为登记端点。
      * WHY 必须从对应端口发出：PC 端 socket 是 connect() 的，源端口须匹配。
      */
     void sendMediaRaw(int stream, InetSocketAddress dst, byte[] wire) {
@@ -237,7 +237,7 @@ public final class UdpServer {
     }
 
     /**
-     * 媒体端口接收循环：解析 25B 头 → 按 client_id 查会话 → 登记源地址为
+     * 媒体端口接收循环：解析 33B 头 → 按 client_id 查会话 → 登记源地址为
      * 该流发送端点并刷新活跃时间。OPEN（frag_total=0xFFFF 空负载）只是首次
      * 注册触发器，后续数据报同样刷新端点；负载不消费（phone 不重装媒体）。
      */

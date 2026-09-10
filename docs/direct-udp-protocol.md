@@ -43,7 +43,7 @@ message Frame {
 }
 ```
 
-**媒体端口（video=P+1 / audio=P+2）**：每个 UDP datagram = **25B 大端定长头 +
+**媒体端口（video=P+1 / audio=P+2）**：每个 UDP datagram = **33B 大端定长头 +
 负载（≤1200B）**，非 protobuf：
 
 ```
@@ -54,7 +54,10 @@ offset  size  field
 12     2     frag       （分片索引，0 起）
 14     2     frag_total （0 = 单包完整；0xFFFF 且负载为空 = OPEN 注册包）
 16     8     pts        （微秒；接收侧以 frag==0 的值为准）
-24     1     flags      （bit0=config bit1=keyframe）
+24     8     revision   （音频代次 = 产生本帧的采集器对应的 SetAudio.revision；
+                        视频恒 0。接收侧只接受当前代次，避免开关/编码切换时
+                        上一代在途音频串入新播放队列）
+32     1     flags      （bit0=config bit1=keyframe）
 ```
 
 WHY 不进 protobuf：媒体分片速率高（8Mbps 视频 ≈170 片/s/viewer），定长头
@@ -64,9 +67,9 @@ WHY 不进 protobuf：媒体分片速率高（8Mbps 视频 ≈170 片/s/viewer�
 `CtrlMsg` 覆盖所有 control 命令（`inject_keycode/text/touch/scroll`、
 `back_or_screen_on`、`set_clipboard`、`start_app`、`resize_display`、
 `create/destroy_display`、`clipboard_changed`、`ack_clipboard`、
-`display_ready`、`audio_ready`）。字段沿用原字节协议的语义（displayId 前缀、
-pointerId、压力定点等均以原生类型表达，Java/Rust 侧转换职责分离：Rust 生成
-protobuf，Java 消费 protobuf 转 Android 注入）。
+`display_ready`、`set_audio`、`audio_state`）。字段沿用原字节协议的语义
+（displayId 前缀、pointerId、压力定点等均以原生类型表达，Java/Rust 侧转换
+职责分离：Rust 生成 protobuf，Java 消费 protobuf 转 Android 注入）。
 
 ## 会话模型
 
@@ -89,15 +92,39 @@ phone (0.0.0.0:P / P+1 / P+2, 三个 DatagramSocket)
    每 500ms 重发（最多 20 次 → 判死）。
 2. phone 校验 `scid` 后回 `HELLO_ACK`（附带 `audio_codec` + **`client_id`**，
    phone 侧 1 起单调分配），并注册该源地址为本客户端 ctrl 端点。
-3. PC 按需打开媒体 socket（bind 随机本地端口、connect 到 `phone_ip:P+1/P+2`），
-   在媒体端口周期发 **OPEN**（25B 头，frag_total=0xFFFF、无负载，携 client_id，
+3. PC 打开媒体 socket（bind 随机本地端口、connect 到 `phone_ip:P+1/P+2`），
+   在媒体端口周期发 **OPEN**（33B 头，frag_total=0xFFFF、无负载，携 client_id，
    500ms 重发直到收到首个媒体包）。phone 收到媒体端口上任何头合法且
    client_id 可识别的数据报，即把源地址登记为该流的发送端点——OPEN 只是
    首次注册的触发器。
-4. daemon 发 control 信息走 `Frame{CTRL, DATA, CtrlMsg}`；audio 编码协商经
-   HELLO_ACK 的 `audio_codec` 携带（无需二次握手）。
+   - daemon 会话**恒打开音频端口**（哪怕会话初始音频是关闭）：音频可在会话
+     中途热开启，接收端点必须先就位，否则开启后 phone 无处发送、也无从再登记。
+   - 融合窗口只收视频：不开音频端口，`Hello.audio=false`。
+4. daemon 发 control 信息走 `Frame{CTRL, DATA, CtrlMsg}`；`Hello.audio` 只表达
+   "握手时是否就让 phone 起采集"（= 会话初始音频目标，代次 0）。
 5. viewer 创建显示器：发 `CtrlMsg.create_display{width,height,dpi}`（可靠），
    phone 创建 VirtualDisplay + 编码器，回 `CtrlMsg.display_ready{...}`。
+
+### 音频：会话内独立启停（热切换）
+
+音频链路可在会话存活期间独立开关与换编码，**不重启会话**（端口 / 剪贴板 /
+通知 / 融合窗口全部保持）：
+
+1. Core 把用户目标写进 `watch<AudioTarget>{enabled, codec}`（连续操作自动合并）。
+2. Session 主循环发现目标变化 → 代次 +1 → 发 `SetAudio{enabled, codec, revision}`，
+   并立即把它交给音频任务（切代次）：旧代次的 Config/Frame 全部丢弃，关闭时
+   立刻释放播放资源（rodio sink + 输出设备）。
+3. phone 侧由**专用单线程执行器**串行处理启停（启停要 join 采集线程，不能占
+   ctrl 线程，否则阻塞所有客户端的心跳与输入注入）：先停旧链路，再按目标启动，
+   然后回 `AudioState{revision, enabled, codec_id, error}`（传输 ACK 只代表命令
+   收到，业务结果看这里）。
+4. Session 依据回执维护运行态（off / starting / on / stopping / failed）推给 UI；
+   等不到回执（2s）就换代次重试（最多 3 次），仍无回执 → failed + 原因。
+5. phone 采集自愈后（重建采集器并真正送出帧）会再发一次同代次的 `AudioState`，
+   PC 据此把 failed 翻回 on；PC 侧连续 3s 没有新帧也判断流（指标归零 + 提示），
+   并按 10s 间隔换代次自动重发（最多 3 次）尝试恢复。
+6. 开关与编码用同一条命令下发：分开下发会出现"先按旧 codec 起采集、再按新
+   codec 重起"的中间态；`codec=0` 表示 raw，**不能**用来表示关闭。
 
 ### 生命周期与保活
 
@@ -125,12 +152,14 @@ phone (0.0.0.0:P / P+1 / P+2, 三个 DatagramSocket)
 - 媒体数据报格式见上文「数据报格式」；phone 从**对应端口的 socket**发送
   （PC 端 socket 是 connect() 的，源端口须匹配）；端点未登记时静默丢弃
   （OPEN 注册完成前的少量首帧丢失可接受，config 可靠兜底 + 关键帧重同步）。
-- **audio**：尽力而为；乱序/重复按 seq 丢弃（20ms 帧丢失可掩蔽）。
+- **audio**：尽力而为；乱序/重复按 seq 丢弃（20ms 帧丢失可掩蔽）；按媒体头
+  `revision` 过滤，只接受当前代次。
 - **video**：尽力而为；任一分片丢失 → 整帧丢弃（解码器下个关键帧重同步）；
   HUD 丢包率用重装器的 lost 计数。
 - config 帧（SPS/PPS / AudioSpecificConfig）：**仍走 control 流可靠投递**
-  （`CtrlMsg.media_config`，stream 字段 1=audio 2=video），确保解码器可在
-  首帧前初始化。
+  （`CtrlMsg.media_config`，stream 字段 1=audio 2=video，音频另带 `revision`），
+  确保解码器可在首帧前初始化；音频 config 只接受当前代次，AAC/FLAC 在拿到
+  当前代次的 config 前不解码（否则解码器会一直失败）。
 
 ## 端口 / 地址 / 发现
 

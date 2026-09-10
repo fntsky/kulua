@@ -4,7 +4,7 @@
 //! - reader：recv 循环 → 解析 `Frame` → 分派（control 投递 / ACK / HELLO_ACK）
 //! - writer：定时 flush ACK、control 重传、心跳、媒体 OPEN 注册、判死
 //!
-//! 媒体端口（video=P+1 / audio=P+2，按需开启）：各自 reader 线程解析 25B
+//! 媒体端口（video=P+1 / audio=P+2，按需开启）：各自 reader 线程解析 33B
 //! 定长头 → 重装 → 事件；writer 在媒体端口收到首个有效数据报前每 500ms
 //! 重发 OPEN 注册包（phone 收到任意合法头数据报即登记端点）。
 //!
@@ -59,6 +59,18 @@ const OPEN_INTERVAL: Duration = Duration::from_millis(500);
 /// 完成后清理媒体残留的分片缓冲超时。
 const MEDIA_SWEEP: Duration = Duration::from_millis(500);
 
+/// 会话连接参数。
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectOpts {
+    /// 打开音频媒体端口（daemon 会话恒 true）：音频可在会话中途热开启，
+    /// 接收端点必须先注册好，否则开启后 phone 无处发送且无从再登记。
+    pub audio_link: bool,
+    /// `Hello.audio`：是否请求 phone 在握手时就起采集（= 会话初始音频目标）。
+    pub hello_audio: bool,
+    /// 打开视频媒体端口（融合窗口）。
+    pub video: bool,
+}
+
 /// 一个与 phone 上 kulua-server 直连的 UDP 会话。
 pub struct UdpSession {
     socket: UdpSocket,
@@ -89,15 +101,9 @@ pub struct UdpSession {
 impl UdpSession {
     /// 连接 peer（phone ctrl 端口 ip:port）并完成 HELLO/HELLO_ACK 握手。
     ///
-    /// `want_audio`/`want_video` 按需打开媒体端口 socket（audio=P+2 /
-    /// video=P+1）。阻塞至多 10s；成功返回已就绪的会话（`event` 中不会再有
-    /// `Connected`）。
-    pub fn connect(
-        peer: SocketAddr,
-        scid: &str,
-        want_audio: bool,
-        want_video: bool,
-    ) -> Result<Self, String> {
+    /// 媒体端口（audio=P+2 / video=P+1）按 [`ConnectOpts`] 打开。阻塞至多 10s；
+    /// 成功返回已就绪的会话（`event` 中不会再有 `Connected`）。
+    pub fn connect(peer: SocketAddr, scid: &str, opts: ConnectOpts) -> Result<Self, String> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -117,12 +123,12 @@ impl UdpSession {
                 .map_err(|e| format!("connect {media_peer}: {e}"))?;
             Ok(s)
         };
-        let audio_socket = if want_audio {
+        let audio_socket = if opts.audio_link {
             Some(bind_media(AUDIO_PORT_OFFSET)?)
         } else {
             None
         };
-        let video_socket = if want_video {
+        let video_socket = if opts.video {
             Some(bind_media(VIDEO_PORT_OFFSET)?)
         } else {
             None
@@ -164,7 +170,7 @@ impl UdpSession {
             frag_total: 0,
             payload: Some(frame::Payload::Hello(Hello {
                 scid: s.scid.clone(),
-                audio: want_audio,
+                audio: opts.hello_audio,
             })),
         };
         let mut wire = Vec::with_capacity(64);
@@ -247,7 +253,7 @@ impl UdpSession {
             }));
         }
 
-        // ── 媒体 reader：每 socket 一线程，25B 头解析 → 重装 → 事件 ──
+        // ── 媒体 reader：每 socket 一线程，33B 头解析 → 重装 → 事件 ──
         if let Some(sock) = self.audio_socket.as_ref() {
             let sock = sock.try_clone().expect("clone audio socket");
             self.media_readers.push(Self::spawn_media_reader(
@@ -294,7 +300,6 @@ impl UdpSession {
             let ev_tx = self.ev_tx.clone();
             let closed = self.closed.clone();
             self.writer = Some(std::thread::spawn(move || {
-                let mut last_ack = 0u32;
                 let mut last_hb = Instant::now();
                 let mut last_open = Instant::now();
                 let mut last_rtx_warn = Instant::now();
@@ -302,9 +307,7 @@ impl UdpSession {
                     let now = Instant::now();
                     // ACK flush
                     {
-                        let ack = ctrl_rx.lock().ack_seq();
-                        if ack != last_ack {
-                            last_ack = ack;
+                        if let Some(ack) = ctrl_rx.lock().take_ack() {
                             if let Ok(wire) = encode_ack(ack) {
                                 let _ = socket.send(&wire);
                             }
@@ -377,7 +380,7 @@ impl UdpSession {
         }
     }
 
-    /// 启动一个媒体端口 reader：解析 25B 头 → client_id 校验 → 重装 → 事件。
+    /// 启动一个媒体端口 reader：解析 33B 头 → client_id 校验 → 重装 → 事件。
     ///
     /// 媒体 socket 错误不判死会话（判死只在 ctrl 路径）；媒体断流由上层
     /// 看门狗（viewer 首帧超时 / daemon 音频静默）兜底。
@@ -392,9 +395,13 @@ impl UdpSession {
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; MEDIA_HDR_LEN + 1400];
+            // 非致命 socket 错误的重试计数与日志限频（收到数据后清零）
+            let mut err_count = 0u64;
+            let mut last_err_log = Instant::now();
             while !closed.load(Ordering::SeqCst) {
                 match socket.recv(&mut buf) {
                     Ok(n) => {
+                        err_count = 0;
                         let Some(f) = decode_media_datagram(&buf[..n]) else {
                             continue; // 非法/截断 datagram
                         };
@@ -422,7 +429,18 @@ impl UdpSession {
                     Err(e)
                         if e.kind() == std::io::ErrorKind::ConnectionReset
                             || e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-                    Err(_) => break,
+                    // 其它错误（网卡重配 / 路由切换 / WSAENETRESET 等）不再直接退出
+                    // reader：退出会让该流永久断掉，而 PC 侧只剩「没声音 + 缓冲数字
+                    // 不动」，ctrl 链路照常 → 看起来会话还活着。抖动过去后 socket 可恢复。
+                    Err(e) => {
+                        if err_count == 0 || last_err_log.elapsed() >= Duration::from_secs(5) {
+                            last_err_log = Instant::now();
+                            let stream = if is_video { "video" } else { "audio" };
+                            eprintln!("[kulua] {stream} recv error: {e}（继续重试）");
+                        }
+                        err_count += 1;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
             }
         })
@@ -497,15 +515,6 @@ impl UdpSession {
         Ok(())
     }
 
-    /// 发送 HEARTBEAT（保活；phone 把任意 datagram 都视为存活）。
-    pub fn send_heartbeat(&self) -> Result<(), String> {
-        let wire = encode_heartbeat().map_err(|e| e)?;
-        self.socket
-            .send(&wire)
-            .map_err(|e| format!("udp send: {e}"))?;
-        Ok(())
-    }
-
     /// 发送 BYE（优雅关闭会话）。
     pub fn send_bye(&self) {
         if let Ok(wire) = encode_bye() {
@@ -516,11 +525,6 @@ impl UdpSession {
     /// 握手后返回的 codec 状态。
     pub fn hello_ack(&self) -> Option<HelloAck> {
         self.state.lock().hello_ack.clone()
-    }
-
-    /// 视频流累计丢失的消息数（HUD 丢包率用）。
-    pub fn video_lost(&self) -> u64 {
-        self.video_rx.lock().lost()
     }
 
     /// 关闭会话（发 BYE + 停线程 + 关 socket）。
@@ -547,11 +551,6 @@ impl UdpSession {
     /// 同步非阻塞接收事件（fusion-viewer 事件循环轮询）。
     pub fn try_recv(&mut self) -> Option<Event> {
         self.rx.try_recv().ok()
-    }
-
-    /// 事件接收器是否还有生产端存活。
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -606,10 +605,13 @@ fn encode_bye() -> Result<Vec<u8>, String> {
     Ok(wire)
 }
 
-/// 构造媒体端点 OPEN 注册包（25B 头，frag_total=OPEN 标记，无负载）。
+/// 构造媒体端点 OPEN 注册包（33B 头，frag_total=OPEN 标记，无负载）。
 ///
 /// phone 收到任意合法头数据报即把源地址登记为媒体发送目标；编码器尚未
 /// 推流时靠本包周期重发完成注册。
+///
+/// WHY 每个会话都开媒体端口并注册端点：音频可在会话中途热开启，端点必须先
+/// 就位（否则开启后 phone 无处发送，且它不会再从 PC 收到任何数据报来登记）。
 fn encode_open(client_id: u32) -> Vec<u8> {
     let mut wire = Vec::with_capacity(MEDIA_HDR_LEN);
     encode_media_datagram(
@@ -620,6 +622,7 @@ fn encode_open(client_id: u32) -> Vec<u8> {
             frag: 0,
             frag_total: MEDIA_OPEN_TOTAL,
             pts: 0,
+            revision: 0,
             flags: 0,
             payload: &[],
         },
@@ -763,19 +766,17 @@ pub mod msgs {
         }
     }
 
-    pub fn destroy_display(display_id: u32) -> CtrlMsg {
+    /// 音频开关 + 编码 + 代次一起下发（唯一音频配置命令）。
+    ///
+    /// `codec` 是索引（0=raw 1=opus 2=aac 3=flac）；关闭靠 `enabled=false` 表达
+    /// （codec=0 表示 raw，不能当"关闭"用）。
+    pub fn set_audio(enabled: bool, codec: u32, revision: u64) -> CtrlMsg {
         CtrlMsg {
-            msg: Some(ctrl_msg::Msg::DestroyDisplay(
-                crate::generated::DestroyDisplay { display_id },
-            )),
-        }
-    }
-
-    pub fn set_audio_codec(codec: u32) -> CtrlMsg {
-        CtrlMsg {
-            msg: Some(ctrl_msg::Msg::SetAudioCodec(
-                crate::generated::SetAudioCodec { codec },
-            )),
+            msg: Some(ctrl_msg::Msg::SetAudio(crate::generated::SetAudio {
+                enabled,
+                codec,
+                revision,
+            })),
         }
     }
 }

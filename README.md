@@ -49,9 +49,9 @@
 - **跨平台 GUI** — Tauri v2 + Vue 3 原生桌面界面
 - **音频转发** — 手机系统声音回传 PC 播放（Opus / AAC / FLAC / RAW，可热切换）
 - **融合模式** — session 运行中可从 GUI 选择手机应用，在自研虚拟显示器上
-  打开独立原生窗口（可同时开多个、独立关闭）；完全自研：设备端
-  `kulua-server.jar` 创建虚拟显示器 + H.264 编码，客户端 `fusion-viewer.exe`
-  （winit 窗口 + FFmpeg 软解 + 自研控制协议注入），不依赖官方 scrcpy
+  打开独立窗口（可同时开多个、独立关闭）；完全自研：设备端
+  `kulua-server.jar` 创建虚拟显示器 + H.264 编码，PC 端 Tauri WebviewWindow +
+  WebCodecs 硬解（无 FFmpeg 依赖），不依赖官方 scrcpy
 
 ## Architecture
 
@@ -74,7 +74,6 @@ Core (device mgmt + session orchestration)
 | `kulua-proto` | 直连线协议：`proto/direct.proto` 生成的 protobuf + UDP 传输层（分片 / ACK / 重传 / 多流会话） |
 | `scrcpy` | kulua-server 部署/启停（scid 会话隔离 + 精准 kill）+ 设备直连地址解析（模块名沿用历史） |
 | `apps` | 设备应用枚举（server 一次性模式 `list_apps=true`，60s 缓存） |
-| `fusion` | 融合窗口管理（fusion-viewer.exe 进程生命周期：启动 / 回收 / 优雅关闭） |
 | `wireless_pair` | mDNS 发现 + QR 码生成 + 配对信息 |
 | `ipc` | TCP Protobuf IPC 服务（GUI 通信） |
 | `cli` | 终端交互界面 |
@@ -136,7 +135,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 | `clipboard.get` | Request | 读取 PC 端剪贴板 |
 | `pairing.info` | Request | 获取配对二维码信息 |
 | `app.list` | Request | 枚举设备可启动应用（60s 缓存，`force` 可刷新） |
-| `app.open` | Request | 以融合模式窗口打开应用（拉起 fusion-viewer.exe，返回 window_id） |
+| `app.open` | Request | 以融合模式窗口打开应用（返回 window_id + 设备直连地址 addr，UI 自建视频客户端） |
 
 #### 推送事件
 
@@ -159,9 +158,6 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 - [adb](https://developer.android.com/tools/adb)（`PATH` 中或项目目录下的 `adb.exe`）
 - Node.js 18+（构建 GUI）
 - Android 设备（Android 11+ 推荐无线调试）
-- FFmpeg 7.1 运行时 DLL（融合模式需要；`vendor/scrcpy-win64` 目录已内置
-  `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`，目录名沿用历史，
-  自研 `fusion-viewer.exe` 复用）
 
 ### Build & Run
 
@@ -187,15 +183,8 @@ npm run tauri dev
 
 首次使用前需要将 `kulua-server.jar`（`kulua-server/build.ps1` 构建产出）放在项目根目录或 daemon 同级目录。
 
-Windows 发布包（`build.ps1 -Release`）会自动打包自研融合窗口客户端
-（`fusion-viewer.exe` + `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll`，
-来源为 `vendor/scrcpy-win64` 或 `$env:SCRCPY_HOME`，可用 `-FfmpegDir <目录>` 显式指定），
-以及自研 `kulua-server.jar`。缺少 DLL 不影响基础功能，仅融合模式不可用。
-
-> fusion-viewer 构建注意事项：系统 PATH 中的 msys2/mingw64 会干扰 `ffmpeg-sys-next`
-> 的 C 头文件探测，构建请使用 `scripts\build-viewer.cmd`（内部净化 PATH）。
-
-## Project Structure
+Windows 发布包（`build.ps1 -Release`）会自动打包 daemon、GUI 与自研 `kulua-server.jar`。
+融合模式无额外运行时依赖（视频解码由 WebView2 内置 WebCodecs 硬解完成）。
 
 ## Project Structure
 
@@ -218,10 +207,8 @@ kulua/
 │       └── notification.rs
 ├── ui/                  # 桌面 GUI (Tauri v2 + Vue 3)
 │   ├── src/             # Vue 3 前端（App.vue）
-│   └── src-tauri/       # Tauri Rust 后端（复用 sync-core IPC 消息）
-├── vendor/scrcpy-win64/ # FFmpeg 7.1 运行时 DLL（目录名沿用历史，融合窗口自研客户端用）
-├── vendor/ffmpeg-7.1/   # FFmpeg 7.1 头文件 + 导入库（构建 fusion-viewer 用）
-├── fusion-viewer/       # 自研融合窗口客户端（winit + FFmpeg + 自研控制协议）
+│   ├── fusion.html      # 融合窗口页面（WebCodecs 解码渲染，无构建依赖）
+│   └── src-tauri/       # Tauri Rust 后端（IPC 客户端 + fusion_* 窗口命令）
 ├── kulua-server/        # 自研设备端 server（Java：多虚拟显示器 + 剪贴板 + 音频回传）
 │   └── build.ps1        # javac + d8 + jar 构建脚本
 ├── build.sh             # 构建脚本 (Linux/macOS)
@@ -234,7 +221,7 @@ kulua/
 - **手机上绝不安装任何 APK** — 所有功能通过 `adb push` + `adb shell app_process` 实现
 - 依赖自研 `kulua-server.jar`（`kulua-server/build.ps1` 构建，替代官方 scrcpy-server）
 - 需要本地有 `adb` 可执行文件
-- 融合窗口由自研 `fusion-viewer.exe` 实现（winit 窗口 + FFmpeg 解码 + 自研控制协议），
+- 融合窗口由 UI 进程内嵌实现（Tauri WebviewWindow + WebCodecs 硬解），
   设备端由 `kulua-server.jar` 提供虚拟显示器，不依赖官方 scrcpy；手机上仍不装任何 APK；
   融合窗口与 Kulua session 共用同一 server（scid 会话隔离）
 
@@ -256,8 +243,8 @@ kulua/
 - ✅ pending_serials 环（自动重试，失败 5 次丢弃）
 - ✅ scid 会话隔离（session 重启/清理按 scid 精准 kill，不误杀融合窗口）
 - ✅ 应用列表（GUI 选择设备应用，server 一次性模式枚举 + 缓存）
-- ✅ 融合模式窗口（自研 fusion-viewer.exe：虚拟显示器 + FFmpeg 软解 + 输入注入，
-  可多开、独立关闭；不依赖官方 scrcpy）
+- ✅ 融合模式窗口（WebviewWindow + WebCodecs 硬解：虚拟显示器 + 输入注入，
+  可多开、独立关闭；无 FFmpeg 依赖；不依赖官方 scrcpy）
 - ✅ 音频转发（Opus / AAC / FLAC / RAW 解码 + rodio 播放，编码可热切换）
 
 ## License

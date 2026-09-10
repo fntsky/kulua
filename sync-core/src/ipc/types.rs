@@ -81,8 +81,12 @@ pub struct SessionSummary {
     pub clipboard_sync: bool,
     /// 通知同步
     pub notification_sync: bool,
-    /// 音频是否已启用
+    /// 音频目标（用户期望）：true = 开
     pub audio_enabled: bool,
+    /// 音频运行态: "off" | "starting" | "on" | "stopping" | "failed"
+    pub audio_state: String,
+    /// 运行态为 failed 时的原因（UI 展示）
+    pub audio_error: String,
     /// 音量百分比（0-100）
     pub volume: u16,
     /// 音频播放队列缓冲延迟（ms），0 = 无音频/未播放

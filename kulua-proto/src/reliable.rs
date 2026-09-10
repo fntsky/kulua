@@ -165,6 +165,7 @@ pub struct ReliableReceiver {
     next_seq: u32,
     buf: BTreeMap<u32, RecvFragment>,
     dead: bool,
+    ack_pending: bool,
 }
 
 impl ReliableReceiver {
@@ -174,6 +175,7 @@ impl ReliableReceiver {
             next_seq: 1,
             buf: BTreeMap::new(),
             dead: false,
+            ack_pending: false,
         }
     }
 
@@ -187,6 +189,8 @@ impl ReliableReceiver {
             Some(frame::Payload::Data(d)) => d.clone(),
             _ => return Vec::new(),
         };
+        // 重复分片也要回复 ACK：上一份确认可能在网络中丢失。
+        self.ack_pending = true;
         if frame.seq < self.next_seq {
             return Vec::new(); // 重复
         }
@@ -273,6 +277,15 @@ impl ReliableReceiver {
         self.next_seq.wrapping_sub(1)
     }
 
+    /// 取出待发送的累积确认，包括重复分片触发的补发。
+    pub fn take_ack(&mut self) -> Option<u32> {
+        if std::mem::take(&mut self.ack_pending) {
+            Some(self.ack_seq())
+        } else {
+            None
+        }
+    }
+
     pub fn is_dead(&self) -> bool {
         self.dead
     }
@@ -286,6 +299,19 @@ struct Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_ack_is_reissued_without_duplicate_delivery() {
+        let mut sender = ReliableSender::new();
+        let mut receiver = ReliableReceiver::new();
+        let frames = sender.send_ctrl_bytes(1, b"clipboard");
+        assert_eq!(receiver.on_frame(&frames[0]), vec![b"clipboard".to_vec()]);
+        assert_eq!(receiver.take_ack(), Some(1)); // 模拟确认丢包
+        assert_eq!(receiver.take_ack(), None);
+        assert!(receiver.on_frame(&frames[0]).is_empty());
+        sender.on_ack(receiver.take_ack().unwrap());
+        assert_eq!(sender.pending(), 0);
+    }
 
     #[test]
     fn sender_receiver_single_roundtrip() {

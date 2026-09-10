@@ -26,7 +26,7 @@ public final class ControlChannel {
         if (!msg.hasInjectKeycode() && !msg.hasInjectText() && !msg.hasInjectTouch()
                 && !msg.hasInjectScroll() && !msg.hasBackOrScreenOn() && !msg.hasSetClipboard()
                 && !msg.hasStartApp() && !msg.hasResizeDisplay() && !msg.hasCreateDisplay()
-                && !msg.hasDestroyDisplay() && !msg.hasSetAudioCodec()) {
+                && !msg.hasDestroyDisplay() && !msg.hasSetAudio()) {
             Server.w("empty/unknown ctrl msg from " + client.addr());
             return;
         }
@@ -99,11 +99,12 @@ public final class ControlChannel {
             kulua.direct.DestroyDisplay m = msg.getDestroyDisplay();
             Server.i("destroy display #" + m.getDisplayId());
             client.displays().destroy(m.getDisplayId());
-        } else if (msg.hasSetAudioCodec()) {
-            int codecIndex = (int) msg.getSetAudioCodec().getCodec();
-            String name = codecNameForIndex(codecIndex);
-            Server.i("audio codec hot-switch → " + name + " (" + client.addr() + ")");
-            client.startAudio(name, true);
+        } else if (msg.hasSetAudio()) {
+            kulua.direct.SetAudio m = msg.getSetAudio();
+            // 不在本线程执行启停：join 采集线程会阻塞所有客户端的 ctrl 与心跳
+            Server.i("SetAudio enabled=" + m.getEnabled() + " codec=" + m.getCodec()
+                    + " rev=" + m.getRevision() + " (" + client.addr() + ")");
+            client.applyAudio(m.getEnabled(), (int) m.getCodec(), m.getRevision());
         }
     }
 

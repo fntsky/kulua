@@ -17,7 +17,7 @@ import java.util.concurrent.CountDownLatch;
  * 视频编码器 + 推流（每显示器一个实例）。
  *
  * 流程：MediaCodec(surface 输入) → VirtualDisplay 投屏 → 编码输出 →
- * 媒体端口 UDP 分片推送（25B 定长头）。config 帧（SPS/PPS）走可靠
+ * 媒体端口 UDP 分片推送（33B 定长头）。config 帧（SPS/PPS）走可靠
  * control 流（MediaConfig），普通帧走尽力而为媒体分片（pts/flags 进媒体头）。
  */
 public final class DisplayEncoder {
@@ -322,7 +322,7 @@ public final class DisplayEncoder {
         }
         long pts = System.nanoTime() / 1000;
         client.sendMedia(ClientConnection.MEDIA_STREAM_VIDEO,
-                client.nextMediaSeq(), pts, lastFrameFlags, lastFrameData);
+                client.nextMediaSeq(), pts, 0, lastFrameFlags, lastFrameData);
         lastFrameMs = now;
         resendCount++;
         if (resendCount == 1 || resendCount % 100 == 0) {
@@ -351,7 +351,7 @@ public final class DisplayEncoder {
     /** 发送普通视频帧（尽力而为、分片）。首帧前先冲刷暂存的 codec config。 */
     private void sendData(long pts, int flags, ByteBuffer buffer, int size) {
         if (pendingConfig != null) {
-            client.sendMediaConfig(ClientConnection.MEDIA_STREAM_VIDEO, pendingConfig);
+            client.sendMediaConfig(ClientConnection.MEDIA_STREAM_VIDEO, pendingConfig, 0);
             pendingConfig = null;
         }
         buffer.position(0);
@@ -361,7 +361,8 @@ public final class DisplayEncoder {
         if (data.length != size) {
             data = Arrays.copyOf(data, size);
         }
-        client.sendMedia(ClientConnection.MEDIA_STREAM_VIDEO, client.nextMediaSeq(), pts, flags, data);
+        client.sendMedia(ClientConnection.MEDIA_STREAM_VIDEO, client.nextMediaSeq(), pts, 0, flags,
+                data);
         // 缓存最后一帧，编码器饿死时 resendLastFrameIfStarved 会按 30fps 重发
         lastFrameData = data;
         lastFrameFlags = flags;

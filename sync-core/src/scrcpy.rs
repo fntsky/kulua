@@ -277,7 +277,15 @@ impl ScrcpyServer {
         self.process.try_wait().ok().flatten()
     }
 
-    /// 强制停止 server（清理远程进程和本地 adb shell）。
+    /// 交由设备端按客户端存活状态退出，后台回收本地 adb shell。
+    pub fn detach(mut self) {
+        // 不能关闭 adb shell：同一 server 可能仍承载其它客户端。
+        thread::spawn(move || {
+            let _ = self.process.wait();
+        });
+    }
+
+    /// 强制停止 server（仅部署失败时清理远程进程和本地 adb shell）。
     pub fn stop(&mut self, adb: &dyn AdbOps) {
         // 先按 scid 精准杀远程（设备端 kulua-server），确保无论本地如何终止都不会残留
         kill_by_scid(adb, &self.device.serial, self.port);

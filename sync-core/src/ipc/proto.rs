@@ -6,7 +6,6 @@
 use prost::Message;
 
 use crate::apps::AppInfo as CoreAppInfo;
-use crate::fusion::AppWindowInfo as CoreAppWindowInfo;
 use crate::ipc::types::SessionSummary as CoreSessionSummary;
 use crate::types::{Device as CoreDevice, DeviceIdentity as CoreDeviceIdentity};
 
@@ -155,6 +154,13 @@ pub struct SessionSummary {
     pub volume: u32,
     #[prost(uint64, tag = "11")]
     pub audio_buffer_ms: u64,
+    /// 音频运行态: off | starting | on | stopping | failed（12 起新增，
+    /// 9/10/11 保持原语义：9 = 目标开关）
+    #[prost(string, tag = "12")]
+    pub audio_state: String,
+    /// 运行态为 failed 时的原因
+    #[prost(string, tag = "13")]
+    pub audio_error: String,
 }
 
 impl From<&CoreSessionSummary> for SessionSummary {
@@ -169,6 +175,8 @@ impl From<&CoreSessionSummary> for SessionSummary {
             clipboard_sync: session.clipboard_sync,
             notification_sync: session.notification_sync,
             audio_enabled: session.audio_enabled,
+            audio_state: session.audio_state.clone(),
+            audio_error: session.audio_error.clone(),
             volume: u32::from(session.volume),
             audio_buffer_ms: session.audio_buffer_ms,
         }
@@ -215,34 +223,6 @@ impl From<&CoreAppInfo> for AppInfo {
             package_name: app.package_name.clone(),
             label: app.label.clone(),
             system: app.system,
-        }
-    }
-}
-
-/// 融合窗口信息（`app.windows-updated` 事件项）。
-#[derive(Clone, PartialEq, Message)]
-pub struct AppWindowInfo {
-    #[prost(uint64, tag = "1")]
-    pub window_id: u64,
-    #[prost(string, tag = "2")]
-    pub serial: String,
-    #[prost(string, tag = "3")]
-    pub package_name: String,
-    #[prost(string, tag = "4")]
-    pub label: String,
-    /// running | exited | failed
-    #[prost(string, tag = "5")]
-    pub state: String,
-}
-
-impl From<&CoreAppWindowInfo> for AppWindowInfo {
-    fn from(window: &CoreAppWindowInfo) -> Self {
-        Self {
-            window_id: window.window_id,
-            serial: window.serial.clone(),
-            package_name: window.package_name.clone(),
-            label: window.label.clone(),
-            state: window.state.clone(),
         }
     }
 }
@@ -435,6 +415,10 @@ pub mod response {
     pub struct AppOpen {
         #[prost(uint64, tag = "1")]
         pub window_id: u64,
+        /// phone 直连地址（`ip:port`，UDP）。UI 用它自建 video-only 客户端
+        /// 连接 kulua-server（融合窗口视频流），与 daemon session 并存。
+        #[prost(string, tag = "2")]
+        pub addr: String,
     }
 
     /// 按方法区分的结果 oneof。
@@ -485,17 +469,7 @@ pub mod event {
         /// `notification`
         #[prost(message, tag = "14")]
         Notification(super::NotificationData),
-        /// `app.windows-updated`：融合窗口启动 / 退出 / 失败
-        #[prost(message, tag = "15")]
-        AppWindowsUpdated(super::AppWindowsUpdated),
     }
-}
-
-/// `app.windows-updated` 事件载荷。
-#[derive(Clone, PartialEq, Message)]
-pub struct AppWindowsUpdated {
-    #[prost(message, repeated, tag = "1")]
-    pub windows: Vec<AppWindowInfo>,
 }
 
 #[cfg(test)]
@@ -659,30 +633,12 @@ mod tests {
             id: 14,
             result: Some(response::Payload::AppOpen(response::AppOpen {
                 window_id: 7,
+                addr: String::new(),
             })),
             error: None,
         };
         let bytes = resp.encode_to_vec();
         let decoded = Response::decode(&bytes[..]).unwrap();
         assert_eq!(decoded, resp);
-    }
-
-    #[test]
-    fn event_app_windows_updated_roundtrip() {
-        // 回归：Event.data oneof 必须声明 tag=15，app.windows-updated 才能编码/解码
-        let event = Event {
-            data: Some(event::Payload::AppWindowsUpdated(AppWindowsUpdated {
-                windows: vec![AppWindowInfo {
-                    window_id: 1,
-                    serial: "192.168.1.5:5555".into(),
-                    package_name: "com.android.settings".into(),
-                    label: "设置".into(),
-                    state: "running".into(),
-                }],
-            })),
-        };
-        let bytes = event.encode_to_vec();
-        let decoded = Event::decode(&bytes[..]).unwrap();
-        assert_eq!(decoded, event);
     }
 }
