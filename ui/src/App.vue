@@ -229,6 +229,20 @@ async function retrySession(uuid: string) {
   }
 }
 
+// 断开设备会话：serial 从设备列表按 uuid 取；仅停止 session（不动 adb 连接）。
+// 成功不做本地状态改动，daemon 会推 sessions-updated 刷新卡片。
+async function disconnectSession(uuid: string) {
+  const dev = devices.value.find((d) => d.uuid === uuid);
+  // 无会话/设备已消失时本地直接返回，避免无意义的 IPC 往返
+  if (!dev || !sessionStates.value[uuid]) return;
+  try {
+    await invoke("disconnect_device", { serial: dev.serial });
+  } catch (e) {
+    console.error("disconnect_device failed:", e);
+    showError(String(e));
+  }
+}
+
 // ADB 行对应设备的 session 状态（经合并列表 uuid 关联，支持地址变更）
 function adbSessionState(serial: string): string | undefined {
   const dev = devices.value.find((x) => x.serial === serial);
@@ -463,6 +477,7 @@ onMounted(async () => {
           @update-volume="setVolume(d.uuid, $event)"
           @retry="retrySession(d.uuid)"
           @open-fusion="openAppPicker(d.uuid, d.name || d.serial)"
+          @disconnect="disconnectSession(d.uuid)"
         />
       </div>
       <!-- adb raw device list -->

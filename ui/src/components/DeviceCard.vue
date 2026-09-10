@@ -4,7 +4,7 @@
 import type { DeviceConfig, DeviceInfo } from "../types";
 import { sessionStateText, stateClass } from "../utils";
 
-defineProps<{
+const props = defineProps<{
   device: DeviceInfo;
   // getDeviceConfig(uuid) 的结果（App.vue 侧惰性创建并持有）
   config: DeviceConfig;
@@ -23,7 +23,15 @@ const emit = defineEmits<{
   (e: "update-volume", volume: number): void;
   (e: "retry"): void;
   (e: "open-fusion"): void;
+  (e: "disconnect"): void;
 }>();
+
+// 断开：仅在有会话时可点（无会话直接本地返回，不产生 IPC 往返）。
+// 成功不做本地状态改动，daemon 会推 sessions-updated 刷新卡片。
+function onDisconnect() {
+  if (!props.sessionState) return;
+  emit("disconnect");
+}
 </script>
 
 <template>
@@ -79,6 +87,16 @@ const emit = defineEmits<{
           @input="emit('update-volume', Number(($event.target as HTMLInputElement).value))"
         />
         <span class="toggle-label">{{ config.volume }}</span>
+      </div>
+      <!-- 断开：点亮 = 该设备已建立会话；无会话时置灰且点击不发事件 -->
+      <div
+        class="toggle-row"
+        :class="{ disabled: !sessionState }"
+        :title="sessionState ? '断开该设备的会话' : '未建立会话'"
+        @click="onDisconnect"
+      >
+        <div class="toggle-switch" :class="{ active: !!sessionState }" />
+        <span class="toggle-label">断开</span>
       </div>
     </div>
     <div v-if="sessionState === 'failed'" class="retry-row">

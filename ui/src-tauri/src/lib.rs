@@ -256,6 +256,15 @@ async fn start_session(state: State<'_, AppState>, serial: String) -> Result<(),
     Ok(())
 }
 
+/// 断开指定设备的会话（daemon 侧 Command::Disconnect；不动 adb 连接）
+#[tauri::command]
+async fn disconnect_device(state: State<'_, AppState>, serial: String) -> Result<(), String> {
+    let params = request::Payload::DeviceDisconnect(request::DeviceSerial { serial });
+    let resp = ipc_request(&state, "device.disconnect", Some(params)).await?;
+    check_response(&resp)?;
+    Ok(())
+}
+
 /// adb 原始设备列表（含 Offline/Unauthorized）
 #[tauri::command]
 async fn get_adb_devices(state: State<'_, AppState>) -> Result<Vec<AdbDeviceInfo>, String> {
@@ -610,6 +619,7 @@ pub fn run() {
             update_session_config,
             retry_session,
             start_session,
+            disconnect_device,
             get_adb_devices,
             get_settings,
             set_autostart,
