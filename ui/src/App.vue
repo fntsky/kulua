@@ -678,17 +678,25 @@ body {
 .session-failed { color: var(--red); }
 .audio-latency {
   font-size: 11px; color: var(--dim); font-weight: 500;
+  /* 固定占位：数字位数变化（58ms↔128ms）不得推动右侧的音量滑块。
+     flex:none 必须写：否则行宽紧张时 flex 会把固定宽度收缩掉，又变成推动邻居。 */
+  flex: none; width: 66px; text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .audio-latency.high {
   color: var(--red);
 }
 .audio-state {
   font-size: 11px; font-weight: 500;
+  /* 同上：切换中…/音频失败 文案长度不同，固定占位避免行内元素跳动 */
+  flex: none; width: 52px;
 }
 .audio-pending { color: #f0c040; }
 .audio-failed { color: var(--red); }
-.retry-row {
-  display: flex; justify-content: flex-end;
+/* 会话操作行：应用 / 重试 / 窗口计数 / 断开 —— 与卡片内其它操作同一排 */
+.device-actions {
+  display: flex; align-items: center; gap: 8px;
+  border-top: 1px solid var(--border); padding-top: 8px;
 }
 .retry-btn {
   background: var(--red); color: #fff;
@@ -696,17 +704,21 @@ body {
   padding: 4px 14px; font-size: 12px; cursor: pointer;
 }
 .retry-btn:hover { opacity: 0.85; }
-/* 融合模式：应用按钮 + 窗口计数 */
-.fusion-row {
-  display: flex; align-items: center; gap: 8px;
-  border-top: 1px solid var(--border); padding-top: 8px;
-}
 .apps-btn {
   background: var(--green); color: #fff;
   border: none; border-radius: 4px;
   padding: 4px 16px; font-size: 12px; cursor: pointer;
 }
 .apps-btn:hover { opacity: 0.85; }
+/* 断开：描边按钮（次要动作），hover 才转红，避免与「应用」抢视觉重量 */
+.disconnect-btn {
+  background: transparent; color: var(--dim);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 16px; font-size: 12px; cursor: pointer;
+  /* 推到行尾，和左侧的「应用/重试」分开 */
+  margin-left: auto;
+}
+.disconnect-btn:hover { color: #fff; background: var(--red); border-color: var(--red); }
 .fusion-count { font-size: 11px; color: var(--dim); }
 /* 应用选择器弹层 */
 .modal-overlay {
@@ -780,7 +792,7 @@ body {
 }
 .modal-help { font-size: 11px; color: var(--dim); text-align: center; }
 .device-toggles {
-  display: flex; align-items: center; gap: 16px; padding-top: 4px;
+  display: flex; align-items: center; gap: 12px; padding-top: 4px;
   border-top: 1px solid var(--border);
 }
 .toggle-row {
@@ -789,6 +801,8 @@ body {
 }
 .toggle-row.disabled { cursor: not-allowed; opacity: 0.5; }
 .toggle-label { user-select: none; }
+/* 音量数值固定占位（0 / 80 / 100 位数不同） */
+.toggle-row .volume-value { min-width: 22px; text-align: right; font-variant-numeric: tabular-nums; }
 .settings-panel { display: flex; flex-direction: column; gap: 10px; }
 .settings-card {
   background: var(--card); border-radius: 10px;
@@ -873,7 +887,7 @@ body {
 .volume-slider {
   -webkit-appearance: none;
   appearance: none;
-  width: 80px;
+  width: 64px;
   height: 4px;
   border-radius: 2px;
   background: var(--slider-bg);
