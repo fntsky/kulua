@@ -94,6 +94,15 @@ fn setup_tray_icon(
     use tray_icon::{Icon, TrayIconBuilder};
 
     std::thread::spawn(move || {
+        // Linux 必须先 gtk::init()：TrayIconBuilder::build（muda 建 GTK 菜单）内部
+        // 就要用 GTK，顺序颠倒会因未初始化而静默失败/断言。
+        // 无显示环境（SSH/Headless）时 init 失败 → 放弃托盘，不影响 daemon 主功能。
+        #[cfg(target_os = "linux")]
+        if let Err(e) = gtk::init() {
+            eprintln!("tray: gtk init 失败（无显示环境？）: {e}");
+            return;
+        }
+
         let open_item = MenuItem::new("打开", true, None);
         let quit_item = MenuItem::new("退出", true, None);
 
@@ -116,12 +125,14 @@ fn setup_tray_icon(
         {
             Ok(t) => t,
             Err(e) => {
-                // 桌面环境缺 StatusNotifier 宿主 / 无显示环境时可能失败；
-                // 托盘只是辅助入口，失败不应影响 daemon 主功能
-                eprintln!("tray icon 创建失败（桌面环境不支持托盘？）: {e}");
+                // 桌面环境缺 StatusNotifier 宿主 / appindicator 运行时库缺失 /
+                // 无显示环境时可能失败；托盘只是辅助入口，失败不应影响 daemon 主功能
+                eprintln!("tray icon 创建失败（缺 appindicator 库或桌面不支持托盘？）: {e}");
                 return;
             }
         };
+        #[cfg(target_os = "linux")]
+        println!("tray icon 已注册（StatusNotifier）");
 
         // Windows: Win32 message loop required by tray-icon
         #[cfg(target_os = "windows")]
@@ -157,15 +168,11 @@ fn setup_tray_icon(
         // Linux: libappindicator 必须靠 GTK 主循环迭代才会注册/显示托盘图标。
         // 事件泵（gtk::main_iteration_do）与菜单轮询共用本线程；20ms 间隔足以
         // 让 StatusNotifierItem 显示并对点击响应，又不至于空转烧 CPU。
-        // 无显示环境（SSH/Headless）时 gtk::init 失败 → 放弃托盘，不影响其余功能。
+        // （gtk::init 已在线程开头完成；失败路径在 init/build 处已提前 return）
         #[cfg(target_os = "linux")]
         {
             use std::time::Duration;
 
-            if let Err(e) = gtk::init() {
-                eprintln!("tray: gtk init 失败（无显示环境？）: {e}");
-                return;
-            }
             loop {
                 while gtk::events_pending() {
                     gtk::main_iteration_do(false);
