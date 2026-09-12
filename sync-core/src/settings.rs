@@ -29,6 +29,10 @@ fn default_audio_codec() -> String {
     DEFAULT_AUDIO_CODEC.to_string()
 }
 
+fn default_icon_theme() -> String {
+    "dark".to_string()
+}
+
 /// config 文件内容（全部字段带默认值，保证旧文件缺字段也能解析）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -50,6 +54,10 @@ pub struct AppConfig {
     /// scrcpy 音频编码器：opus / aac / flac / raw
     #[serde(default = "default_audio_codec")]
     pub audio_codec: String,
+    /// 图标主题：dark（黑）/ light（白）——软件窗口图标与托盘图标共用。
+    /// 按桌面面板/任务栏明暗选择：深色面板用 dark，浅色面板用 light 才看得清。
+    #[serde(default = "default_icon_theme")]
+    pub icon_theme: String,
 }
 
 impl Default for AppConfig {
@@ -61,6 +69,7 @@ impl Default for AppConfig {
             video_max_fps: 0,
             audio_bit_rate: DEFAULT_AUDIO_BIT_RATE,
             audio_codec: DEFAULT_AUDIO_CODEC.to_string(),
+            icon_theme: "dark".to_string(),
         }
     }
 }
@@ -151,6 +160,7 @@ mod tests {
             video_max_fps: 30,
             audio_bit_rate: 96_000,
             audio_codec: "aac".to_string(),
+            icon_theme: "light".to_string(),
         };
         let text = serde_json::to_string(&cfg).unwrap();
         let back: AppConfig = serde_json::from_str(&text).unwrap();
@@ -160,6 +170,7 @@ mod tests {
         assert_eq!(back.video_max_fps, 30);
         assert_eq!(back.audio_bit_rate, 96_000);
         assert_eq!(back.audio_codec, "aac");
+        assert_eq!(back.icon_theme, "light");
     }
 
     #[test]
@@ -173,6 +184,7 @@ mod tests {
         assert_eq!(cfg.video_max_fps, 0);
         assert_eq!(cfg.audio_bit_rate, DEFAULT_AUDIO_BIT_RATE);
         assert_eq!(cfg.audio_codec, DEFAULT_AUDIO_CODEC);
+        assert_eq!(cfg.icon_theme, "dark");
     }
 
     #[test]

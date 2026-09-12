@@ -50,7 +50,7 @@ export interface LocalFusionWindow {
   label: string;
 }
 
-// 设置：开机自启动 + 编码参数
+// 设置：开机自启动 + 编码参数 + 图标主题
 export interface SettingsState {
   autostartEnabled: boolean;
   autostartSupported: boolean;
@@ -59,6 +59,7 @@ export interface SettingsState {
   videoMaxFps: number; // fps, 0=不限
   audioBitRate: number; // bps
   audioCodec: string; // opus/aac/flac/raw
+  iconTheme: string; // dark/light——软件窗口图标与托盘图标共用
 }
 
 // daemon 返回的原始设置字段（snake_case）
@@ -70,6 +71,7 @@ export interface SettingsPayload {
   video_max_fps: number;
   audio_bit_rate: number;
   audio_codec: string;
+  icon_theme: string;
 }
 
 // 设置页本地编辑中的编码参数（Mbps / kbps 显示单位）

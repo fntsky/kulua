@@ -280,6 +280,7 @@ fn settings_payload(autostart_enabled: bool, autostart_supported: bool) -> respo
         video_max_fps: config.video_max_fps,
         audio_bit_rate: config.audio_bit_rate,
         audio_codec: config.audio_codec.clone(),
+        icon_theme: config.icon_theme.clone(),
     }
 }
 
@@ -351,5 +352,34 @@ pub(super) async fn settings_set_scrcpy_params(
             )
         }
         Err(e) => make_error(req.id, ERROR_CODE, &format!("保存 scrcpy 参数失败: {e}")),
+    }
+}
+
+/// `settings.set_icon_theme`：写入图标主题（dark/light）并回读设置。
+///
+/// 不重启任何会话：窗口/托盘图标由各自进程按新主题即时刷新。
+pub(super) fn settings_set_icon_theme(req: &proto::Request) -> proto::Response {
+    let Some(request::Payload::SetIconTheme(params)) = &req.params else {
+        return make_error(req.id, ERROR_CODE, "缺少 settings.set_icon_theme 参数");
+    };
+    if !matches!(params.icon_theme.as_str(), "dark" | "light") {
+        return make_error(
+            req.id,
+            ERROR_CODE,
+            &format!("不支持的图标主题: {}", params.icon_theme),
+        );
+    }
+    let mut config = crate::settings::read();
+    config.icon_theme = params.icon_theme.clone();
+    match crate::settings::write(&config) {
+        Ok(()) => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("daemon"));
+            let state = crate::autostart::current_state(&exe);
+            make_result(
+                req.id,
+                response::Payload::Settings(settings_payload(state.enabled, state.supported)),
+            )
+        }
+        Err(e) => make_error(req.id, ERROR_CODE, &format!("保存图标主题失败: {e}")),
     }
 }

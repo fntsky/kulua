@@ -227,6 +227,8 @@ cargo run --package daemon
 - **开机自启动**：Linux 走 XDG autostart（`~/.config/autostart/kulua-daemon.desktop`），
   GUI 设置面板开关与 Windows 注册表版本等效；reconcile 会自愈不一致的条目
 - 桌面通知经 D-Bus（libnotify）弹出
+- **图标主题**：设置面板可在深色/浅色间切换软件窗口图标与托盘图标
+  （黑/白两版 logo 内嵌在 daemon 与 GUI 中，切换即时生效，托盘热切换≤1s）
 
 ## Project Structure
 

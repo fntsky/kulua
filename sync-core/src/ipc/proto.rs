@@ -23,7 +23,7 @@ pub struct Request {
     pub method: String,
     #[prost(
         oneof = "request::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub params: Option<request::Payload>,
 }
@@ -292,6 +292,14 @@ pub mod request {
         pub audio_codec: Option<String>,
     }
 
+    /// `settings.set_icon_theme` 参数：目标图标主题。
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SetIconTheme {
+        /// dark（黑）/ light（白）
+        #[prost(string, tag = "1")]
+        pub icon_theme: String,
+    }
+
     /// `app.list` 参数。
     #[derive(Clone, PartialEq, Message)]
     pub struct AppListParams {
@@ -335,6 +343,9 @@ pub mod request {
         /// `settings.set_scrcpy_params`
         #[prost(message, tag = "16")]
         SetScrcpyParams(SetScrcpyParams),
+        /// `settings.set_icon_theme`
+        #[prost(message, tag = "19")]
+        SetIconTheme(SetIconTheme),
         /// `app.list`
         #[prost(message, tag = "17")]
         AppListParams(AppListParams),
@@ -398,6 +409,9 @@ pub mod response {
         /// scrcpy 音频编码器：opus / aac / flac / raw
         #[prost(string, tag = "7")]
         pub audio_codec: String,
+        /// 图标主题：dark（黑）/ light（白）
+        #[prost(string, tag = "8")]
+        pub icon_theme: String,
     }
 
     /// `app.list` 的结果。
@@ -531,6 +545,7 @@ mod tests {
                 video_max_fps: 60,
                 audio_bit_rate: 128_000,
                 audio_codec: "aac".to_string(),
+                icon_theme: "light".to_string(),
             })),
             error: None,
         };

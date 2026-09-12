@@ -64,6 +64,8 @@ struct SettingsInfo {
     video_max_fps: u32,
     audio_bit_rate: u32,
     audio_codec: String,
+    /// 图标主题：dark（黑）/ light（白）
+    icon_theme: String,
 }
 
 /// 发送给前端的会话列表事件载荷。
@@ -288,16 +290,21 @@ fn settings_to_info(s: &response::Settings) -> SettingsInfo {
         video_max_fps: s.video_max_fps,
         audio_bit_rate: s.audio_bit_rate,
         audio_codec: s.audio_codec.clone(),
+        icon_theme: s.icon_theme.clone(),
     }
 }
 
-/// 读取应用设置（含开机自启动状态 + 编码参数）。
+/// 读取应用设置（含开机自启动状态 + 编码参数）；顺带把窗口图标刷成 config 主题。
 #[tauri::command]
-async fn get_settings(state: State<'_, AppState>) -> Result<SettingsInfo, String> {
+async fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsInfo, String> {
     let resp = ipc_request(&state, "settings.get", None).await?;
     check_response(&resp)?;
     match resp.result {
-        Some(response::Payload::Settings(s)) => Ok(settings_to_info(&s)),
+        Some(response::Payload::Settings(s)) => {
+            let info = settings_to_info(&s);
+            apply_window_icon(&app, &info.icon_theme);
+            Ok(info)
+        }
         _ => Err("daemon 返回了意外的 settings.get 结果".into()),
     }
 }
@@ -338,6 +345,48 @@ async fn set_scrcpy_params(
         Some(response::Payload::Settings(s)) => Ok(settings_to_info(&s)),
         _ => Err("daemon 返回了意外的 settings.set_scrcpy_params 结果".into()),
     }
+}
+
+/// 把主题对应的 logo 设为窗口（任务栏/标题栏）图标。
+///
+/// 图标随主窗口 label "main" 即时替换；解码失败仅记日志，不影响功能。
+fn apply_window_icon(app: &AppHandle, theme: &str) {
+    let bytes: &[u8] = if theme == "light" {
+        include_bytes!("../../../logo-light.png")
+    } else {
+        include_bytes!("../../../logo.png")
+    };
+    let img = match tauri::image::Image::from_bytes(bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("window icon 解码失败: {e}");
+            return;
+        }
+    };
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(e) = window.set_icon(img) {
+            eprintln!("设置窗口图标失败: {e}");
+        }
+    }
+}
+
+/// 设置图标主题（dark/light）：持久化到 daemon config 真源，并立即刷新窗口图标。
+/// 托盘图标由 daemon 侧轮询 config 自动热切换。
+#[tauri::command]
+async fn set_icon_theme(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    theme: String,
+) -> Result<SettingsInfo, String> {
+    let params = request::Payload::SetIconTheme(request::SetIconTheme { icon_theme: theme });
+    let resp = ipc_request(&state, "settings.set_icon_theme", Some(params)).await?;
+    check_response(&resp)?;
+    let info = match resp.result {
+        Some(response::Payload::Settings(s)) => settings_to_info(&s),
+        _ => return Err("daemon 返回了意外的 settings.set_icon_theme 结果".into()),
+    };
+    apply_window_icon(&app, &info.icon_theme);
+    Ok(info)
 }
 
 /// 枚举设备可启动应用（`app.list`；带 60s 缓存，force=true 强制刷新）。
@@ -624,6 +673,7 @@ pub fn run() {
             get_settings,
             set_autostart,
             set_scrcpy_params,
+            set_icon_theme,
             get_apps,
             open_app,
             fusion::fusion_start,

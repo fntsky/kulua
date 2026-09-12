@@ -298,6 +298,7 @@ async fn dispatch_request(
         "settings.get" => handlers::settings_get(req),
         "settings.set_autostart" => handlers::settings_set_autostart(req),
         "settings.set_scrcpy_params" => handlers::settings_set_scrcpy_params(req, cmd_tx).await,
+        "settings.set_icon_theme" => handlers::settings_set_icon_theme(req),
 
         _ => make_error(req.id, ERROR_CODE, &format!("未知方法: {}", req.method)),
     }

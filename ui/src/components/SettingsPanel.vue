@@ -6,6 +6,7 @@ import type { ScrcpyDraft, SettingsState } from "../types";
 defineProps<{
   connected: boolean;
   settings: SettingsState;
+  iconTheme: string;
   draft: ScrcpyDraft;
   settingsError: string;
   theme: string;
@@ -13,6 +14,7 @@ defineProps<{
 
 const emit = defineEmits<{
   (e: "set-theme", mode: "dark" | "light"): void;
+  (e: "set-icon-theme", mode: "dark" | "light"): void;
   (e: "toggle-autostart"): void;
   (e: "save"): void;
 }>();
@@ -36,6 +38,28 @@ const emit = defineEmits<{
             @click="emit('set-theme', 'light')"
           >浅色</span>
         </div>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">图标（窗口/托盘）</span>
+        <div class="theme-segment">
+          <span
+            class="theme-option"
+            :class="{ active: iconTheme === 'dark' }"
+            @click="emit('set-icon-theme', 'dark')"
+          >
+            <span class="icon-swatch icon-swatch-dark">K</span>深色
+          </span>
+          <span
+            class="theme-option"
+            :class="{ active: iconTheme === 'light' }"
+            @click="emit('set-icon-theme', 'light')"
+          >
+            <span class="icon-swatch icon-swatch-light">K</span>浅色
+          </span>
+        </div>
+      </div>
+      <div class="settings-help">
+        按任务栏/面板明暗选择：深色面板用深色图标，浅色面板用浅色图标才看得清。
       </div>
     </div>
     <div class="section">常规</div>

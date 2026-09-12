@@ -44,6 +44,7 @@ const settings = ref<SettingsState>({
   videoMaxFps: 0,
   audioBitRate: 128000,
   audioCodec: "opus",
+  iconTheme: "dark",
 });
 // 设置页本地编辑中的编码参数（Mbps / kbps 显示单位）
 const scrcpyDraft = ref<ScrcpyDraft>({
@@ -64,6 +65,7 @@ function applySettings(s: SettingsPayload) {
     videoMaxFps: s.video_max_fps,
     audioBitRate: s.audio_bit_rate,
     audioCodec: s.audio_codec,
+    iconTheme: s.icon_theme,
   };
   scrcpyDraft.value = {
     videoBitRateMbps: s.video_bit_rate / 1_000_000,
@@ -92,6 +94,17 @@ async function toggleAutostart() {
   } catch (e) {
     console.error("set_autostart failed:", e);
     settingsError.value = `设置自启动失败：${String(e)}`;
+  }
+}
+// 图标主题（dark/light）：软件窗口图标 + daemon 托盘图标（daemon 轮询 config 热切换）
+async function setIconTheme(mode: "dark" | "light") {
+  try {
+    const s = await invoke<SettingsPayload>("set_icon_theme", { theme: mode });
+    applySettings(s);
+    settingsError.value = "";
+  } catch (e) {
+    console.error("set_icon_theme failed:", e);
+    settingsError.value = `设置图标主题失败：${String(e)}`;
   }
 }
 // 保存编码参数（0 值 = 不限制 / 用 server 默认）
@@ -492,10 +505,12 @@ onMounted(async () => {
         v-else
         :connected="connected"
         :settings="settings"
+        :icon-theme="settings.iconTheme"
         :draft="scrcpyDraft"
         :settings-error="settingsError"
         :theme="theme"
         @set-theme="setTheme"
+        @set-icon-theme="setIconTheme"
         @toggle-autostart="toggleAutostart"
         @save="saveScrcpyParams"
       />
@@ -820,6 +835,13 @@ body {
 .theme-option.active {
   color: #fff; background: var(--green);
 }
+.icon-swatch {
+  display: inline-block; width: 14px; height: 14px; margin-right: 6px;
+  border-radius: 3px; font-size: 9px; line-height: 14px; text-align: center;
+  vertical-align: -2px; border: 1px solid var(--border);
+}
+.icon-swatch-dark { background: #16181d; color: #fff; }
+.icon-swatch-light { background: #fff; color: #16181d; }
 .settings-help {
   font-size: 11px; color: var(--dim); line-height: 1.6;
   border-top: 1px solid var(--border); padding-top: 10px;

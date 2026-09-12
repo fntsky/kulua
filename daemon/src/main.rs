@@ -86,12 +86,29 @@ fn kill_ui(ui_handle: &Mutex<Option<Child>>) {
     }
 }
 
+/// 按图标主题返回内嵌的 logo 像素数据：dark=黑底，light=白底（release 包自带，无需外部文件）。
+fn logo_bytes(theme: &str) -> &'static [u8] {
+    if theme == "light" {
+        include_bytes!("../../logo-light.png")
+    } else {
+        include_bytes!("../../logo.png")
+    }
+}
+
+/// 把主题对应的 logo 解码为托盘图标（解码失败返回 None，调用方降级）。
+fn tray_icon_for(theme: &str) -> Option<tray_icon::Icon> {
+    let img = image::load_from_memory(logo_bytes(theme)).ok()?;
+    let rgba = img.to_rgba8();
+    let (icon_w, icon_h) = rgba.dimensions();
+    tray_icon::Icon::from_rgba(rgba.into_raw(), icon_w, icon_h).ok()
+}
+
 fn setup_tray_icon(
     ui_handle: Arc<Mutex<Option<Child>>>,
     token: tokio_util::sync::CancellationToken,
 ) {
+    use tray_icon::TrayIconBuilder;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::{Icon, TrayIconBuilder};
 
     std::thread::spawn(move || {
         // Linux 必须先 gtk::init()：TrayIconBuilder::build（muda 建 GTK 菜单）内部
@@ -110,14 +127,17 @@ fn setup_tray_icon(
         menu.append(&open_item).expect("append menu item");
         menu.append(&quit_item).expect("append menu item");
 
-        // 从项目根 logo.png 解码为托盘图标
-        let logo_bytes = include_bytes!("../../logo.png");
-        let img = image::load_from_memory(logo_bytes).expect("decode logo.png");
-        let rgba = img.to_rgba8();
-        let (icon_w, icon_h) = rgba.dimensions();
-        let icon = Icon::from_rgba(rgba.into_raw(), icon_w, icon_h).expect("create tray icon");
+        // 图标主题（config 真源）：设置面板可切换 dark/light，托盘即时刷新
+        let mut current_theme = sync_core::settings::read().icon_theme;
+        let icon = match tray_icon_for(&current_theme) {
+            Some(i) => i,
+            None => {
+                eprintln!("tray: 图标解码失败（{}）", current_theme);
+                return;
+            }
+        };
 
-        let _tray = match TrayIconBuilder::new()
+        let mut _tray = match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
             .with_tooltip("Kulua")
@@ -171,11 +191,23 @@ fn setup_tray_icon(
         // （gtk::init 已在线程开头完成；失败路径在 init/build 处已提前 return）
         #[cfg(target_os = "linux")]
         {
-            use std::time::Duration;
+            use std::time::{Duration, Instant};
 
+            let mut last_theme_check = Instant::now();
             loop {
                 while gtk::events_pending() {
                     gtk::main_iteration_do(false);
+                }
+                // 设置面板改图标主题 → config 文件变化 → 这里 1s 内感知并热切换托盘图标
+                if last_theme_check.elapsed() >= Duration::from_secs(1) {
+                    last_theme_check = Instant::now();
+                    let theme = sync_core::settings::read().icon_theme;
+                    if theme != current_theme {
+                        current_theme = theme.clone();
+                        if let Some(icon) = tray_icon_for(&current_theme) {
+                            let _ = _tray.set_icon(Some(icon));
+                        }
+                    }
                 }
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
                     if event.id() == quit_item.id() {
