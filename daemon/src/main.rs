@@ -108,12 +108,20 @@ fn setup_tray_icon(
         let (icon_w, icon_h) = rgba.dimensions();
         let icon = Icon::from_rgba(rgba.into_raw(), icon_w, icon_h).expect("create tray icon");
 
-        let _tray = TrayIconBuilder::new()
+        let _tray = match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
             .with_tooltip("Kulua")
             .build()
-            .expect("build tray icon");
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // 桌面环境缺 StatusNotifier 宿主 / 无显示环境时可能失败；
+                // 托盘只是辅助入口，失败不应影响 daemon 主功能
+                eprintln!("tray icon 创建失败（桌面环境不支持托盘？）: {e}");
+                return;
+            }
+        };
 
         // Windows: Win32 message loop required by tray-icon
         #[cfg(target_os = "windows")]
@@ -146,8 +154,38 @@ fn setup_tray_icon(
             }
         }
 
-        // Non-Windows: block on channel
-        #[cfg(not(target_os = "windows"))]
+        // Linux: libappindicator 必须靠 GTK 主循环迭代才会注册/显示托盘图标。
+        // 事件泵（gtk::main_iteration_do）与菜单轮询共用本线程；20ms 间隔足以
+        // 让 StatusNotifierItem 显示并对点击响应，又不至于空转烧 CPU。
+        // 无显示环境（SSH/Headless）时 gtk::init 失败 → 放弃托盘，不影响其余功能。
+        #[cfg(target_os = "linux")]
+        {
+            use std::time::Duration;
+
+            if let Err(e) = gtk::init() {
+                eprintln!("tray: gtk init 失败（无显示环境？）: {e}");
+                return;
+            }
+            loop {
+                while gtk::events_pending() {
+                    gtk::main_iteration_do(false);
+                }
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if event.id() == quit_item.id() {
+                        // 退出：先结束前台 UI，再让 daemon 优雅退出
+                        kill_ui(&ui_handle);
+                        token.cancel();
+                        return;
+                    } else if event.id() == open_item.id() {
+                        spawn_ui(&ui_handle);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // 其余平台（macOS 等）: block on channel
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let receiver = MenuEvent::receiver();
             while let Ok(event) = receiver.recv() {

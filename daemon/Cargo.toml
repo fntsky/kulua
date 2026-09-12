@@ -15,3 +15,7 @@ tokio-util = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Console"] }
+
+# Linux 托盘：泵 GTK 主循环让 libappindicator 显示图标（见 main.rs setup_tray_icon）
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
