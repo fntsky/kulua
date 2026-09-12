@@ -193,18 +193,29 @@ impl AdbOps for AdbCmd {
     }
 }
 
-/// 解析 adb 路径：当前目录优先，PATH 兜底。
+/// 解析 adb 路径：可执行文件同目录 → 当前目录 → PATH 兜底。
+///
+/// WHY 同目录优先：发布包（dist/kulua/）与 Windows 版一致捆绑 adb，而 daemon
+/// 可能从 .desktop / 绝对路径启动（CWD 不在 dist 目录），此时仅查 CWD 会
+/// 找不到捆绑的 adb。
 pub fn resolve_adb() -> PathBuf {
     #[cfg(windows)]
-    let local = "./adb.exe";
+    let exe_name = "adb.exe";
     #[cfg(not(windows))]
-    let local = "./adb";
+    let exe_name = "adb";
 
-    if std::path::Path::new(local).exists() {
-        PathBuf::from(local)
-    } else {
-        PathBuf::from("adb")
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(exe_name));
+        }
     }
+    candidates.push(PathBuf::from(format!("./{exe_name}")));
+
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(exe_name))
 }
 
 impl AdbCmd {

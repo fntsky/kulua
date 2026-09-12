@@ -101,7 +101,9 @@ elif command -v adb >/dev/null 2>&1; then
     echo "  adb bundled from PATH ($(command -v adb))"
     adb_found=true
 else
-    echo "  WARNING: adb not found -- daemon 将回退到 PATH 中的 adb" >&2
+    echo "  WARNING: adb not found（daemon 必需）-- 装系统包后重跑，或下载放 ./adb：" >&2
+    echo "    sudo pacman -S android-tools" >&2
+    echo "    # 或: 手动下载 https://dl.google.com/android/repository/platform-tools-latest-linux.zip 解压到项目根 ./adb" >&2
 fi
 
 # ── 验证 ──
