@@ -4,6 +4,7 @@
 # 用法:
 #   ./build.sh            # debug 构建（daemon + sync-ui，不打包）
 #   ./build.sh release    # release 构建 + 打包 dist/kulua/
+#   TAURI_BUNDLE=1 ./build.sh release   # 额外生成原生安装包（deb/rpm/AppImage）
 #
 # 依赖: rust (cargo), node/npm, tauri Linux 系统库（webkit2gtk-4.1 等），
 #       打包阶段可选 adb（PATH 或 ./adb）与 kulua-server.jar（缺时自动构建）。
@@ -12,7 +13,13 @@ set -euo pipefail
 RELEASE="${1:-debug}"
 TARGET_FLAG=""
 TAURI_FLAGS="--debug --no-bundle"
-[[ "$RELEASE" == "release" ]] && { TARGET_FLAG="--release"; TAURI_FLAGS=""; }
+if [[ "$RELEASE" == "release" ]]; then
+    TARGET_FLAG="--release"
+    # 默认不生成原生安装包（AppImage 打包需联网下载 linuxdeploy 等工具），
+    # 与 Windows 版 dist/kulua 文件夹形态一致；需要安装包时 TAURI_BUNDLE=1 ./build.sh release
+    TAURI_FLAGS="${TAURI_BUNDLE:+}"
+    [[ -n "$TAURI_BUNDLE" ]] || TAURI_FLAGS="--no-bundle"
+fi
 
 CONFIG_DIR="target/$([ "$RELEASE" == "release" ] && echo "release" || echo "debug")"
 DIST="dist/kulua"
