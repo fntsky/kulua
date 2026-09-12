@@ -46,7 +46,7 @@ const filteredApps = computed(() => {
         <span class="modal-close" @click="emit('close')">✕</span>
       </div>
       <div v-if="!fusionSupported" class="modal-error">
-        未找到 fusion-viewer.exe：请将其放入 daemon 同目录后重启 daemon。
+        融合模式不可用：daemon 未就绪或设备不受支持（需要 Android 10+）。
       </div>
       <template v-else>
         <div class="modal-toolbar">

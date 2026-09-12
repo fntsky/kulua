@@ -420,7 +420,7 @@ impl Core {
         self.last_received_from_phone = Some(text.clone());
 
         println!("System clipboard (from phone): {}", text);
-        if let Err(e) = clipboard_win::set_clipboard_string(&text) {
+        if let Err(e) = crate::clipboard::set_text(&text) {
             eprintln!("Clipboard: failed to write from phone: {}", e);
         }
         self.clipboard_last_seen = Some(text);
@@ -806,7 +806,7 @@ impl Core {
     }
 
     fn poll_system_clipboard(&mut self) {
-        match &clipboard_win::get_clipboard_string() {
+        match &crate::clipboard::get_text() {
             Ok(text) if Some(text.as_str()) != self.clipboard_last_seen.as_deref() => {
                 self.clipboard_last_seen = Some(text.clone());
                 self.last_clipboard_error_print = Instant::now();
@@ -1383,8 +1383,17 @@ mod tests {
     }
 
     /// 向设备的 DeviceEntry 塞入一个假 handle（哨兵 port 9999，state 可指定）。
-    fn inject_fake_session(core: &mut Core, device: &Device, state: u8) -> oneshot::Receiver<()> {
+    ///
+    /// 返回 (stop_rx, audio_target_rx)：rx 必须由调用方持有存活，否则
+    /// watch::Sender::send 因无接收者而静默失败（tokio 语义），热切换断言会失真。
+    fn inject_fake_session(
+        core: &mut Core,
+        device: &Device,
+        state: u8,
+    ) -> (oneshot::Receiver<()>, watch::Receiver<session::AudioTarget>) {
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (audio_target_tx, audio_target_rx) =
+            watch::channel(session::AudioTarget::new(false, 2)); // aac
         core.devices.get_mut(&device.uuid).unwrap().session = Some(session::Handle {
             device: device.clone(),
             port: 9999, // 哨兵值：区别于 start_session 分配的 27183
@@ -1395,10 +1404,10 @@ mod tests {
             volume: Arc::new(AtomicU16::new(80)),
             session_state: Arc::new(AtomicU8::new(state)),
             audio_latency: Arc::new(AtomicU64::new(0)),
-            audio_target: watch::channel(session::AudioTarget::new(false, 2)).0, // aac
+            audio_target: audio_target_tx,
             audio_runtime: session::shared_runtime(),
         });
-        stop_rx
+        (stop_rx, audio_target_rx)
     }
 
     fn test_device(state: DeviceState) -> Device {
@@ -1433,7 +1442,7 @@ mod tests {
         // 不变量：一个设备至多一个 session；已有活跃 session 时点击必须 no-op
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx =
+        let (mut stop_rx, _target_rx) =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
 
         core.on_command(Command::StartSession(device.serial.clone()))
@@ -1453,7 +1462,7 @@ mod tests {
         // failed 墓碑不算活跃 session → 点击重建（等价重试按钮）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx =
+        let (mut stop_rx, _target_rx) =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_FAILED);
 
         core.on_command(Command::StartSession(device.serial.clone()))
@@ -1500,7 +1509,7 @@ mod tests {
         // 不重启 session（stop 不触发，端口不变）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx =
+        let (mut stop_rx, _target_rx) =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_RUNNING);
         // 当前目标是 opus，配置里的编码来自全局 settings（两边读同一来源）
         let expected =
@@ -1543,7 +1552,7 @@ mod tests {
         // failed 墓碑 session：编码变更 → 全量重建（等价重试）
         let device = test_device(DeviceState::Device);
         let mut core = core_with_device(device.clone());
-        let mut stop_rx =
+        let (mut stop_rx, _target_rx) =
             inject_fake_session(&mut core, &device, crate::session::SESSION_STATE_FAILED);
 
         core.on_command(Command::RestartAllSessions).await;

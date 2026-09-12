@@ -11,3 +11,7 @@ node_modules
 kulua-server/build/
 # 根目录 jar 副本（daemon find_jar 运行时查找用，构建产物不入库）
 /kulua-server.jar
+# 本机 cargo 缓存（rsproxy 镜像；沙箱 HOME 只读，build 命令需 CARGO_HOME 指向此处）
+/.cargo-cache/
+# 本机编辑器配置（含绝对路径，不入库）
+/.vscode/

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tray-icon = "0.24"
+# Linux 不需要 muda 的 libxdo（xdotool）：自定菜单项（打开/退出）走 GTK 即可，
+# 关闭默认 feature 省掉 xdotool 系统依赖
+tray-icon = { version = "0.24", default-features = false, features = ["gtk"] }
 sync-core = { path = "../sync-core" }
 image = "0.25"
 ctrlc = "3.4"

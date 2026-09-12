@@ -89,7 +89,7 @@ pub(super) async fn device_disconnect(
 
 /// `clipboard.get`：读取本机剪贴板文本（读取失败时返回空串）。
 pub(super) fn clipboard_get(req: &proto::Request) -> proto::Response {
-    let text = match clipboard_win::get_clipboard_string() {
+    let text = match crate::clipboard::get_text() {
         Ok(t) => t,
         Err(_) => String::new(),
     };

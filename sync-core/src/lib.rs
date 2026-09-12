@@ -4,6 +4,7 @@ pub mod apps;
 pub mod audio_player;
 pub mod autostart;
 pub mod cli;
+pub mod clipboard;
 pub mod device_refresh;
 pub mod ipc;
 pub mod notification;

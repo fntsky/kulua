@@ -4,7 +4,7 @@
 
 ## How It Works
 
-利用 Android 系统自带的 ADB 调试功能，`adb push` 自研 `kulua-server.jar`（`kulua-server/` 目录的 Java 工程，`build.ps1` 构建）到设备后通过 `app_process` 启动，实现"零安装"的剪贴板读取、多窗口融合视频与音频回传。
+利用 Android 系统自带的 ADB 调试功能，`adb push` 自研 `kulua-server.jar`（`kulua-server/` 目录的 Java 工程，`kulua-server/build.sh`（Linux）/ `build.ps1`（Windows）构建）到设备后通过 `app_process` 启动，实现"零安装"的剪贴板读取、多窗口融合视频与音频回传。
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -119,7 +119,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 
 - GUI 侧按单客户端使用
 - Request / Response / Event / Audio 四种帧类型，RPC 载荷为 Protobuf 强类型消息
-- 端口号写入 `%TEMP%/sync-daemon.port`
+- 端口号写入 `%TEMP%/sync-daemon.port`（Linux 为 `/tmp/sync-daemon.port`）
 
 #### RPC 方法
 
@@ -155,7 +155,7 @@ GUI 与 daemon 之间通过 **TCP 本地回环 + Protobuf** 通信：
 ### Prerequisites
 
 - Rust 2024 edition toolchain
-- [adb](https://developer.android.com/tools/adb)（`PATH` 中或项目目录下的 `adb.exe`）
+- [adb](https://developer.android.com/tools/adb)（`PATH` 中，或项目目录下的 `adb` / `adb.exe`）
 - Node.js 18+（构建 GUI）
 - Android 设备（Android 11+ 推荐无线调试）
 
@@ -181,10 +181,52 @@ npm install
 npm run tauri dev
 ```
 
-首次使用前需要将 `kulua-server.jar`（`kulua-server/build.ps1` 构建产出）放在项目根目录或 daemon 同级目录。
+首次使用前需要将 `kulua-server.jar`（`kulua-server/build.sh`（Linux）/ `build.ps1`（Windows）构建产出）放在项目根目录或 daemon 同级目录。
 
-Windows 发布包（`build.ps1 -Release`）会自动打包 daemon、GUI 与自研 `kulua-server.jar`。
-融合模式无额外运行时依赖（视频解码由 WebView2 内置 WebCodecs 硬解完成）。
+- **Windows** 发布包（`build.ps1 -Release`）自动打包 daemon、GUI 与自研 `kulua-server.jar` 到 `dist/kulua/`
+- **Linux** 发布包（`./build.sh release`）同样打包到 `dist/kulua/`（含自动捆绑 `adb` 与 jar）
+- 融合模式无额外运行时依赖（视频解码由 WebView2 / WebKitGTK 内置 WebCodecs 硬解完成，无 FFmpeg 依赖）
+
+## Linux 支持（feat/linux-port）
+
+基于 `main` 分支的 Linux 移植，构建与运行全部在 Linux 上完成：
+
+### 系统依赖（Arch / CachyOS）
+
+```bash
+sudo pacman -S rustup nodejs npm adb webkit2gtk-4.1 javascriptcoregtk-4.1 \
+    gtk3 libsoup3 dbus glib2 openssl alsa-lib cmake java-openjdk
+```
+
+> Debian/Ubuntu 对应：`libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libdbus-1-dev libssl-dev libasound2-dev cmake default-jdk`
+> 托盘图标需要 `libappindicator` 运行时（可选）。
+
+### 构建
+
+```bash
+./build.sh            # debug 构建（target/debug/daemon、target/debug/sync-ui）
+./build.sh release    # release 构建 + 打包 dist/kulua/
+```
+
+设备端 jar 在 Linux 上构建（需 Android SDK，`d8` 与 `android.jar`）：
+
+```bash
+ANDROID_HOME=~/Android/Sdk ./kulua-server/build.sh   # 产出 kulua-server/build/kulua-server.jar
+```
+
+### 运行
+
+```bash
+./dist/kulua/daemon        # 发布包：daemon 自动拉起 sync-ui 窗口
+# 或开发模式：
+cargo run --package daemon
+```
+
+- adb 查找顺序：daemon 同目录 `./adb` → `PATH`
+- config 文件在 `~/.config/kulua/config.json`
+- **开机自启动**：Linux 走 XDG autostart（`~/.config/autostart/kulua-daemon.desktop`），
+  GUI 设置面板开关与 Windows 注册表版本等效；reconcile 会自愈不一致的条目
+- 桌面通知经 D-Bus（libnotify）弹出
 
 ## Project Structure
 
@@ -198,7 +240,6 @@ kulua/
 │       ├── session/     # 会话生命周期（含 config / handle / runner / proto）
 │       ├── scrcpy.rs    # kulua-server 部署/启停（scid 会话隔离）
 │       ├── apps.rs      # 设备应用枚举（server 一次性模式 + 缓存）
-│       ├── fusion.rs    # 融合窗口管理（fusion-viewer.exe 进程）
 │       ├── adb_cmd.rs   # ADB CLI 封装
 │       ├── ipc/         # TCP Protobuf IPC 服务
 │       ├── wireless_pair.rs
@@ -210,7 +251,8 @@ kulua/
 │   ├── fusion.html      # 融合窗口页面（WebCodecs 解码渲染，无构建依赖）
 │   └── src-tauri/       # Tauri Rust 后端（IPC 客户端 + fusion_* 窗口命令）
 ├── kulua-server/        # 自研设备端 server（Java：多虚拟显示器 + 剪贴板 + 音频回传）
-│   └── build.ps1        # javac + d8 + jar 构建脚本
+│   ├── build.ps1        # javac + d8 + jar 构建脚本 (Windows)
+│   └── build.sh         # javac + d8 + jar 构建脚本 (Linux)
 ├── build.sh             # 构建脚本 (Linux/macOS)
 ├── build.ps1            # 构建脚本 (Windows)
 └── IPC-DESIGN.md        # IPC 协议设计文档

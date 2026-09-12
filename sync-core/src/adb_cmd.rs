@@ -233,6 +233,21 @@ pub mod mock {
     use crate::wireless_pair;
     use std::sync::Mutex;
 
+    /// 平台无关的 no-op 命令：Windows 用 `cmd /c`，类 Unix 用 `true`。
+    /// 仅用于 mock 中产出一个「立即成功退出」的假子进程，验证管道收尾逻辑。
+    fn dummy_cmd() -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/c");
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("true")
+        }
+    }
+
     /// Mock adb for controlled testing.
     ///
     /// Default: all operations succeed with empty/zero values.
@@ -256,10 +271,7 @@ pub mod mock {
 
     impl MockAdb {
         pub fn new() -> Self {
-            let status = std::process::Command::new("cmd")
-                .arg("/c")
-                .status()
-                .expect("spawn mock dummy cmd process");
+            let status = dummy_cmd().status().expect("spawn mock dummy process");
             Self {
                 devices_result: vec![],
                 fail_check: false,
@@ -334,8 +346,7 @@ pub mod mock {
             _shell_args: &[&str],
         ) -> Result<std::process::Child, AdbError> {
             self.calls.lock().unwrap().push("spawn_shell");
-            let dummy = std::process::Command::new("cmd")
-                .arg("/c")
+            let dummy = dummy_cmd()
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -344,8 +355,7 @@ pub mod mock {
         }
         fn track_devices(&self) -> Result<std::process::Child, AdbError> {
             self.calls.lock().unwrap().push("track_devices");
-            let dummy = std::process::Command::new("cmd")
-                .arg("/c")
+            let dummy = dummy_cmd()
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()

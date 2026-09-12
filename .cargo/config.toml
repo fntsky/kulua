@@ -1,10 +1,5 @@
 [env]
 # audiopus_sys/opus 的 CMakeLists.txt 使用 `cmake_minimum_required(VERSION 2.8)`,
 # 但 CMake ≥4.0 不再兼容 <3.5 的版本声明。
-# 通过此变量让 CMake 兼容旧版语法。
+# 通过此变量让 CMake 兼容旧版语法（Linux/Windows 均需要）。
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
-# ── fusion-viewer：FFmpeg 7.1 自研客户端构建环境 ──
-# FFMPEG_DIR：vendor 头文件 + .lib 导入库（由 dist 的 avcodec-62.dll/avutil-60.dll 生成）
-# LIBCLANG_PATH：ffmpeg-sys-next(bindgen) 需要 libclang.dll
-FFMPEG_DIR = "E:\\code\\sync-workspace\\vendor\\ffmpeg-7.1"
-LIBCLANG_PATH = "E:\\code\\sync-workspace\\.tools\\libclang"

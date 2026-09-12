@@ -9,7 +9,6 @@ image = "0.25"
 rand = "0.8"
 qrcode = "0.14"
 mdns-sd = "0.10"
-clipboard-win = "5.4"
 notify-rust = "4.11"
 serde = { version = "1", features = ["derive"] }
 bytes = "1"
@@ -28,3 +27,9 @@ kulua-proto = { path = "../kulua-proto" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+clipboard-win = "5.4"
+
+# 非 Windows（Linux/macOS）：arboard 纯 Rust 实现，Linux 走 Wayland/X11 协议，
+# 无需安装 wl-copy/xclip 等外部工具
+[target.'cfg(not(windows))'.dependencies]
+arboard = "3"

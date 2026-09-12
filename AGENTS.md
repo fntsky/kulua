@@ -4,7 +4,7 @@
 
 Rust 实现的 ADB 无线配对 & 剪贴板同步工具，通过 Wi-Fi 与 Android 手机互通，**手机上无需安装任何软件**。
 
-**核心思路：** 利用 Android 系统自带的 ADB 调试功能 + `adb push` 自研 `kulua-server.jar`（`kulua-server/` 目录，Java 源码 + build.ps1 构建）到 `/data/local/tmp/` 后运行，实现"无安装"的剪贴板读取 / 多窗口融合视频 / 音频回传。
+**核心思路：** 利用 Android 系统自带的 ADB 调试功能 + `adb push` 自研 `kulua-server.jar`（`kulua-server/` 目录，Java 源码，`build.ps1`（Windows）/ `build.sh`（Linux）构建）到 `/data/local/tmp/` 后运行，实现"无安装"的剪贴板读取 / 多窗口融合视频 / 音频回传。
 
 ## Architecture
 
@@ -21,8 +21,8 @@ Core (device mgmt + session orchestration)
 ## Core Constraints (‼️ 不可违背)
 
 - **手机上绝不安装任何 APK** — 所有功能必须通过 `adb push` + `adb shell app_process` 实现
-- 依赖自研 `kulua-server.jar`（项目根目录或同级需存在此文件；`kulua-server/build.ps1` 构建，替代官方 scrcpy-server.jar）
-- 需要本地有 `adb` 可执行文件（`./adb.exe` 或 `PATH` 中）
+- 依赖自研 `kulua-server.jar`（项目根目录或同级需存在此文件；`kulua-server/build.ps1`（Windows）/ `build.sh`（Linux）构建，替代官方 scrcpy-server.jar）
+- 需要本地有 `adb` 可执行文件（`./adb.exe`（Windows）/ `./adb`（Linux）或 `PATH` 中）
 
 ## Code Conventions
 
@@ -100,7 +100,7 @@ Core (device mgmt + session orchestration)
 
 - `rqrr` / `image` / `qrcode` — QR 码生成与渲染
 - `mdns-sd` — mDNS 服务发现
-- `arboard` — 系统剪贴板（已依赖但未使用）
+- `arboard` — 系统剪贴板（Linux/macOS 用；Windows 用 `clipboard-win`，统一经 `sync-core/src/clipboard.rs` 薄封装）
 - `rand` — 配对码生成
 
 ## Hidden Pitfalls / Known Decisions

@@ -405,7 +405,7 @@ pub mod response {
     pub struct AppList {
         #[prost(message, repeated, tag = "1")]
         pub apps: Vec<super::AppInfo>,
-        /// daemon 是否找到 scrcpy.exe（false 时 UI 隐藏/禁用打开按钮）
+        /// daemon 是否支持融合模式（false 时 UI 隐藏/禁用打开按钮）
         #[prost(bool, tag = "2")]
         pub fusion_supported: bool,
     }
